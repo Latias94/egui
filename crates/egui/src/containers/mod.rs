@@ -18,6 +18,8 @@ pub mod scroll_area;
 mod sides;
 mod tooltip;
 pub(crate) mod window;
+pub mod window_chrome;
+pub(crate) mod window_interaction;
 
 pub use {
     area::{Area, AreaState},

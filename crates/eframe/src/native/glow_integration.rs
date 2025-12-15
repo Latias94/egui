@@ -448,7 +448,11 @@ impl WinitApp for GlowWinitApp<'_> {
                 .and_then(|viewport| glutin.viewports.get_mut(&viewport))
             {
                 if let Some(egui_winit) = viewport.egui_winit.as_mut() {
-                    egui_winit.on_mouse_motion(delta);
+                    if let Some(window) = viewport.window.as_ref() {
+                        egui_winit.on_mouse_motion_with_pointer_fallback(window, delta);
+                    } else {
+                        egui_winit.on_mouse_motion(delta);
+                    }
                 }
 
                 if let Some(window) = viewport.window.as_ref() {

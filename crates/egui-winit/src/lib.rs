@@ -83,6 +83,7 @@ pub struct State {
     egui_input: egui::RawInput,
     pointer_pos_in_points: Option<egui::Pos2>,
     any_pointer_button_down: bool,
+    pointer_buttons_down: u8,
     current_cursor_icon: Option<egui::CursorIcon>,
 
     clipboard: clipboard::Clipboard,
@@ -100,6 +101,7 @@ pub struct State {
 
     /// track ime state
     has_sent_ime_enabled: bool,
+    saw_cursor_moved_since_last_take: bool,
 
     #[cfg(feature = "accesskit")]
     accesskit: Option<accesskit_winit::Adapter>,
@@ -132,6 +134,7 @@ impl State {
             egui_input,
             pointer_pos_in_points: None,
             any_pointer_button_down: false,
+            pointer_buttons_down: 0,
             current_cursor_icon: None,
 
             clipboard: clipboard::Clipboard::new(
@@ -142,6 +145,7 @@ impl State {
             pointer_touch_id: None,
 
             has_sent_ime_enabled: false,
+            saw_cursor_moved_since_last_take: false,
 
             #[cfg(feature = "accesskit")]
             accesskit: None,
@@ -256,6 +260,7 @@ impl State {
             .or_default()
             .native_pixels_per_point = Some(window.scale_factor() as f32);
 
+        self.saw_cursor_moved_since_last_take = false;
         self.egui_input.take()
     }
 
@@ -587,6 +592,40 @@ impl State {
         }));
     }
 
+    /// Like [`Self::on_mouse_motion`], but also synthesizes pointer position updates from raw mouse
+    /// deltas when we are in an active pointer drag and winit doesn't deliver `CursorMoved`.
+    ///
+    /// This improves cross-window docking drags where the OS may keep routing cursor events to the
+    /// source window even while the pointer is physically above a different window.
+    pub fn on_mouse_motion_with_pointer_fallback(
+        &mut self,
+        window: &Window,
+        delta: (f64, f64),
+    ) {
+        self.on_mouse_motion(delta);
+
+        if !self.any_pointer_button_down {
+            return;
+        }
+        if self.saw_cursor_moved_since_last_take {
+            // Avoid double-applying movement when we already received an absolute cursor position.
+            return;
+        }
+        let Some(pos) = self.pointer_pos_in_points else {
+            return;
+        };
+
+        let pixels_per_point = pixels_per_point(&self.egui_ctx, window);
+        if pixels_per_point <= 0.0 || !pixels_per_point.is_finite() {
+            return;
+        }
+
+        let delta_points = egui::vec2(delta.0 as f32, delta.1 as f32) / pixels_per_point;
+        let new_pos = pos + delta_points;
+        self.pointer_pos_in_points = Some(new_pos);
+        self.egui_input.events.push(egui::Event::PointerMoved(new_pos));
+    }
+
     /// Call this when there is a new [`accesskit::ActionRequest`].
     ///
     /// The result can be found in [`Self::egui_input`] and be extracted with [`Self::take_egui_input`].
@@ -614,10 +653,25 @@ impl State {
                 modifiers: self.egui_input.modifiers,
             });
 
+            // Track drag/capture state so we can apply pointer fallback from raw mouse motion when
+            // `CursorMoved` is not delivered.
+            let bit = match button {
+                egui::PointerButton::Primary => 1,
+                egui::PointerButton::Secondary => 2,
+                egui::PointerButton::Middle => 4,
+                _ => 0,
+            };
+            if bit != 0 {
+                if pressed {
+                    self.pointer_buttons_down |= bit;
+                } else {
+                    self.pointer_buttons_down &= !bit;
+                }
+                self.any_pointer_button_down = self.pointer_buttons_down != 0;
+            }
+
             if self.simulate_touch_screen {
                 if pressed {
-                    self.any_pointer_button_down = true;
-
                     self.egui_input.events.push(egui::Event::Touch {
                         device_id: egui::TouchDeviceId(0),
                         id: egui::TouchId(0),
@@ -626,8 +680,6 @@ impl State {
                         force: None,
                     });
                 } else {
-                    self.any_pointer_button_down = false;
-
                     self.egui_input.events.push(egui::Event::PointerGone);
 
                     self.egui_input.events.push(egui::Event::Touch {
@@ -654,6 +706,7 @@ impl State {
             pos_in_pixels.y as f32 / pixels_per_point,
         );
         self.pointer_pos_in_points = Some(pos_in_points);
+        self.saw_cursor_moved_since_last_take = true;
 
         if self.simulate_touch_screen {
             if self.any_pointer_button_down {
