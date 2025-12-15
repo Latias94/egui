@@ -99,6 +99,9 @@ struct GlutinWindowContext {
     window_from_viewport: OrderedViewportIdMap<WindowId>,
 
     focused_viewport: Option<ViewportId>,
+    pointer_drag_viewport: Option<ViewportId>,
+    pointer_buttons_down: u8,
+    device_buttons_down: std::collections::BTreeSet<u32>,
 }
 
 struct Viewport {
@@ -439,25 +442,62 @@ impl WinitApp for GlowWinitApp<'_> {
         _: winit::event::DeviceId,
         event: winit::event::DeviceEvent,
     ) -> crate::Result<EventResult> {
-        if let winit::event::DeviceEvent::MouseMotion { delta } = event
-            && let Some(running) = &mut self.running
-        {
-            let mut glutin = running.glutin.borrow_mut();
-            if let Some(viewport) = glutin
-                .focused_viewport
-                .and_then(|viewport| glutin.viewports.get_mut(&viewport))
-            {
-                if let Some(egui_winit) = viewport.egui_winit.as_mut() {
-                    if let Some(window) = viewport.window.as_ref() {
-                        egui_winit.on_mouse_motion_with_pointer_fallback(window, delta);
-                    } else {
-                        egui_winit.on_mouse_motion(delta);
+        if let Some(running) = &mut self.running {
+            match event {
+                winit::event::DeviceEvent::MouseMotion { delta } => {
+                    let mut glutin = running.glutin.borrow_mut();
+                    let target_viewport_id =
+                        glutin.pointer_drag_viewport.or(glutin.focused_viewport);
+                    if let Some(viewport) =
+                        target_viewport_id.and_then(|id| glutin.viewports.get_mut(&id))
+                    {
+                        if let Some(egui_winit) = viewport.egui_winit.as_mut() {
+                            if let Some(window) = viewport.window.as_ref() {
+                                egui_winit.on_mouse_motion_with_pointer_fallback(window, delta);
+                            } else {
+                                egui_winit.on_mouse_motion(delta);
+                            }
+                        }
+
+                        if let Some(window) = viewport.window.as_ref() {
+                            return Ok(EventResult::RepaintNext(window.id()));
+                        }
                     }
                 }
 
-                if let Some(window) = viewport.window.as_ref() {
-                    return Ok(EventResult::RepaintNext(window.id()));
+                winit::event::DeviceEvent::Button { button, state } => {
+                    let mut glutin = running.glutin.borrow_mut();
+
+                    match state {
+                        winit::event::ElementState::Pressed => {
+                            glutin.device_buttons_down.insert(button);
+                        }
+                        winit::event::ElementState::Released => {
+                            glutin.device_buttons_down.remove(&button);
+                        }
+                    }
+
+                    if glutin.device_buttons_down.is_empty() && glutin.pointer_buttons_down != 0 {
+                        let drag_viewport = glutin.pointer_drag_viewport;
+                        glutin.pointer_drag_viewport = None;
+                        glutin.pointer_buttons_down = 0;
+
+                        if let Some(viewport_id) = drag_viewport
+                            && let Some(viewport) = glutin.viewports.get_mut(&viewport_id)
+                            && let Some(egui_winit) = viewport.egui_winit.as_mut()
+                        {
+                            log::debug!(
+                                "Synthesizing pointer button releases from DeviceEvent::Button fallback for viewport {viewport_id:?}"
+                            );
+                            egui_winit.force_release_all_pointer_buttons();
+                            if let Some(window) = viewport.window.as_ref() {
+                                return Ok(EventResult::RepaintNext(window.id()));
+                            }
+                        }
+                    }
                 }
+
+                _ => {}
             }
         }
 
@@ -802,6 +842,35 @@ impl GlowWinitRunning<'_> {
                 glutin.focused_viewport = focused.then_some(viewport_id).flatten();
             }
 
+            winit::event::WindowEvent::MouseInput { state, button, .. } => {
+                fn bit(button: winit::event::MouseButton) -> u8 {
+                    match button {
+                        winit::event::MouseButton::Left => 1,
+                        winit::event::MouseButton::Right => 2,
+                        winit::event::MouseButton::Middle => 4,
+                        _ => 0,
+                    }
+                }
+
+                if let Some(viewport_id) = viewport_id {
+                    let bit = bit(*button);
+                    if bit != 0 {
+                        match state {
+                            winit::event::ElementState::Pressed => {
+                                glutin.pointer_drag_viewport = Some(viewport_id);
+                                glutin.pointer_buttons_down |= bit;
+                            }
+                            winit::event::ElementState::Released => {
+                                glutin.pointer_buttons_down &= !bit;
+                                if glutin.pointer_buttons_down == 0 {
+                                    glutin.pointer_drag_viewport = None;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
             winit::event::WindowEvent::Resized(physical_size) => {
                 // Resize with 0 width and height is used by winit to signal a minimize event on Windows.
                 // See: https://github.com/rust-windowing/winit/issues/208
@@ -1097,6 +1166,9 @@ impl GlutinWindowContext {
             max_texture_side: None,
             window_from_viewport,
             focused_viewport: Some(ViewportId::ROOT),
+            pointer_drag_viewport: None,
+            pointer_buttons_down: 0,
+            device_buttons_down: Default::default(),
         };
 
         slf.initialize_window(ViewportId::ROOT, event_loop)?;

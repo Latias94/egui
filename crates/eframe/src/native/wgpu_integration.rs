@@ -71,6 +71,9 @@ pub struct SharedState {
     painter: egui_wgpu::winit::Painter,
     viewport_from_window: HashMap<WindowId, ViewportId>,
     focused_viewport: Option<ViewportId>,
+    pointer_drag_viewport: Option<ViewportId>,
+    pointer_buttons_down: u8,
+    device_buttons_down: std::collections::BTreeSet<u32>,
     resized_viewport: Option<ViewportId>,
 }
 
@@ -316,6 +319,9 @@ impl<'app> WgpuWinitApp<'app> {
             viewports,
             painter,
             focused_viewport: Some(ViewportId::ROOT),
+            pointer_drag_viewport: None,
+            pointer_buttons_down: 0,
+            device_buttons_down: Default::default(),
             resized_viewport: None,
         }));
 
@@ -447,25 +453,62 @@ impl WinitApp for WgpuWinitApp<'_> {
         _: winit::event::DeviceId,
         event: winit::event::DeviceEvent,
     ) -> crate::Result<EventResult> {
-        if let winit::event::DeviceEvent::MouseMotion { delta } = event
-            && let Some(running) = &mut self.running
-        {
-            let mut shared = running.shared.borrow_mut();
-            if let Some(viewport) = shared
-                .focused_viewport
-                .and_then(|viewport| shared.viewports.get_mut(&viewport))
-            {
-                if let Some(egui_winit) = viewport.egui_winit.as_mut() {
-                    if let Some(window) = viewport.window.as_ref() {
-                        egui_winit.on_mouse_motion_with_pointer_fallback(window, delta);
-                    } else {
-                        egui_winit.on_mouse_motion(delta);
+        if let Some(running) = &mut self.running {
+            match event {
+                winit::event::DeviceEvent::MouseMotion { delta } => {
+                    let mut shared = running.shared.borrow_mut();
+                    let target_viewport_id =
+                        shared.pointer_drag_viewport.or(shared.focused_viewport);
+                    if let Some(viewport) =
+                        target_viewport_id.and_then(|id| shared.viewports.get_mut(&id))
+                    {
+                        if let Some(egui_winit) = viewport.egui_winit.as_mut() {
+                            if let Some(window) = viewport.window.as_ref() {
+                                egui_winit.on_mouse_motion_with_pointer_fallback(window, delta);
+                            } else {
+                                egui_winit.on_mouse_motion(delta);
+                            }
+                        }
+
+                        if let Some(window) = viewport.window.as_ref() {
+                            return Ok(EventResult::RepaintNext(window.id()));
+                        }
                     }
                 }
 
-                if let Some(window) = viewport.window.as_ref() {
-                    return Ok(EventResult::RepaintNext(window.id()));
+                winit::event::DeviceEvent::Button { button, state } => {
+                    let mut shared = running.shared.borrow_mut();
+
+                    match state {
+                        winit::event::ElementState::Pressed => {
+                            shared.device_buttons_down.insert(button);
+                        }
+                        winit::event::ElementState::Released => {
+                            shared.device_buttons_down.remove(&button);
+                        }
+                    }
+
+                    if shared.device_buttons_down.is_empty() && shared.pointer_buttons_down != 0 {
+                        let drag_viewport = shared.pointer_drag_viewport;
+                        shared.pointer_drag_viewport = None;
+                        shared.pointer_buttons_down = 0;
+
+                        if let Some(viewport_id) = drag_viewport
+                            && let Some(viewport) = shared.viewports.get_mut(&viewport_id)
+                            && let Some(egui_winit) = viewport.egui_winit.as_mut()
+                        {
+                            log::debug!(
+                                "Synthesizing pointer button releases from DeviceEvent::Button fallback for viewport {viewport_id:?}"
+                            );
+                            egui_winit.force_release_all_pointer_buttons();
+                            if let Some(window) = viewport.window.as_ref() {
+                                return Ok(EventResult::RepaintNext(window.id()));
+                            }
+                        }
+                    }
                 }
+
+                _ => {}
             }
         }
 
@@ -826,6 +869,35 @@ impl WgpuWinitRunning<'_> {
                 };
 
                 shared.focused_viewport = focused.then_some(viewport_id).flatten();
+            }
+
+            winit::event::WindowEvent::MouseInput { state, button, .. } => {
+                fn bit(button: winit::event::MouseButton) -> u8 {
+                    match button {
+                        winit::event::MouseButton::Left => 1,
+                        winit::event::MouseButton::Right => 2,
+                        winit::event::MouseButton::Middle => 4,
+                        _ => 0,
+                    }
+                }
+
+                if let Some(viewport_id) = viewport_id {
+                    let bit = bit(*button);
+                    if bit != 0 {
+                        match state {
+                            winit::event::ElementState::Pressed => {
+                                shared.pointer_drag_viewport = Some(viewport_id);
+                                shared.pointer_buttons_down |= bit;
+                            }
+                            winit::event::ElementState::Released => {
+                                shared.pointer_buttons_down &= !bit;
+                                if shared.pointer_buttons_down == 0 {
+                                    shared.pointer_drag_viewport = None;
+                                }
+                            }
+                        }
+                    }
+                }
             }
 
             winit::event::WindowEvent::Resized(physical_size) => {

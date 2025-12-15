@@ -626,6 +626,41 @@ impl State {
         self.egui_input.events.push(egui::Event::PointerMoved(new_pos));
     }
 
+    /// Force-end an active pointer drag by emitting `PointerButton { pressed: false }` events for
+    /// any currently pressed mouse buttons we track.
+    ///
+    /// This is intended as a backend fallback when the OS fails to deliver a `MouseInput::Released`
+    /// event to any window (e.g. if the pointer is released outside all windows).
+    pub fn force_release_all_pointer_buttons(&mut self) {
+        if self.pointer_buttons_down == 0 {
+            return;
+        }
+
+        let Some(pos) = self.pointer_pos_in_points else {
+            self.pointer_buttons_down = 0;
+            self.any_pointer_button_down = false;
+            return;
+        };
+
+        for (bit, button) in [
+            (1u8, egui::PointerButton::Primary),
+            (2u8, egui::PointerButton::Secondary),
+            (4u8, egui::PointerButton::Middle),
+        ] {
+            if self.pointer_buttons_down & bit != 0 {
+                self.egui_input.events.push(egui::Event::PointerButton {
+                    pos,
+                    button,
+                    pressed: false,
+                    modifiers: self.egui_input.modifiers,
+                });
+            }
+        }
+
+        self.pointer_buttons_down = 0;
+        self.any_pointer_button_down = false;
+    }
+
     /// Call this when there is a new [`accesskit::ActionRequest`].
     ///
     /// The result can be found in [`Self::egui_input`] and be extracted with [`Self::take_egui_input`].
