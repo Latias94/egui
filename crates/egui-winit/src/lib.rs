@@ -626,6 +626,45 @@ impl State {
         self.egui_input.events.push(egui::Event::PointerMoved(new_pos));
     }
 
+    /// Synthesize an absolute pointer position update from a global (screen) position in physical pixels.
+    ///
+    /// This is intended as a backend-level fallback during active drags, where the OS may stop
+    /// delivering `WindowEvent::CursorMoved` for some windows (e.g. cross-window drags or while a
+    /// native window is being moved).
+    ///
+    /// The position is translated into this window's local egui coordinate space using the
+    /// current `inner_position` and `pixels_per_point`.
+    pub fn synthesize_pointer_moved_from_global_pixels(
+        &mut self,
+        window: &Window,
+        pointer_global_px: winit::dpi::PhysicalPosition<f64>,
+    ) {
+        if !self.any_pointer_button_down {
+            // Avoid fighting normal cursor routing when we're not dragging.
+            return;
+        }
+
+        let Ok(inner_pos_px) = window.inner_position() else {
+            return;
+        };
+        let pixels_per_point = pixels_per_point(&self.egui_ctx, window);
+        if pixels_per_point <= 0.0 || !pixels_per_point.is_finite() {
+            return;
+        }
+
+        let local_px = egui::pos2(
+            (pointer_global_px.x - inner_pos_px.x as f64) as f32,
+            (pointer_global_px.y - inner_pos_px.y as f64) as f32,
+        );
+        let local_points = local_px / pixels_per_point;
+
+        self.pointer_pos_in_points = Some(local_points);
+        self.egui_input
+            .events
+            .push(egui::Event::PointerMoved(local_points));
+        self.saw_cursor_moved_since_last_take = true;
+    }
+
     /// Force-end an active pointer drag by emitting `PointerButton { pressed: false }` events for
     /// any currently pressed mouse buttons we track.
     ///

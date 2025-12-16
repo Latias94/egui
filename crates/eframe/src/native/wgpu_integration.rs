@@ -74,6 +74,7 @@ pub struct SharedState {
     pointer_drag_viewport: Option<ViewportId>,
     pointer_buttons_down: u8,
     device_buttons_down: std::collections::BTreeSet<u32>,
+    pointer_pos_global_px: Option<winit::dpi::PhysicalPosition<f64>>,
     resized_viewport: Option<ViewportId>,
 }
 
@@ -322,6 +323,7 @@ impl<'app> WgpuWinitApp<'app> {
             pointer_drag_viewport: None,
             pointer_buttons_down: 0,
             device_buttons_down: Default::default(),
+            pointer_pos_global_px: None,
             resized_viewport: None,
         }));
 
@@ -457,6 +459,18 @@ impl WinitApp for WgpuWinitApp<'_> {
             match event {
                 winit::event::DeviceEvent::MouseMotion { delta } => {
                     let mut shared = running.shared.borrow_mut();
+
+                    // Maintain a best-effort global pointer position (in physical pixels) by integrating raw deltas.
+                    // This helps drive cross-viewport hover/docking previews even when the OS stops delivering
+                    // `CursorMoved` during an active drag.
+                    if shared.pointer_buttons_down != 0 {
+                        if let Some(mut p) = shared.pointer_pos_global_px {
+                            p.x += delta.0;
+                            p.y += delta.1;
+                            shared.pointer_pos_global_px = Some(p);
+                        }
+                    }
+
                     let target_viewport_id =
                         shared.pointer_drag_viewport.or(shared.focused_viewport);
                     if let Some(viewport) =
@@ -472,6 +486,44 @@ impl WinitApp for WgpuWinitApp<'_> {
 
                         if let Some(window) = viewport.window.as_ref() {
                             return Ok(EventResult::RepaintNext(window.id()));
+                        }
+                    }
+
+                    // Also synthesize absolute pointer positions into any viewport whose inner rect contains
+                    // the global pointer (so they can show hover/drag previews even if they don't receive
+                    // `CursorMoved` events directly).
+                    if shared.pointer_buttons_down != 0
+                        && let Some(global) = shared.pointer_pos_global_px
+                    {
+                        let viewport_ids: Vec<ViewportId> =
+                            shared.viewports.keys().copied().collect();
+                        for vid in viewport_ids {
+                            let Some(vp) = shared.viewports.get_mut(&vid) else {
+                                continue;
+                            };
+                            let (Some(window), Some(egui_winit)) =
+                                (vp.window.as_ref(), vp.egui_winit.as_mut())
+                            else {
+                                continue;
+                            };
+                            let Ok(inner_pos) = window.inner_position() else {
+                                continue;
+                            };
+                            let inner_size = window.inner_size();
+                            let inside = global.x >= inner_pos.x as f64
+                                && global.y >= inner_pos.y as f64
+                                && global.x < (inner_pos.x as f64 + inner_size.width as f64)
+                                && global.y < (inner_pos.y as f64 + inner_size.height as f64);
+                            if inside {
+                                egui_winit.synthesize_pointer_moved_from_global_pixels(
+                                    window,
+                                    global,
+                                );
+                                running
+                                    .integration
+                                    .egui_ctx
+                                    .request_repaint_of(vid);
+                            }
                         }
                     }
                 }
@@ -493,17 +545,31 @@ impl WinitApp for WgpuWinitApp<'_> {
                         shared.pointer_drag_viewport = None;
                         shared.pointer_buttons_down = 0;
 
+                        // Best-effort: force-release pointer buttons in any viewport that might still think a drag is active.
+                        let viewport_ids: Vec<ViewportId> =
+                            shared.viewports.keys().copied().collect();
+                        for vid in viewport_ids {
+                            let Some(viewport) = shared.viewports.get_mut(&vid) else {
+                                continue;
+                            };
+                            let Some(egui_winit) = viewport.egui_winit.as_mut() else {
+                                continue;
+                            };
+
+                            if Some(vid) == drag_viewport {
+                                log::debug!(
+                                    "Synthesizing pointer button releases from DeviceEvent::Button fallback for viewport {vid:?}"
+                                );
+                            }
+                            egui_winit.force_release_all_pointer_buttons();
+                            running.integration.egui_ctx.request_repaint_of(vid);
+                        }
+
                         if let Some(viewport_id) = drag_viewport
                             && let Some(viewport) = shared.viewports.get_mut(&viewport_id)
-                            && let Some(egui_winit) = viewport.egui_winit.as_mut()
+                            && let Some(window) = viewport.window.as_ref()
                         {
-                            log::debug!(
-                                "Synthesizing pointer button releases from DeviceEvent::Button fallback for viewport {viewport_id:?}"
-                            );
-                            egui_winit.force_release_all_pointer_buttons();
-                            if let Some(window) = viewport.window.as_ref() {
-                                return Ok(EventResult::RepaintNext(window.id()));
-                            }
+                            return Ok(EventResult::RepaintNext(window.id()));
                         }
                     }
                 }
@@ -869,6 +935,19 @@ impl WgpuWinitRunning<'_> {
                 };
 
                 shared.focused_viewport = focused.then_some(viewport_id).flatten();
+            }
+
+            winit::event::WindowEvent::CursorMoved { position, .. } => {
+                if let Some(viewport_id) = viewport_id
+                    && let Some(viewport) = shared.viewports.get(&viewport_id)
+                    && let Some(window) = viewport.window.as_ref()
+                    && let Ok(inner_pos) = window.inner_position()
+                {
+                    shared.pointer_pos_global_px = Some(winit::dpi::PhysicalPosition::new(
+                        inner_pos.x as f64 + position.x,
+                        inner_pos.y as f64 + position.y,
+                    ));
+                }
             }
 
             winit::event::WindowEvent::MouseInput { state, button, .. } => {

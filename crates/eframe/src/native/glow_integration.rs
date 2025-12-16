@@ -102,6 +102,7 @@ struct GlutinWindowContext {
     pointer_drag_viewport: Option<ViewportId>,
     pointer_buttons_down: u8,
     device_buttons_down: std::collections::BTreeSet<u32>,
+    pointer_pos_global_px: Option<winit::dpi::PhysicalPosition<f64>>,
 }
 
 struct Viewport {
@@ -446,6 +447,18 @@ impl WinitApp for GlowWinitApp<'_> {
             match event {
                 winit::event::DeviceEvent::MouseMotion { delta } => {
                     let mut glutin = running.glutin.borrow_mut();
+
+                    // Maintain a best-effort global pointer position (in physical pixels) by integrating raw deltas.
+                    // This helps drive cross-viewport hover/docking previews even when the OS stops delivering
+                    // `CursorMoved` during an active drag.
+                    if glutin.pointer_buttons_down != 0 {
+                        if let Some(mut p) = glutin.pointer_pos_global_px {
+                            p.x += delta.0;
+                            p.y += delta.1;
+                            glutin.pointer_pos_global_px = Some(p);
+                        }
+                    }
+
                     let target_viewport_id =
                         glutin.pointer_drag_viewport.or(glutin.focused_viewport);
                     if let Some(viewport) =
@@ -461,6 +474,44 @@ impl WinitApp for GlowWinitApp<'_> {
 
                         if let Some(window) = viewport.window.as_ref() {
                             return Ok(EventResult::RepaintNext(window.id()));
+                        }
+                    }
+
+                    // Also synthesize absolute pointer positions into any viewport whose inner rect contains
+                    // the global pointer (so they can show hover/drag previews even if they don't receive
+                    // `CursorMoved` events directly).
+                    if glutin.pointer_buttons_down != 0
+                        && let Some(global) = glutin.pointer_pos_global_px
+                    {
+                        let viewport_ids: Vec<ViewportId> =
+                            glutin.viewports.keys().copied().collect();
+                        for vid in viewport_ids {
+                            let Some(vp) = glutin.viewports.get_mut(&vid) else {
+                                continue;
+                            };
+                            let (Some(window), Some(egui_winit)) =
+                                (vp.window.as_ref(), vp.egui_winit.as_mut())
+                            else {
+                                continue;
+                            };
+                            let Ok(inner_pos) = window.inner_position() else {
+                                continue;
+                            };
+                            let inner_size = window.inner_size();
+                            let inside = global.x >= inner_pos.x as f64
+                                && global.y >= inner_pos.y as f64
+                                && global.x < (inner_pos.x as f64 + inner_size.width as f64)
+                                && global.y < (inner_pos.y as f64 + inner_size.height as f64);
+                            if inside {
+                                egui_winit.synthesize_pointer_moved_from_global_pixels(
+                                    window,
+                                    global,
+                                );
+                                running
+                                    .integration
+                                    .egui_ctx
+                                    .request_repaint_of(vid);
+                            }
                         }
                     }
                 }
@@ -482,17 +533,31 @@ impl WinitApp for GlowWinitApp<'_> {
                         glutin.pointer_drag_viewport = None;
                         glutin.pointer_buttons_down = 0;
 
+                        // Best-effort: force-release pointer buttons in any viewport that might still think a drag is active.
+                        let viewport_ids: Vec<ViewportId> =
+                            glutin.viewports.keys().copied().collect();
+                        for vid in viewport_ids {
+                            let Some(viewport) = glutin.viewports.get_mut(&vid) else {
+                                continue;
+                            };
+                            let Some(egui_winit) = viewport.egui_winit.as_mut() else {
+                                continue;
+                            };
+
+                            if Some(vid) == drag_viewport {
+                                log::debug!(
+                                    "Synthesizing pointer button releases from DeviceEvent::Button fallback for viewport {vid:?}"
+                                );
+                            }
+                            egui_winit.force_release_all_pointer_buttons();
+                            running.integration.egui_ctx.request_repaint_of(vid);
+                        }
+
                         if let Some(viewport_id) = drag_viewport
                             && let Some(viewport) = glutin.viewports.get_mut(&viewport_id)
-                            && let Some(egui_winit) = viewport.egui_winit.as_mut()
+                            && let Some(window) = viewport.window.as_ref()
                         {
-                            log::debug!(
-                                "Synthesizing pointer button releases from DeviceEvent::Button fallback for viewport {viewport_id:?}"
-                            );
-                            egui_winit.force_release_all_pointer_buttons();
-                            if let Some(window) = viewport.window.as_ref() {
-                                return Ok(EventResult::RepaintNext(window.id()));
-                            }
+                            return Ok(EventResult::RepaintNext(window.id()));
                         }
                     }
                 }
@@ -842,6 +907,19 @@ impl GlowWinitRunning<'_> {
                 glutin.focused_viewport = focused.then_some(viewport_id).flatten();
             }
 
+            winit::event::WindowEvent::CursorMoved { position, .. } => {
+                if let Some(viewport_id) = viewport_id
+                    && let Some(viewport) = glutin.viewports.get(&viewport_id)
+                    && let Some(window) = viewport.window.as_ref()
+                    && let Ok(inner_pos) = window.inner_position()
+                {
+                    glutin.pointer_pos_global_px = Some(winit::dpi::PhysicalPosition::new(
+                        inner_pos.x as f64 + position.x,
+                        inner_pos.y as f64 + position.y,
+                    ));
+                }
+            }
+
             winit::event::WindowEvent::MouseInput { state, button, .. } => {
                 fn bit(button: winit::event::MouseButton) -> u8 {
                     match button {
@@ -1169,6 +1247,7 @@ impl GlutinWindowContext {
             pointer_drag_viewport: None,
             pointer_buttons_down: 0,
             device_buttons_down: Default::default(),
+            pointer_pos_global_px: None,
         };
 
         slf.initialize_window(ViewportId::ROOT, event_loop)?;
