@@ -459,14 +459,25 @@ impl WinitApp for WgpuWinitApp<'_> {
             match event {
                 winit::event::DeviceEvent::MouseMotion { delta } => {
                     let mut shared = running.shared.borrow_mut();
+                    let mut repaint_window_id: Option<WindowId> = None;
+                    let (mut dx, mut dy) = delta;
+                    // Raw mouse motion can be slightly noisy on some platforms even when the mouse is
+                    // physically still. Apply a tiny deadzone so we don't jitter windows during
+                    // window-move drags.
+                    if dx.abs() < 0.01 {
+                        dx = 0.0;
+                    }
+                    if dy.abs() < 0.01 {
+                        dy = 0.0;
+                    }
 
                     // Maintain a best-effort global pointer position (in physical pixels) by integrating raw deltas.
                     // This helps drive cross-viewport hover/docking previews even when the OS stops delivering
                     // `CursorMoved` during an active drag.
                     if shared.pointer_buttons_down != 0 {
                         if let Some(mut p) = shared.pointer_pos_global_px {
-                            p.x += delta.0;
-                            p.y += delta.1;
+                            p.x += dx;
+                            p.y += dy;
                             shared.pointer_pos_global_px = Some(p);
                         }
                     }
@@ -476,34 +487,29 @@ impl WinitApp for WgpuWinitApp<'_> {
                     if let Some(viewport) =
                         target_viewport_id.and_then(|id| shared.viewports.get_mut(&id))
                     {
-                        if let Some(egui_winit) = viewport.egui_winit.as_mut() {
-                            if let Some(window) = viewport.window.as_ref() {
-                                egui_winit.on_mouse_motion_with_pointer_fallback(window, delta);
+                            if let Some(egui_winit) = viewport.egui_winit.as_mut() {
+                                if let Some(window) = viewport.window.as_ref() {
+                                egui_winit.on_mouse_motion_with_pointer_fallback(window, (dx, dy));
+                                repaint_window_id = Some(window.id());
                             } else {
-                                egui_winit.on_mouse_motion(delta);
+                                egui_winit.on_mouse_motion((dx, dy));
                             }
-                        }
-
-                        if let Some(window) = viewport.window.as_ref() {
-                            return Ok(EventResult::RepaintNext(window.id()));
                         }
                     }
 
-                    // Also synthesize absolute pointer positions into any viewport whose inner rect contains
-                    // the global pointer (so they can show hover/drag previews even if they don't receive
-                    // `CursorMoved` events directly).
+                    // Also synthesize an absolute pointer position into the single "best" viewport whose
+                    // inner rect contains the global pointer (so it can show hover/drag previews even if
+                    // it doesn't receive `CursorMoved` events directly).
+                    //
+                    // IMPORTANT: We intentionally pick ONE viewport. Broadcasting to all matching viewports
+                    // makes the hovered-viewport authority ambiguous and can lead to jitter/drift when
+                    // windows overlap.
                     if shared.pointer_buttons_down != 0
                         && let Some(global) = shared.pointer_pos_global_px
                     {
-                        let viewport_ids: Vec<ViewportId> =
-                            shared.viewports.keys().copied().collect();
-                        for vid in viewport_ids {
-                            let Some(vp) = shared.viewports.get_mut(&vid) else {
-                                continue;
-                            };
-                            let (Some(window), Some(egui_winit)) =
-                                (vp.window.as_ref(), vp.egui_winit.as_mut())
-                            else {
+                        let mut best: Option<(ViewportId, u64)> = None;
+                        for (vid, vp) in &shared.viewports {
+                            let Some(window) = vp.window.as_ref() else {
                                 continue;
                             };
                             let Ok(inner_pos) = window.inner_position() else {
@@ -514,17 +520,61 @@ impl WinitApp for WgpuWinitApp<'_> {
                                 && global.y >= inner_pos.y as f64
                                 && global.x < (inner_pos.x as f64 + inner_size.width as f64)
                                 && global.y < (inner_pos.y as f64 + inner_size.height as f64);
-                            if inside {
-                                egui_winit.synthesize_pointer_moved_from_global_pixels(
-                                    window,
-                                    global,
-                                );
-                                running
-                                    .integration
-                                    .egui_ctx
-                                    .request_repaint_of(vid);
+                            if !inside {
+                                continue;
+                            }
+                            let area = (inner_size.width as u64).saturating_mul(inner_size.height as u64);
+                            match best {
+                                None => best = Some((*vid, area)),
+                                Some((_best_id, best_area)) if area < best_area => {
+                                    best = Some((*vid, area));
+                                }
+                                _ => {}
                             }
                         }
+
+                        if let Some((vid, _area)) = best {
+                            // Backend-style hovered viewport authority (ImGui `io.MouseHoveredViewport` analog).
+                            running.integration.egui_ctx.data_mut(|d| {
+                                d.insert_temp::<Option<ViewportId>>(
+                                    egui::Id::new("egui-winit::mouse_hovered_viewport_id"),
+                                    Some(vid),
+                                );
+                            });
+
+                            if let Some(vp) = shared.viewports.get_mut(&vid)
+                                && let (Some(window), Some(egui_winit)) =
+                                    (vp.window.as_ref(), vp.egui_winit.as_mut())
+                            {
+                                // Backend-style global pointer position (ImGui `io.MousePos` analog), in egui points.
+                                // This is used by docking logic to resolve cross-viewport targets even if the OS
+                                // routes cursor events to a different window during drags.
+                                let ppp = egui_winit::pixels_per_point(&running.integration.egui_ctx, window);
+                                if ppp > 0.0 && ppp.is_finite() {
+                                    let pointer_global_points =
+                                        egui::pos2(global.x as f32 / ppp, global.y as f32 / ppp);
+                                    running.integration.egui_ctx.data_mut(|d| {
+                                        d.insert_temp::<Option<egui::Pos2>>(
+                                            egui::Id::new("egui-winit::pointer_global_points"),
+                                            Some(pointer_global_points),
+                                        );
+                                    });
+                                }
+
+                                egui_winit.synthesize_pointer_moved_from_global_pixels(window, global);
+                                running.integration.egui_ctx.request_repaint_of(vid);
+                            }
+                        }
+                    }
+
+                    if shared.pointer_buttons_down != 0 {
+                        // Keep the root viewport ticking during drags even if the OS routes mouse
+                        // input to a different platform window.
+                        running.integration.egui_ctx.request_repaint_of(ViewportId::ROOT);
+                    }
+
+                    if let Some(window_id) = repaint_window_id {
+                        return Ok(EventResult::RepaintNext(window_id));
                     }
                 }
 
@@ -938,15 +988,23 @@ impl WgpuWinitRunning<'_> {
             }
 
             winit::event::WindowEvent::CursorMoved { position, .. } => {
-                if let Some(viewport_id) = viewport_id
-                    && let Some(viewport) = shared.viewports.get(&viewport_id)
-                    && let Some(window) = viewport.window.as_ref()
-                    && let Ok(inner_pos) = window.inner_position()
-                {
-                    shared.pointer_pos_global_px = Some(winit::dpi::PhysicalPosition::new(
-                        inner_pos.x as f64 + position.x,
-                        inner_pos.y as f64 + position.y,
-                    ));
+                // Do not recompute global pointer position from (window position + local cursor)
+                // while a pointer drag is active. During OS-level window moves, the window position
+                // is exactly what we are driving, which makes this self-referential and can cause
+                // severe jitter/drift even when the user doesn't move the mouse.
+                //
+                // Instead, keep using the global pointer maintained from raw mouse motion deltas.
+                if shared.pointer_buttons_down == 0 {
+                    if let Some(viewport_id) = viewport_id
+                        && let Some(viewport) = shared.viewports.get(&viewport_id)
+                        && let Some(window) = viewport.window.as_ref()
+                        && let Ok(inner_pos) = window.inner_position()
+                    {
+                        shared.pointer_pos_global_px = Some(winit::dpi::PhysicalPosition::new(
+                            inner_pos.x as f64 + position.x,
+                            inner_pos.y as f64 + position.y,
+                        ));
+                    }
                 }
             }
 

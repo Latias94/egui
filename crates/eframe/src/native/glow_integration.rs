@@ -447,14 +447,22 @@ impl WinitApp for GlowWinitApp<'_> {
             match event {
                 winit::event::DeviceEvent::MouseMotion { delta } => {
                     let mut glutin = running.glutin.borrow_mut();
+                    let mut repaint_window_id: Option<WindowId> = None;
+                    let (mut dx, mut dy) = delta;
+                    if dx.abs() < 0.01 {
+                        dx = 0.0;
+                    }
+                    if dy.abs() < 0.01 {
+                        dy = 0.0;
+                    }
 
                     // Maintain a best-effort global pointer position (in physical pixels) by integrating raw deltas.
                     // This helps drive cross-viewport hover/docking previews even when the OS stops delivering
                     // `CursorMoved` during an active drag.
                     if glutin.pointer_buttons_down != 0 {
                         if let Some(mut p) = glutin.pointer_pos_global_px {
-                            p.x += delta.0;
-                            p.y += delta.1;
+                            p.x += dx;
+                            p.y += dy;
                             glutin.pointer_pos_global_px = Some(p);
                         }
                     }
@@ -466,32 +474,27 @@ impl WinitApp for GlowWinitApp<'_> {
                     {
                         if let Some(egui_winit) = viewport.egui_winit.as_mut() {
                             if let Some(window) = viewport.window.as_ref() {
-                                egui_winit.on_mouse_motion_with_pointer_fallback(window, delta);
+                                egui_winit.on_mouse_motion_with_pointer_fallback(window, (dx, dy));
+                                repaint_window_id = Some(window.id());
                             } else {
-                                egui_winit.on_mouse_motion(delta);
+                                egui_winit.on_mouse_motion((dx, dy));
                             }
-                        }
-
-                        if let Some(window) = viewport.window.as_ref() {
-                            return Ok(EventResult::RepaintNext(window.id()));
                         }
                     }
 
-                    // Also synthesize absolute pointer positions into any viewport whose inner rect contains
-                    // the global pointer (so they can show hover/drag previews even if they don't receive
-                    // `CursorMoved` events directly).
+                    // Also synthesize an absolute pointer position into the single "best" viewport whose
+                    // inner rect contains the global pointer (so it can show hover/drag previews even if
+                    // it doesn't receive `CursorMoved` events directly).
+                    //
+                    // IMPORTANT: We intentionally pick ONE viewport. Broadcasting to all matching viewports
+                    // makes the hovered-viewport authority ambiguous and can lead to jitter/drift when
+                    // windows overlap.
                     if glutin.pointer_buttons_down != 0
                         && let Some(global) = glutin.pointer_pos_global_px
                     {
-                        let viewport_ids: Vec<ViewportId> =
-                            glutin.viewports.keys().copied().collect();
-                        for vid in viewport_ids {
-                            let Some(vp) = glutin.viewports.get_mut(&vid) else {
-                                continue;
-                            };
-                            let (Some(window), Some(egui_winit)) =
-                                (vp.window.as_ref(), vp.egui_winit.as_mut())
-                            else {
+                        let mut best: Option<(ViewportId, u64)> = None;
+                        for (vid, vp) in &glutin.viewports {
+                            let Some(window) = vp.window.as_ref() else {
                                 continue;
                             };
                             let Ok(inner_pos) = window.inner_position() else {
@@ -502,17 +505,59 @@ impl WinitApp for GlowWinitApp<'_> {
                                 && global.y >= inner_pos.y as f64
                                 && global.x < (inner_pos.x as f64 + inner_size.width as f64)
                                 && global.y < (inner_pos.y as f64 + inner_size.height as f64);
-                            if inside {
-                                egui_winit.synthesize_pointer_moved_from_global_pixels(
-                                    window,
-                                    global,
-                                );
-                                running
-                                    .integration
-                                    .egui_ctx
-                                    .request_repaint_of(vid);
+                            if !inside {
+                                continue;
+                            }
+                            let area = (inner_size.width as u64).saturating_mul(inner_size.height as u64);
+                            match best {
+                                None => best = Some((*vid, area)),
+                                Some((_best_id, best_area)) if area < best_area => {
+                                    best = Some((*vid, area));
+                                }
+                                _ => {}
                             }
                         }
+
+                        if let Some((vid, _area)) = best {
+                            // Backend-style hovered viewport authority (ImGui `io.MouseHoveredViewport` analog).
+                            running.integration.egui_ctx.data_mut(|d| {
+                                d.insert_temp::<Option<ViewportId>>(
+                                    egui::Id::new("egui-winit::mouse_hovered_viewport_id"),
+                                    Some(vid),
+                                );
+                            });
+
+                            if let Some(vp) = glutin.viewports.get_mut(&vid)
+                                && let (Some(window), Some(egui_winit)) =
+                                    (vp.window.as_ref(), vp.egui_winit.as_mut())
+                            {
+                                // Backend-style global pointer position (ImGui `io.MousePos` analog), in egui points.
+                                let ppp = egui_winit::pixels_per_point(&running.integration.egui_ctx, window);
+                                if ppp > 0.0 && ppp.is_finite() {
+                                    let pointer_global_points =
+                                        egui::pos2(global.x as f32 / ppp, global.y as f32 / ppp);
+                                    running.integration.egui_ctx.data_mut(|d| {
+                                        d.insert_temp::<Option<egui::Pos2>>(
+                                            egui::Id::new("egui-winit::pointer_global_points"),
+                                            Some(pointer_global_points),
+                                        );
+                                    });
+                                }
+
+                                egui_winit.synthesize_pointer_moved_from_global_pixels(window, global);
+                                running.integration.egui_ctx.request_repaint_of(vid);
+                            }
+                        }
+                    }
+
+                    if glutin.pointer_buttons_down != 0 {
+                        // Keep the root viewport ticking during drags even if the OS routes mouse
+                        // input to a different platform window.
+                        running.integration.egui_ctx.request_repaint_of(ViewportId::ROOT);
+                    }
+
+                    if let Some(window_id) = repaint_window_id {
+                        return Ok(EventResult::RepaintNext(window_id));
                     }
                 }
 
@@ -908,15 +953,20 @@ impl GlowWinitRunning<'_> {
             }
 
             winit::event::WindowEvent::CursorMoved { position, .. } => {
-                if let Some(viewport_id) = viewport_id
-                    && let Some(viewport) = glutin.viewports.get(&viewport_id)
-                    && let Some(window) = viewport.window.as_ref()
-                    && let Ok(inner_pos) = window.inner_position()
-                {
-                    glutin.pointer_pos_global_px = Some(winit::dpi::PhysicalPosition::new(
-                        inner_pos.x as f64 + position.x,
-                        inner_pos.y as f64 + position.y,
-                    ));
+                // See wgpu backend: during active drags, global pointer updates based on
+                // (window position + local cursor) can become self-referential while moving windows.
+                // Rely on raw mouse motion integration instead.
+                if glutin.pointer_buttons_down == 0 {
+                    if let Some(viewport_id) = viewport_id
+                        && let Some(viewport) = glutin.viewports.get(&viewport_id)
+                        && let Some(window) = viewport.window.as_ref()
+                        && let Ok(inner_pos) = window.inner_position()
+                    {
+                        glutin.pointer_pos_global_px = Some(winit::dpi::PhysicalPosition::new(
+                            inner_pos.x as f64 + position.x,
+                            inner_pos.y as f64 + position.y,
+                        ));
+                    }
                 }
             }
 

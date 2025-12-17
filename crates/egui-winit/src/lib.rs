@@ -32,6 +32,18 @@ use winit::{
     window::{CursorGrabMode, Window, WindowButtons, WindowLevel},
 };
 
+/// Backend-only key used to store the currently hovered native viewport/window in `egui::Context` data.
+///
+/// This mirrors Dear ImGui's `io.MouseHoveredViewport` concept: it is a backend-provided hint about
+/// which OS window is currently receiving mouse input, and helps higher-level docking logic make
+/// stable decisions when viewports overlap.
+const BACKEND_MOUSE_HOVERED_VIEWPORT_ID_KEY: &str = "egui-winit::mouse_hovered_viewport_id";
+
+#[inline]
+fn backend_mouse_hovered_viewport_id_storage_id() -> egui::Id {
+    egui::Id::new(BACKEND_MOUSE_HOVERED_VIEWPORT_ID_KEY)
+}
+
 pub fn screen_size_in_pixels(window: &Window) -> egui::Vec2 {
     let size = if cfg!(target_os = "ios") {
         // `outer_size` Includes the area behind the "dynamic island".
@@ -325,6 +337,16 @@ impl State {
                 }
             }
             WindowEvent::CursorMoved { position, .. } => {
+                // Record the viewport that currently receives cursor events.
+                //
+                // This is a best-effort, backend-only signal (stored in `Context::data`) that can be
+                // used by external docking/multi-viewport systems to disambiguate overlaps.
+                self.egui_ctx.data_mut(|d| {
+                    d.insert_temp::<Option<ViewportId>>(
+                        backend_mouse_hovered_viewport_id_storage_id(),
+                        Some(self.viewport_id),
+                    );
+                });
                 self.on_cursor_moved(window, *position);
                 EventResponse {
                     repaint: true,
@@ -332,6 +354,14 @@ impl State {
                 }
             }
             WindowEvent::CursorLeft { .. } => {
+                // Clear hover only if we were the currently hovered viewport.
+                self.egui_ctx.data_mut(|d| {
+                    let id = backend_mouse_hovered_viewport_id_storage_id();
+                    let current = d.get_temp::<Option<ViewportId>>(id).flatten();
+                    if current == Some(self.viewport_id) {
+                        d.insert_temp::<Option<ViewportId>>(id, None);
+                    }
+                });
                 self.pointer_pos_in_points = None;
                 self.egui_input.events.push(egui::Event::PointerGone);
                 EventResponse {
