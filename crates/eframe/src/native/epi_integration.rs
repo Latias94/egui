@@ -12,6 +12,45 @@ use egui_winit::{EventResponse, WindowSettings};
 
 use crate::epi;
 
+const BACKEND_MONITORS_OUTER_RECTS_POINTS_KEY: &str = "egui-winit::monitors_outer_rects_points";
+
+/// Store backend monitor rectangles in `egui::Context` data (best-effort, native only).
+///
+/// This mirrors Dear ImGui's `ImGuiPlatformIO::Monitors` concept: higher-level docking systems can
+/// use it to clamp restored window positions into visible monitor bounds.
+pub fn store_backend_monitor_rects(egui_ctx: &egui::Context, event_loop: &ActiveEventLoop) {
+    let zoom_factor = egui_ctx.zoom_factor();
+    if !(zoom_factor > 0.0 && zoom_factor.is_finite()) {
+        return;
+    }
+
+    let mut rects: Vec<egui::Rect> = Vec::new();
+    for monitor in event_loop.available_monitors() {
+        let scale_factor = monitor.scale_factor() as f32;
+        let pixels_per_point = zoom_factor * scale_factor;
+        if !(pixels_per_point > 0.0 && pixels_per_point.is_finite()) {
+            continue;
+        }
+
+        let pos_px = monitor.position();
+        let size_px = monitor.size();
+
+        let min = egui::pos2(pos_px.x as f32 / pixels_per_point, pos_px.y as f32 / pixels_per_point);
+        let size = egui::vec2(size_px.width as f32 / pixels_per_point, size_px.height as f32 / pixels_per_point);
+        if size.x > 1.0 && size.y > 1.0 {
+            rects.push(egui::Rect::from_min_size(min, size));
+        }
+    }
+
+    if rects.is_empty() {
+        return;
+    }
+
+    egui_ctx.data_mut(|d| {
+        d.insert_temp::<Vec<egui::Rect>>(egui::Id::new(BACKEND_MONITORS_OUTER_RECTS_POINTS_KEY), rects);
+    });
+}
+
 #[cfg_attr(target_os = "ios", allow(dead_code, unused_variables, unused_mut))]
 pub fn viewport_builder(
     egui_zoom_factor: f32,

@@ -101,6 +101,10 @@ impl<T: WinitApp> WinitAppWrapper<T> {
             self.windows_next_repaint_times
                 .insert(window_id, Instant::now());
 
+            if let Some(egui_ctx) = self.winit_app.egui_ctx() {
+                super::epi_integration::store_backend_monitor_rects(egui_ctx, event_loop);
+            }
+
             // Fix flickering on Windows, see https://github.com/emilk/egui/pull/2280
             event_result = self.winit_app.run_ui_and_paint(event_loop, window_id);
         }
@@ -308,6 +312,9 @@ impl<T: WinitApp> ApplicationHandler<UserEvent> for WinitAppWrapper<T> {
         event_loop_context::with_event_loop_context(event_loop, move || {
             let event_result = match event {
                 winit::event::WindowEvent::RedrawRequested => {
+                    if let Some(egui_ctx) = self.winit_app.egui_ctx() {
+                        super::epi_integration::store_backend_monitor_rects(egui_ctx, event_loop);
+                    }
                     self.winit_app.run_ui_and_paint(event_loop, window_id)
                 }
                 _ => self.winit_app.window_event(event_loop, window_id, event),
