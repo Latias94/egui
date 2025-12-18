@@ -75,6 +75,7 @@ pub struct SharedState {
     pointer_buttons_down: u8,
     device_buttons_down: std::collections::BTreeSet<u32>,
     pointer_pos_global_px: Option<winit::dpi::PhysicalPosition<f64>>,
+    last_cursor_pos_in_window_px: HashMap<WindowId, winit::dpi::PhysicalPosition<f64>>,
     resized_viewport: Option<ViewportId>,
 }
 
@@ -324,6 +325,7 @@ impl<'app> WgpuWinitApp<'app> {
             pointer_buttons_down: 0,
             device_buttons_down: Default::default(),
             pointer_pos_global_px: None,
+            last_cursor_pos_in_window_px: Default::default(),
             resized_viewport: None,
         }));
 
@@ -988,6 +990,10 @@ impl WgpuWinitRunning<'_> {
             }
 
             winit::event::WindowEvent::CursorMoved { position, .. } => {
+                shared
+                    .last_cursor_pos_in_window_px
+                    .insert(window_id, *position);
+
                 // Do not recompute global pointer position from (window position + local cursor)
                 // while a pointer drag is active. During OS-level window moves, the window position
                 // is exactly what we are driving, which makes this self-referential and can cause
@@ -1023,6 +1029,52 @@ impl WgpuWinitRunning<'_> {
                     if bit != 0 {
                         match state {
                             winit::event::ElementState::Pressed => {
+                                // Seed a global pointer position at drag start.
+                                //
+                                // Without this, `DeviceEvent::MouseMotion` integration has no starting point
+                                // (e.g. if the user clicks without moving the mouse first), so higher-level
+                                // docking systems won't see a usable global pointer during cross-viewport drags.
+                                if shared.pointer_buttons_down == 0
+                                    && let Some(local) =
+                                        shared.last_cursor_pos_in_window_px.get(&window_id).copied()
+                                    && let Some(viewport) = shared.viewports.get(&viewport_id)
+                                    && let Some(window) = viewport.window.as_ref()
+                                    && let Ok(inner_pos) = window.inner_position()
+                                {
+                                    let global = winit::dpi::PhysicalPosition::new(
+                                        inner_pos.x as f64 + local.x,
+                                        inner_pos.y as f64 + local.y,
+                                    );
+                                    shared.pointer_pos_global_px = Some(global);
+
+                                    // Also provide egui context hints (best-effort).
+                                    if let Some(egui_winit) = viewport.egui_winit.as_ref() {
+                                        let ppp = egui_winit::pixels_per_point(&integration.egui_ctx, window);
+                                        if ppp > 0.0 && ppp.is_finite() {
+                                            let pointer_global_points =
+                                                egui::pos2(global.x as f32 / ppp, global.y as f32 / ppp);
+                                            integration.egui_ctx.data_mut(|d| {
+                                                d.insert_temp::<Option<egui::Pos2>>(
+                                                    egui::Id::new("egui-winit::pointer_global_points"),
+                                                    Some(pointer_global_points),
+                                                );
+                                                d.insert_temp::<Option<ViewportId>>(
+                                                    egui::Id::new("egui-winit::mouse_hovered_viewport_id"),
+                                                    Some(viewport_id),
+                                                );
+                                            });
+                                        }
+                                    }
+                                } else {
+                                    // At least provide hovered-viewport authority when pressing inside a viewport.
+                                    integration.egui_ctx.data_mut(|d| {
+                                        d.insert_temp::<Option<ViewportId>>(
+                                            egui::Id::new("egui-winit::mouse_hovered_viewport_id"),
+                                            Some(viewport_id),
+                                        );
+                                    });
+                                }
+
                                 shared.pointer_drag_viewport = Some(viewport_id);
                                 shared.pointer_buttons_down |= bit;
                             }

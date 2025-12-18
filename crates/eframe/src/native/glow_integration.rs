@@ -103,6 +103,7 @@ struct GlutinWindowContext {
     pointer_buttons_down: u8,
     device_buttons_down: std::collections::BTreeSet<u32>,
     pointer_pos_global_px: Option<winit::dpi::PhysicalPosition<f64>>,
+    last_cursor_pos_in_window_px: HashMap<WindowId, winit::dpi::PhysicalPosition<f64>>,
 }
 
 struct Viewport {
@@ -953,6 +954,10 @@ impl GlowWinitRunning<'_> {
             }
 
             winit::event::WindowEvent::CursorMoved { position, .. } => {
+                glutin
+                    .last_cursor_pos_in_window_px
+                    .insert(window_id, *position);
+
                 // See wgpu backend: during active drags, global pointer updates based on
                 // (window position + local cursor) can become self-referential while moving windows.
                 // Rely on raw mouse motion integration instead.
@@ -985,6 +990,53 @@ impl GlowWinitRunning<'_> {
                     if bit != 0 {
                         match state {
                             winit::event::ElementState::Pressed => {
+                                // Seed a global pointer position at drag start.
+                                //
+                                // Without this, `DeviceEvent::MouseMotion` integration has no starting point
+                                // (e.g. if the user clicks without moving the mouse first), so higher-level
+                                // docking systems won't see a usable global pointer during cross-viewport drags.
+                                let seed = if glutin.pointer_buttons_down == 0
+                                    && let Some(local) =
+                                        glutin.last_cursor_pos_in_window_px.get(&window_id).copied()
+                                    && let Some(viewport) = glutin.viewports.get(&viewport_id)
+                                    && let Some(window) = viewport.window.as_ref()
+                                    && let Ok(inner_pos) = window.inner_position()
+                                {
+                                    let global = winit::dpi::PhysicalPosition::new(
+                                        inner_pos.x as f64 + local.x,
+                                        inner_pos.y as f64 + local.y,
+                                    );
+                                    Some((global, window.clone()))
+                                } else {
+                                    None
+                                };
+
+                                if let Some((global, window)) = seed {
+                                    glutin.pointer_pos_global_px = Some(global);
+
+                                    // Also provide egui context hints (best-effort).
+                                    let ppp =
+                                        egui_winit::pixels_per_point(&self.integration.egui_ctx, &window);
+                                    if ppp > 0.0 && ppp.is_finite() {
+                                        let pointer_global_points =
+                                            egui::pos2(global.x as f32 / ppp, global.y as f32 / ppp);
+                                        self.integration.egui_ctx.data_mut(|d| {
+                                            d.insert_temp::<Option<egui::Pos2>>(
+                                                egui::Id::new("egui-winit::pointer_global_points"),
+                                                Some(pointer_global_points),
+                                            );
+                                        });
+                                    }
+                                }
+
+                                // At least provide hovered-viewport authority when pressing inside a viewport.
+                                self.integration.egui_ctx.data_mut(|d| {
+                                    d.insert_temp::<Option<ViewportId>>(
+                                        egui::Id::new("egui-winit::mouse_hovered_viewport_id"),
+                                        Some(viewport_id),
+                                    );
+                                });
+
                                 glutin.pointer_drag_viewport = Some(viewport_id);
                                 glutin.pointer_buttons_down |= bit;
                             }
@@ -1298,6 +1350,7 @@ impl GlutinWindowContext {
             pointer_buttons_down: 0,
             device_buttons_down: Default::default(),
             pointer_pos_global_px: None,
+            last_cursor_pos_in_window_px: Default::default(),
         };
 
         slf.initialize_window(ViewportId::ROOT, event_loop)?;
