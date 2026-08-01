@@ -1,6 +1,7 @@
 mod app_icon;
 mod epi_integration;
 mod event_loop_context;
+pub(crate) mod platform_provider;
 pub mod run;
 
 #[cfg(target_os = "macos")]
