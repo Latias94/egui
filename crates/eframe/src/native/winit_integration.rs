@@ -5,6 +5,8 @@ use winit::{
     window::{Window, WindowId},
 };
 
+#[cfg(feature = "native-test-support")]
+use super::test_support::NativeTestPointerEvent;
 use egui::ViewportId;
 #[cfg(feature = "accesskit")]
 use egui_winit::accesskit_winit;
@@ -65,6 +67,10 @@ pub enum UserEvent {
     /// A request related to [`accesskit`](https://accesskit.dev/).
     #[cfg(feature = "accesskit")]
     AccessKitActionRequest(accesskit_winit::Event),
+
+    /// A deterministic pointer action used only by the fork's native integration tests.
+    #[cfg(feature = "native-test-support")]
+    NativeTestPointer(NativeTestPointerEvent),
 }
 
 #[cfg(feature = "accesskit")]
@@ -85,10 +91,9 @@ pub trait WinitApp {
 
     fn save_and_destroy(&mut self);
 
-    fn run_ui_and_paint(
+    fn run_hosted_viewport_cycle(
         &mut self,
         event_loop: &ActiveEventLoop,
-        window_id: WindowId,
     ) -> crate::Result<EventResult>;
 
     fn suspended(&mut self, event_loop: &ActiveEventLoop) -> crate::Result<EventResult>;
@@ -100,6 +105,7 @@ pub trait WinitApp {
         event_loop: &ActiveEventLoop,
         device_id: winit::event::DeviceId,
         event: winit::event::DeviceEvent,
+        sequence: Option<egui::BackendEventSequence>,
     ) -> crate::Result<EventResult>;
 
     fn window_event(
@@ -107,10 +113,22 @@ pub trait WinitApp {
         event_loop: &ActiveEventLoop,
         window_id: WindowId,
         event: winit::event::WindowEvent,
+        sequence: Option<egui::BackendEventSequence>,
     ) -> crate::Result<EventResult>;
 
     #[cfg(feature = "accesskit")]
-    fn on_accesskit_event(&mut self, event: accesskit_winit::Event) -> crate::Result<EventResult>;
+    fn on_accesskit_event(
+        &mut self,
+        event: accesskit_winit::Event,
+        sequence: Option<egui::BackendEventSequence>,
+    ) -> crate::Result<EventResult>;
+
+    #[cfg(feature = "native-test-support")]
+    fn on_native_test_pointer_event(
+        &mut self,
+        event: NativeTestPointerEvent,
+        sequence: Option<egui::BackendEventSequence>,
+    ) -> crate::Result<EventResult>;
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

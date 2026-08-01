@@ -122,6 +122,10 @@ __screenshot = []
 ## and capture screenshots. Off unless the env var is set; no-op on wasm.
 inspection = ["dep:egui_inspection", "accesskit"]
 
+## Exposes a test-only event-loop driver for deterministic native ingress tests.
+## This feature is intentionally disabled by default and must not be enabled by published apps.
+native-test-support = []
+
 [dependencies]
 egui = { workspace = true, default-features = false, features = ["bytemuck"] }
 
@@ -174,16 +178,21 @@ objc2-foundation = { workspace = true, default-features = false, features = [
 ] }
 objc2-app-kit = { workspace = true, default-features = false, features = [
   "std",
+  "objc2-core-foundation",
+  "objc2-core-graphics",
   "NSApplication",
+  "NSApplicationScripting",
   "NSBitmapImageRep",
   "NSButton",
   "NSControl",
+  "NSEvent",
   "NSGraphics",
   "NSImage",
   "NSImageRep",
   "NSMenu",
   "NSMenuItem",
   "NSResponder",
+  "NSScreen",
   "NSView",
   "NSWindow",
 ] }
@@ -192,6 +201,7 @@ objc2-app-kit = { workspace = true, default-features = false, features = [
 [target.'cfg(any(target_os = "windows"))'.dependencies]
 windows-sys = { workspace = true, features = [
   "Win32_Foundation",
+  "Win32_Graphics_Gdi",
   "Win32_System_Com",
   "Win32_UI_Input_KeyboardAndMouse",
   "Win32_UI_Shell",

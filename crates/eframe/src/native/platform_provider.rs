@@ -7,10 +7,6 @@
     dead_code,
     reason = "the provider contract is staged before the native runtime integration"
 )]
-#![expect(
-    unused_imports,
-    reason = "the provider exports are staged before the native runtime integration"
-)]
 
 mod accessibility;
 mod authority;

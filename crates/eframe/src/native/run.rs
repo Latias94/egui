@@ -25,6 +25,21 @@ use crate::{
 /// See <https://github.com/emilk/egui/issues/7776>.
 const INVISIBLE_WINDOW_REPAINT_INTERVAL: Duration = Duration::from_millis(100);
 
+#[derive(Default)]
+struct HostedViewportCycleScheduler {
+    pending: bool,
+}
+
+impl HostedViewportCycleScheduler {
+    fn request(&mut self) {
+        self.pending = true;
+    }
+
+    fn take_pending(&mut self) -> bool {
+        std::mem::take(&mut self.pending)
+    }
+}
+
 // ----------------------------------------------------------------------------
 fn create_event_loop(native_options: &mut epi::NativeOptions) -> Result<EventLoop<UserEvent>> {
     #[cfg(target_os = "android")]
@@ -78,6 +93,8 @@ fn with_event_loop<R>(
 /// some events, but otherwise forwards events to the [`WinitApp`].
 struct WinitAppWrapper<T: WinitApp> {
     windows_next_repaint_times: HashMap<WindowId, Instant>,
+    hosted_viewport_cycle_scheduler: HostedViewportCycleScheduler,
+    next_backend_event_sequence: Option<u128>,
     winit_app: T,
     return_result: Result<(), crate::Error>,
     run_and_return: bool,
@@ -87,6 +104,8 @@ impl<T: WinitApp> WinitAppWrapper<T> {
     fn new(winit_app: T, run_and_return: bool) -> Self {
         Self {
             windows_next_repaint_times: HashMap::default(),
+            hosted_viewport_cycle_scheduler: HostedViewportCycleScheduler::default(),
+            next_backend_event_sequence: Some(0),
             winit_app,
             return_result: Ok(()),
             run_and_return,
@@ -113,7 +132,10 @@ impl<T: WinitApp> WinitAppWrapper<T> {
                 .insert(window_id, Instant::now());
 
             // Fix flickering on Windows, see https://github.com/emilk/egui/pull/2280
-            event_result = self.winit_app.run_ui_and_paint(event_loop, window_id);
+            self.hosted_viewport_cycle_scheduler.request();
+            if let Some(cycle_result) = self.run_pending_hosted_viewport_cycle(event_loop) {
+                event_result = cycle_result;
+            }
         }
 
         let combined_result = event_result.map(|event_result| match event_result {
@@ -185,6 +207,23 @@ impl<T: WinitApp> WinitAppWrapper<T> {
         self.check_redraw_requests(event_loop);
     }
 
+    fn mint_backend_event_sequence(&mut self) -> Option<egui::BackendEventSequence> {
+        let sequence = self.next_backend_event_sequence?;
+        self.next_backend_event_sequence = sequence.checked_add(1);
+        Some(egui::BackendEventSequence::new(sequence))
+    }
+
+    fn run_pending_hosted_viewport_cycle(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+    ) -> Option<Result<EventResult>> {
+        if self.hosted_viewport_cycle_scheduler.take_pending() {
+            Some(self.winit_app.run_hosted_viewport_cycle(event_loop))
+        } else {
+            None
+        }
+    }
+
     fn check_redraw_requests(&mut self, event_loop: &ActiveEventLoop) {
         let now = Instant::now();
 
@@ -199,8 +238,8 @@ impl<T: WinitApp> WinitAppWrapper<T> {
                 if let Some(window) = self.winit_app.window(*window_id) {
                     // On Windows, invisible windows don't receive RedrawRequested
                     // events, so pending viewport commands (e.g. Visible(true)) would
-                    // never be processed. We collect these windows to paint them
-                    // directly below.
+                    // never be processed. Collect their due deadlines and request one
+                    // shared hosted cycle below.
                     // See: https://github.com/emilk/egui/issues/5229
                     if is_invisible_or_minimized(&window) {
                         invisible_window_ids.push(*window_id);
@@ -215,12 +254,12 @@ impl<T: WinitApp> WinitAppWrapper<T> {
                 false
             });
 
-        // Paint invisible windows directly, since they won't receive
-        // RedrawRequested events on Windows. This ensures that viewport
-        // commands like Visible(true) are still processed.
-        for window_id in &invisible_window_ids {
-            let event_result = self.winit_app.run_ui_and_paint(event_loop, *window_id);
-            self.handle_event_result(event_loop, event_result);
+        // Invisible windows don't receive RedrawRequested events on Windows.
+        // Schedule one complete hosted cycle for the entire ready roster so
+        // viewport commands like Visible(true) are still processed.
+        if !invisible_window_ids.is_empty() {
+            self.hosted_viewport_cycle_scheduler.request();
+            event_loop.set_control_flow(ControlFlow::Poll);
         }
 
         // Throttle any already-scheduled repaints for invisible windows
@@ -279,10 +318,13 @@ impl<T: WinitApp> ApplicationHandler<UserEvent> for WinitAppWrapper<T> {
         event: winit::event::DeviceEvent,
     ) {
         profiling::function_scope!(egui_winit::short_device_event_description(&event));
+        let sequence = self.mint_backend_event_sequence();
 
         // Nb: Make sure this guard is dropped after this function returns.
         event_loop_context::with_event_loop_context(event_loop, move || {
-            let event_result = self.winit_app.device_event(event_loop, device_id, event);
+            let event_result = self
+                .winit_app
+                .device_event(event_loop, device_id, event, sequence);
             self.handle_event_result(event_loop, event_result);
         });
     }
@@ -292,6 +334,8 @@ impl<T: WinitApp> ApplicationHandler<UserEvent> for WinitAppWrapper<T> {
             UserEvent::RequestRepaint { .. } => "UserEvent::RequestRepaint",
             #[cfg(feature = "accesskit")]
             UserEvent::AccessKitActionRequest(_) => "UserEvent::AccessKitActionRequest",
+            #[cfg(feature = "native-test-support")]
+            UserEvent::NativeTestPointer(_) => "UserEvent::NativeTestPointer",
         });
 
         event_loop_context::with_event_loop_context(event_loop, move || {
@@ -333,7 +377,13 @@ impl<T: WinitApp> ApplicationHandler<UserEvent> for WinitAppWrapper<T> {
                 }
                 #[cfg(feature = "accesskit")]
                 UserEvent::AccessKitActionRequest(request) => {
-                    self.winit_app.on_accesskit_event(request)
+                    let sequence = self.mint_backend_event_sequence();
+                    self.winit_app.on_accesskit_event(request, sequence)
+                }
+                #[cfg(feature = "native-test-support")]
+                UserEvent::NativeTestPointer(event) => {
+                    let sequence = self.mint_backend_event_sequence();
+                    self.winit_app.on_native_test_pointer_event(event, sequence)
                 }
             };
             self.handle_event_result(event_loop, event_result);
@@ -355,18 +405,69 @@ impl<T: WinitApp> ApplicationHandler<UserEvent> for WinitAppWrapper<T> {
         event: winit::event::WindowEvent,
     ) {
         profiling::function_scope!(egui_winit::short_window_event_description(&event));
+        let sequence = self.mint_backend_event_sequence();
 
         // Nb: Make sure this guard is dropped after this function returns.
         event_loop_context::with_event_loop_context(event_loop, move || {
-            let event_result = match event {
-                winit::event::WindowEvent::RedrawRequested => {
-                    self.winit_app.run_ui_and_paint(event_loop, window_id)
-                }
-                _ => self.winit_app.window_event(event_loop, window_id, event),
-            };
-
-            self.handle_event_result(event_loop, event_result);
+            if matches!(&event, winit::event::WindowEvent::RedrawRequested) {
+                self.hosted_viewport_cycle_scheduler.request();
+            } else {
+                let event_result = self
+                    .winit_app
+                    .window_event(event_loop, window_id, event, sequence);
+                self.handle_event_result(event_loop, event_result);
+            }
         });
+    }
+
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        profiling::scope!("Event::AboutToWait");
+
+        event_loop_context::with_event_loop_context(event_loop, move || {
+            if let Some(event_result) = self.run_pending_hosted_viewport_cycle(event_loop) {
+                self.handle_event_result(event_loop, event_result);
+            }
+        });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::HostedViewportCycleScheduler;
+
+    #[test]
+    fn repeated_redraws_schedule_one_hosted_cycle() {
+        let mut scheduler = HostedViewportCycleScheduler::default();
+
+        scheduler.request();
+        scheduler.request();
+        scheduler.request();
+
+        assert!(scheduler.take_pending());
+        assert!(!scheduler.take_pending());
+    }
+
+    #[test]
+    fn invisible_and_ordinary_requests_share_one_pending_cycle() {
+        let mut scheduler = HostedViewportCycleScheduler::default();
+
+        scheduler.request();
+        scheduler.request();
+
+        assert!(scheduler.take_pending());
+        assert!(!scheduler.take_pending());
+    }
+
+    #[test]
+    fn scheduler_accepts_another_cycle_after_consumption() {
+        let mut scheduler = HostedViewportCycleScheduler::default();
+
+        scheduler.request();
+        assert!(scheduler.take_pending());
+
+        scheduler.request();
+        assert!(scheduler.take_pending());
+        assert!(!scheduler.take_pending());
     }
 }
 

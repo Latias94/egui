@@ -216,6 +216,13 @@ pub use native::{
 
 #[cfg(not(target_arch = "wasm32"))]
 #[cfg(any(feature = "glow", feature = "wgpu_no_default_features"))]
+#[cfg(feature = "native-test-support")]
+pub use native::{
+    NativeTestDriver, NativeTestPointerAction, NativeTestPointerEvent, NativeTestPointerLocation,
+};
+
+#[cfg(not(target_arch = "wasm32"))]
+#[cfg(any(feature = "glow", feature = "wgpu_no_default_features"))]
 pub use native::platform_provider::{
     NativeAccessibilityAction, NativeAccessibilityEdge, NativeAuthority, NativeBackendCapabilities,
     NativeBackendCapability, NativeCaptureOwner, NativeCloseState, NativeEffectAcknowledgement,

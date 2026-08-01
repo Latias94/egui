@@ -1,10 +1,5 @@
 //! Cycle-scoped scheduling for native viewports that have no binding yet.
 
-#![allow(
-    dead_code,
-    reason = "the native event-loop driver is connected in the following integration commit"
-)]
-
 use std::{collections::BTreeSet, sync::Arc};
 
 use super::platform_provider::{

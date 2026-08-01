@@ -152,6 +152,15 @@ pub struct CreationContext<'s> {
     /// Raw platform display handle for window
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) raw_display_handle: Result<RawDisplayHandle, HandleError>,
+
+    /// A deterministic native event-loop driver available only to fork tests.
+    #[cfg(all(
+        not(target_arch = "wasm32"),
+        any(feature = "glow", feature = "wgpu_no_default_features"),
+        feature = "native-test-support"
+    ))]
+    #[doc(hidden)]
+    pub native_test_driver: Option<crate::NativeTestDriver>,
 }
 
 #[expect(unsafe_code)]
@@ -188,6 +197,12 @@ impl CreationContext<'_> {
             wgpu_render_state: None,
             #[cfg(not(target_arch = "wasm32"))]
             window: None,
+            #[cfg(all(
+                not(target_arch = "wasm32"),
+                any(feature = "glow", feature = "wgpu_no_default_features"),
+                feature = "native-test-support"
+            ))]
+            native_test_driver: None,
             #[cfg(not(target_arch = "wasm32"))]
             raw_window_handle: Err(HandleError::NotSupported),
             #[cfg(not(target_arch = "wasm32"))]

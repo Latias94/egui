@@ -1,10 +1,5 @@
 //! Complete-roster native viewport cycle orchestration.
 
-#![allow(
-    dead_code,
-    reason = "renderer drivers are connected in the following integration commit"
-)]
-
 use std::{
     cell::RefCell,
     collections::{BTreeMap, BTreeSet, VecDeque},

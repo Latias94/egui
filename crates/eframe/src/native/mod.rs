@@ -6,8 +6,20 @@ pub use native_effect_sink::{NativeEffectSink, NativeEffectSubmitError};
 mod native_viewport_create_sink;
 pub use native_viewport_create_sink::{NativeViewportCreateSink, NativeViewportCreateSubmitError};
 pub mod hosted_cycle;
+mod native_pointer_probe;
+mod native_window_probe;
+mod native_work_area_authority;
+mod native_work_area_probe;
+mod platform_ingress_owner;
 pub(crate) mod platform_provider;
 pub mod run;
+#[cfg(feature = "native-test-support")]
+mod test_support;
+
+#[cfg(feature = "native-test-support")]
+pub use test_support::{
+    NativeTestDriver, NativeTestPointerAction, NativeTestPointerEvent, NativeTestPointerLocation,
+};
 
 #[cfg(target_os = "macos")]
 pub(crate) mod macos;
@@ -19,10 +31,6 @@ pub mod file_storage;
 pub(crate) mod winit_integration;
 
 #[cfg(any(feature = "glow", feature = "wgpu_no_default_features"))]
-#[allow(
-    dead_code,
-    reason = "renderer drivers are connected in the following integration commit"
-)]
 #[derive(Clone)]
 pub(crate) struct PresentationResults {
     hook: Option<crate::PresentationResultHook>,
@@ -31,10 +39,6 @@ pub(crate) struct PresentationResults {
 }
 
 #[cfg(any(feature = "glow", feature = "wgpu_no_default_features"))]
-#[allow(
-    dead_code,
-    reason = "renderer drivers are connected in the following integration commit"
-)]
 impl PresentationResults {
     pub(crate) fn new(
         hook: Option<crate::PresentationResultHook>,
@@ -93,10 +97,6 @@ impl PresentationResults {
 }
 
 #[cfg(any(feature = "glow", feature = "wgpu_no_default_features"))]
-#[allow(
-    dead_code,
-    reason = "renderer drivers are connected in the following integration commit"
-)]
 pub(crate) struct PendingPresentation {
     results: PresentationResults,
     viewport_id: egui::ViewportId,
@@ -106,10 +106,6 @@ pub(crate) struct PendingPresentation {
 }
 
 #[cfg(any(feature = "glow", feature = "wgpu_no_default_features"))]
-#[allow(
-    dead_code,
-    reason = "renderer drivers are connected in the following integration commit"
-)]
 impl PendingPresentation {
     pub(crate) fn new(
         results: PresentationResults,
@@ -197,7 +193,13 @@ impl Drop for PendingPresentation {
 }
 
 #[cfg(feature = "glow")]
+mod glow_hosted_cycle;
+
+#[cfg(feature = "glow")]
 mod glow_integration;
+
+#[cfg(feature = "wgpu_no_default_features")]
+mod wgpu_hosted_cycle;
 
 #[cfg(feature = "wgpu_no_default_features")]
 mod wgpu_integration;
