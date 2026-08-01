@@ -1,4 +1,4 @@
-use egui::{Event, UserData};
+use egui::UserData;
 use wasm_bindgen::JsValue;
 
 /// Renderer for a browser canvas.
@@ -28,7 +28,7 @@ pub(crate) trait WebPainter {
         capture: Vec<UserData>,
     ) -> Result<(), JsValue>;
 
-    fn handle_screenshots(&mut self, events: &mut Vec<Event>);
+    fn handle_screenshots(&mut self, events: &mut Vec<egui::EventEnvelope>);
 
     /// Destroy all resources.
     fn destroy(&mut self);

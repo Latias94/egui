@@ -84,6 +84,7 @@ pub struct State {
     viewport_id: ViewportId,
     start_time: web_time::Instant,
     egui_input: egui::RawInput,
+    event_derivation: egui::BackendEventDerivation,
     pointer_pos_in_points: Option<egui::Pos2>,
     any_pointer_button_down: bool,
     current_cursor_icon: Option<egui::CursorIcon>,
@@ -122,6 +123,43 @@ pub struct State {
     pressed_processed_physical_keys: HashSet<winit::keyboard::PhysicalKey>,
 }
 
+struct EventDerivationScope<'a> {
+    state: &'a mut State,
+    previous: Option<egui::BackendEventDerivation>,
+}
+
+impl<'a> EventDerivationScope<'a> {
+    fn new(state: &'a mut State, derivation: egui::BackendEventDerivation) -> Self {
+        let previous = std::mem::replace(&mut state.event_derivation, derivation);
+        Self {
+            state,
+            previous: Some(previous),
+        }
+    }
+}
+
+impl std::ops::Deref for EventDerivationScope<'_> {
+    type Target = State;
+
+    fn deref(&self) -> &Self::Target {
+        self.state
+    }
+}
+
+impl std::ops::DerefMut for EventDerivationScope<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.state
+    }
+}
+
+impl Drop for EventDerivationScope<'_> {
+    fn drop(&mut self) {
+        if let Some(previous) = self.previous.take() {
+            self.state.event_derivation = previous;
+        }
+    }
+}
+
 impl State {
     /// Construct a new instance
     pub fn new(
@@ -146,6 +184,7 @@ impl State {
                 .unwrap_or_else(web_time::Instant::now),
             egui_ctx,
             egui_input,
+            event_derivation: egui::BackendEventDerivation::unknown(),
             pointer_pos_in_points: None,
             any_pointer_button_down: false,
             current_cursor_icon: None,
@@ -284,6 +323,36 @@ impl State {
         window: &Window,
         event: &winit::event::WindowEvent,
     ) -> EventResponse {
+        self.with_event_derivation(egui::BackendEventDerivation::unknown(), |this| {
+            this.on_window_event_impl(window, event)
+        })
+    }
+
+    /// Call this for a winit event whose position in the integration-wide event stream is known.
+    ///
+    /// Every egui event derived by this call receives the same `sequence` and a stable zero-based
+    /// derivative ordinal. Integrations with several windows must mint `sequence` from one shared
+    /// counter before routing the winit event to a window.
+    ///
+    /// This adds correlation only. It does not prove capture, viewport incarnation, or a global
+    /// release. In particular, `CursorLeft` emits only `PointerGone`; a higher-level coordinator
+    /// must journal an actual release delivered outside this window.
+    pub fn on_window_event_with_sequence(
+        &mut self,
+        window: &Window,
+        event: &winit::event::WindowEvent,
+        sequence: egui::BackendEventSequence,
+    ) -> EventResponse {
+        self.with_event_derivation(egui::BackendEventDerivation::known(sequence), |this| {
+            this.on_window_event_impl(window, event)
+        })
+    }
+
+    fn on_window_event_impl(
+        &mut self,
+        window: &Window,
+        event: &winit::event::WindowEvent,
+    ) -> EventResponse {
         profiling::function_scope!(short_window_event_description(event));
 
         #[cfg(feature = "accesskit")]
@@ -345,7 +414,9 @@ impl State {
             }
             WindowEvent::CursorLeft { .. } => {
                 self.pointer_pos_in_points = None;
-                self.egui_input.events.push(egui::Event::PointerGone);
+                // This is only a viewport-local absence observation. Never synthesize a release:
+                // a coordinator-owned raw journal must report a global release explicitly.
+                self.push_event(egui::Event::PointerGone);
                 EventResponse {
                     repaint: true,
                     consumed: false,
@@ -422,9 +493,7 @@ impl State {
                 };
 
                 self.egui_input.focused = focused;
-                self.egui_input
-                    .events
-                    .push(egui::Event::WindowFocused(focused));
+                self.push_event(egui::Event::WindowFocused(focused));
                 EventResponse {
                     repaint: true,
                     consumed: false,
@@ -514,7 +583,7 @@ impl State {
                 // Positive delta values indicate magnification (zooming in).
                 // Negative delta values indicate shrinking (zooming out).
                 let zoom_factor = (*delta as f32).exp();
-                self.egui_input.events.push(egui::Event::Zoom(zoom_factor));
+                self.push_event(egui::Event::Zoom(zoom_factor));
                 EventResponse {
                     repaint: true,
                     consumed: self.egui_ctx.egui_wants_pointer_input(),
@@ -525,9 +594,7 @@ impl State {
                 // Positive delta values indicate counterclockwise rotation
                 // Negative delta values indicate clockwise rotation
                 // This is opposite of egui's sign convention for angles
-                self.egui_input
-                    .events
-                    .push(egui::Event::Rotate(-delta.to_radians()));
+                self.push_event(egui::Event::Rotate(-delta.to_radians()));
                 EventResponse {
                     repaint: true,
                     consumed: self.egui_ctx.egui_wants_pointer_input(),
@@ -537,7 +604,7 @@ impl State {
             WindowEvent::PanGesture { delta, phase, .. } => {
                 let pixels_per_point = pixels_per_point(&self.egui_ctx, window);
 
-                self.egui_input.events.push(egui::Event::MouseWheel {
+                self.push_event(egui::Event::MouseWheel {
                     unit: egui::MouseWheelUnit::Point,
                     delta: Vec2::new(delta.x, delta.y) / pixels_per_point,
                     phase: to_egui_touch_phase(*phase),
@@ -549,6 +616,20 @@ impl State {
                 }
             }
         }
+    }
+
+    fn with_event_derivation<R>(
+        &mut self,
+        derivation: egui::BackendEventDerivation,
+        derive: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        let mut scope = EventDerivationScope::new(self, derivation);
+        derive(&mut scope)
+    }
+
+    fn push_event(&mut self, event: egui::Event) {
+        let event = self.event_derivation.envelope(event);
+        self.egui_input.events.push(event);
     }
 
     #[cfg(not(target_os = "windows"))]
@@ -728,28 +809,41 @@ impl State {
                     None => None,
                 };
 
-                self.egui_input
-                    .events
-                    .push(egui::Event::Ime(egui::ImeEvent::Preedit {
-                        text: text.clone(),
-                        active_range_chars,
-                    }));
+                self.push_event(egui::Event::Ime(egui::ImeEvent::Preedit {
+                    text: text.clone(),
+                    active_range_chars,
+                }));
             }
             winit::event::Ime::Commit(text) => {
-                self.egui_input
-                    .events
-                    .push(egui::Event::Ime(egui::ImeEvent::Commit(text.clone())));
+                self.push_event(egui::Event::Ime(egui::ImeEvent::Commit(text.clone())));
             }
         }
     }
 
     /// Returns `true` if the event was sent to egui.
     pub fn on_mouse_motion(&mut self, delta: (f64, f64)) -> bool {
+        self.with_event_derivation(egui::BackendEventDerivation::unknown(), |this| {
+            this.on_mouse_motion_impl(delta)
+        })
+    }
+
+    /// Handle mouse motion from a sequenced backend event.
+    pub fn on_mouse_motion_with_sequence(
+        &mut self,
+        delta: (f64, f64),
+        sequence: egui::BackendEventSequence,
+    ) -> bool {
+        self.with_event_derivation(egui::BackendEventDerivation::known(sequence), |this| {
+            this.on_mouse_motion_impl(delta)
+        })
+    }
+
+    fn on_mouse_motion_impl(&mut self, delta: (f64, f64)) -> bool {
         if !self.is_pointer_in_window() && !self.any_pointer_button_down {
             return false;
         }
 
-        self.egui_input.events.push(egui::Event::MouseMoved(Vec2 {
+        self.push_event(egui::Event::MouseMoved(Vec2 {
             x: delta.0 as f32,
             y: delta.1 as f32,
         }));
@@ -771,9 +865,7 @@ impl State {
     /// The result can be found in [`Self::egui_input`] and be extracted with [`Self::take_egui_input`].
     #[cfg(feature = "accesskit")]
     pub fn on_accesskit_action_request(&mut self, request: accesskit::ActionRequest) {
-        self.egui_input
-            .events
-            .push(egui::Event::AccessKitActionRequest(request));
+        self.push_event(egui::Event::AccessKitActionRequest(request));
     }
 
     fn on_mouse_button_input(
@@ -786,7 +878,7 @@ impl State {
         {
             let pressed = state == winit::event::ElementState::Pressed;
 
-            self.egui_input.events.push(egui::Event::PointerButton {
+            self.push_event(egui::Event::PointerButton {
                 pos,
                 button,
                 pressed,
@@ -797,7 +889,7 @@ impl State {
                 if pressed {
                     self.any_pointer_button_down = true;
 
-                    self.egui_input.events.push(egui::Event::Touch {
+                    self.push_event(egui::Event::Touch {
                         device_id: egui::TouchDeviceId(0),
                         id: egui::TouchId(0),
                         phase: egui::TouchPhase::Start,
@@ -807,9 +899,9 @@ impl State {
                 } else {
                     self.any_pointer_button_down = false;
 
-                    self.egui_input.events.push(egui::Event::PointerGone);
+                    self.push_event(egui::Event::PointerGone);
 
-                    self.egui_input.events.push(egui::Event::Touch {
+                    self.push_event(egui::Event::Touch {
                         device_id: egui::TouchDeviceId(0),
                         id: egui::TouchId(0),
                         phase: egui::TouchPhase::End,
@@ -836,11 +928,9 @@ impl State {
 
         if self.simulate_touch_screen {
             if self.any_pointer_button_down {
-                self.egui_input
-                    .events
-                    .push(egui::Event::PointerMoved(pos_in_points));
+                self.push_event(egui::Event::PointerMoved(pos_in_points));
 
-                self.egui_input.events.push(egui::Event::Touch {
+                self.push_event(egui::Event::Touch {
                     device_id: egui::TouchDeviceId(0),
                     id: egui::TouchId(0),
                     phase: egui::TouchPhase::Move,
@@ -849,9 +939,7 @@ impl State {
                 });
             }
         } else {
-            self.egui_input
-                .events
-                .push(egui::Event::PointerMoved(pos_in_points));
+            self.push_event(egui::Event::PointerMoved(pos_in_points));
         }
     }
 
@@ -859,7 +947,7 @@ impl State {
         let pixels_per_point = pixels_per_point(&self.egui_ctx, window);
 
         // Emit touch event
-        self.egui_input.events.push(egui::Event::Touch {
+        self.push_event(egui::Event::Touch {
             device_id: egui::TouchDeviceId(egui::epaint::util::hash(touch.device_id)),
             id: egui::TouchId::from(touch.id),
             phase: to_egui_touch_phase(touch.phase),
@@ -904,12 +992,12 @@ impl State {
                     // The pointer should vanish completely to not get any
                     // hover effects
                     self.pointer_pos_in_points = None;
-                    self.egui_input.events.push(egui::Event::PointerGone);
+                    self.push_event(egui::Event::PointerGone);
                 }
                 winit::event::TouchPhase::Cancelled => {
                     self.pointer_touch_id = None;
                     self.pointer_pos_in_points = None;
-                    self.egui_input.events.push(egui::Event::PointerGone);
+                    self.push_event(egui::Event::PointerGone);
                 }
             }
         }
@@ -938,7 +1026,7 @@ impl State {
             };
             let phase = to_egui_touch_phase(phase);
             let modifiers = self.egui_input.modifiers;
-            self.egui_input.events.push(egui::Event::MouseWheel {
+            self.push_event(egui::Event::MouseWheel {
                 unit,
                 delta,
                 phase,
@@ -999,23 +1087,23 @@ impl State {
         if let Some(active_key) = logical_key.or(physical_key) {
             if pressed {
                 if is_cut_command(self.egui_input.modifiers, active_key) {
-                    self.egui_input.events.push(egui::Event::Cut);
+                    self.push_event(egui::Event::Cut);
                     return;
                 } else if is_copy_command(self.egui_input.modifiers, active_key) {
-                    self.egui_input.events.push(egui::Event::Copy);
+                    self.push_event(egui::Event::Copy);
                     return;
                 } else if is_paste_command(self.egui_input.modifiers, active_key) {
                     if let Some(contents) = self.clipboard.get() {
                         let contents = contents.replace("\r\n", "\n");
                         if !contents.is_empty() {
-                            self.egui_input.events.push(egui::Event::Paste(contents));
+                            self.push_event(egui::Event::Paste(contents));
                         }
                     }
                     return;
                 }
             }
 
-            self.egui_input.events.push(egui::Event::Key {
+            self.push_event(egui::Event::Key {
                 key: active_key,
                 physical_key,
                 pressed,
@@ -1040,9 +1128,7 @@ impl State {
                     || self.egui_input.modifiers.command
                     || self.egui_input.modifiers.mac_cmd;
                 if pressed && !is_cmd {
-                    self.egui_input
-                        .events
-                        .push(egui::Event::Text(text.to_owned()));
+                    self.push_event(egui::Event::Text(text.to_owned()));
                 }
             }
         }
@@ -1092,7 +1178,8 @@ impl State {
             commands,
             cursor_icon,
             cursor_image,
-            events: _,                    // handled elsewhere
+            presentation_token: _, // consumed by higher-level native integrations
+            events: _,             // handled elsewhere
             mutable_text_under_cursor: _, // only used in eframe web
             ime,
             accesskit_update,
@@ -2280,5 +2367,148 @@ pub fn short_window_event_description(event: &winit::event::WindowEvent) -> &'st
         WindowEvent::ThemeChanged { .. } => "WindowEvent::ThemeChanged",
         WindowEvent::Occluded { .. } => "WindowEvent::Occluded",
         WindowEvent::PanGesture { .. } => "WindowEvent::PanGesture",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn state() -> State {
+        State {
+            egui_ctx: egui::Context::default(),
+            viewport_id: ViewportId::ROOT,
+            start_time: web_time::Instant::now(),
+            egui_input: egui::RawInput::default(),
+            event_derivation: egui::BackendEventDerivation::unknown(),
+            pointer_pos_in_points: None,
+            any_pointer_button_down: false,
+            current_cursor_icon: None,
+            current_custom_cursor: None,
+            clipboard: clipboard::Clipboard::new(None),
+            simulate_touch_screen: false,
+            pointer_touch_id: None,
+            #[cfg(feature = "accesskit")]
+            accesskit: None,
+            allow_ime: false,
+            ime_rect_px: None,
+            #[cfg(target_os = "windows")]
+            pressed_processed_physical_keys: HashSet::new(),
+        }
+    }
+
+    fn correlations(state: &State) -> Vec<egui::EventCorrelation> {
+        state
+            .egui_input
+            .events
+            .iter()
+            .map(egui::EventEnvelope::correlation)
+            .collect()
+    }
+
+    #[test]
+    fn nested_event_derivations_restore_the_outer_ordinal() {
+        let mut state = state();
+        let outer = egui::BackendEventSequence::new(10);
+        let inner = egui::BackendEventSequence::new(20);
+
+        state.with_event_derivation(egui::BackendEventDerivation::known(outer), |state| {
+            state.push_event(egui::Event::Copy);
+            state.with_event_derivation(egui::BackendEventDerivation::known(inner), |state| {
+                state.push_event(egui::Event::Cut);
+            });
+            state.push_event(egui::Event::Paste("outer".to_owned()));
+        });
+        state.push_event(egui::Event::PointerGone);
+
+        assert_eq!(
+            correlations(&state),
+            vec![
+                egui::EventCorrelation::Known {
+                    sequence: outer,
+                    derivative_ordinal: 0,
+                },
+                egui::EventCorrelation::Known {
+                    sequence: inner,
+                    derivative_ordinal: 0,
+                },
+                egui::EventCorrelation::Known {
+                    sequence: outer,
+                    derivative_ordinal: 1,
+                },
+                egui::EventCorrelation::Unknown,
+            ]
+        );
+    }
+
+    #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "this regression test verifies scoped restoration during unwinding"
+    )]
+    fn panicking_event_derivation_restores_unknown_provenance() {
+        let mut state = state();
+        let sequence = egui::BackendEventSequence::new(30);
+
+        let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            state.with_event_derivation(egui::BackendEventDerivation::known(sequence), |state| {
+                state.push_event(egui::Event::Copy);
+                panic!("test event derivation unwind");
+            });
+        }));
+        assert!(unwind.is_err());
+        state.push_event(egui::Event::Cut);
+
+        assert_eq!(
+            correlations(&state),
+            vec![
+                egui::EventCorrelation::Known {
+                    sequence,
+                    derivative_ordinal: 0,
+                },
+                egui::EventCorrelation::Unknown,
+            ]
+        );
+    }
+
+    #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "this regression test verifies nested scoped restoration during unwinding"
+    )]
+    fn panicking_nested_derivation_restores_the_outer_provenance() {
+        let mut state = state();
+        let outer = egui::BackendEventSequence::new(40);
+        let inner = egui::BackendEventSequence::new(50);
+
+        state.with_event_derivation(egui::BackendEventDerivation::known(outer), |state| {
+            state.push_event(egui::Event::Copy);
+            let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                state.with_event_derivation(egui::BackendEventDerivation::known(inner), |state| {
+                    state.push_event(egui::Event::Cut);
+                    panic!("test nested event derivation unwind");
+                });
+            }));
+            assert!(unwind.is_err());
+            state.push_event(egui::Event::Paste("outer restored".to_owned()));
+        });
+
+        assert_eq!(
+            correlations(&state),
+            vec![
+                egui::EventCorrelation::Known {
+                    sequence: outer,
+                    derivative_ordinal: 0,
+                },
+                egui::EventCorrelation::Known {
+                    sequence: inner,
+                    derivative_ordinal: 0,
+                },
+                egui::EventCorrelation::Known {
+                    sequence: outer,
+                    derivative_ordinal: 1,
+                },
+            ]
+        );
     }
 }

@@ -81,9 +81,13 @@ impl Keypad {
                 .events
                 .take()
         });
-        if let Some(mut events) = events {
-            events.append(&mut raw_input.events);
-            raw_input.events = events;
+        if let Some(events) = events {
+            let mut injected = events
+                .into_iter()
+                .map(egui::EventEnvelope::unknown)
+                .collect::<Vec<_>>();
+            injected.append(&mut raw_input.events);
+            raw_input.events = injected;
         }
     }
 

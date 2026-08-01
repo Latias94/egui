@@ -21,6 +21,28 @@ struct SurfaceState {
     needs_recreate: bool,
 }
 
+/// The synchronous result of painting one native WGPU frame.
+///
+/// [`egui::PaintOutcome::SubmittedToSwapchain`] means that WGPU scheduled the surface texture for
+/// presentation. It does not prove that the compositor accepted or displayed it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PaintResult {
+    /// Approximate seconds spent waiting for vertical synchronization.
+    pub vsync_seconds: f32,
+
+    /// The terminal renderer outcome for this paint attempt.
+    pub outcome: egui::PaintOutcome,
+}
+
+impl PaintResult {
+    fn new(vsync_seconds: f32, outcome: egui::PaintOutcome) -> Self {
+        Self {
+            vsync_seconds,
+            outcome,
+        }
+    }
+}
+
 /// Everything you need to paint egui with [`wgpu`] on [`winit`].
 ///
 /// Alternatively you can use [`crate::Renderer`] directly.
@@ -465,10 +487,8 @@ impl Painter {
         }
     }
 
-    /// Returns two things:
-    ///
-    /// The approximate number of seconds spent on vsync-waiting (if any),
-    /// and the captures captured screenshot if it was requested.
+    /// Returns the approximate time spent waiting for vertical synchronization and a terminal
+    /// renderer outcome.
     ///
     /// If `capture_data` isn't empty, a screenshot will be captured.
     #[expect(clippy::too_many_arguments)]
@@ -481,7 +501,7 @@ impl Painter {
         textures_delta: &epaint::textures::TexturesDelta,
         capture_data: Vec<UserData>,
         window: &Arc<winit::window::Window>,
-    ) -> f32 {
+    ) -> PaintResult {
         profiling::function_scope!();
 
         /// Guard to ensure that commands are always submitted to the renderer queue
@@ -519,7 +539,10 @@ impl Painter {
             && let Err(err) = self.recreate_surface(viewport_id, window)
         {
             log::error!("Failed to recreate surface for {viewport_id:?}: {err}");
-            return vsync_sec;
+            return PaintResult::new(
+                vsync_sec,
+                egui::PaintOutcome::Failed(egui::PaintFailure::SurfaceSetup(err.to_string())),
+            );
         }
 
         // Apply any runtime changes requested via `RenderState::surface_config`.
@@ -537,7 +560,10 @@ impl Painter {
         }
 
         let Some(render_state) = self.render_state.as_mut() else {
-            return vsync_sec;
+            return PaintResult::new(
+                vsync_sec,
+                egui::PaintOutcome::Failed(egui::PaintFailure::RendererUnavailable),
+            );
         };
 
         let mut render_queue_guard = RendererQueueGuard {
@@ -561,7 +587,10 @@ impl Painter {
         }
 
         let Some(surface_state) = self.surfaces.get_mut(&viewport_id) else {
-            return vsync_sec;
+            return PaintResult::new(
+                vsync_sec,
+                egui::PaintOutcome::Failed(egui::PaintFailure::SurfaceUnavailable),
+            );
         };
 
         let mut encoder =
@@ -609,6 +638,27 @@ impl Painter {
                 frame
             }
             other => {
+                let outcome = match &other {
+                    wgpu::CurrentSurfaceTexture::Timeout => {
+                        egui::PaintOutcome::Skipped(egui::PaintSkipReason::SurfaceAcquireTimeout)
+                    }
+                    wgpu::CurrentSurfaceTexture::Occluded => {
+                        egui::PaintOutcome::Skipped(egui::PaintSkipReason::SurfaceOccluded)
+                    }
+                    wgpu::CurrentSurfaceTexture::Outdated => {
+                        egui::PaintOutcome::Skipped(egui::PaintSkipReason::SurfaceOutdated)
+                    }
+                    wgpu::CurrentSurfaceTexture::Lost => {
+                        egui::PaintOutcome::Skipped(egui::PaintSkipReason::SurfaceLost)
+                    }
+                    wgpu::CurrentSurfaceTexture::Validation => {
+                        egui::PaintOutcome::Failed(egui::PaintFailure::SurfaceAcquireValidation)
+                    }
+                    wgpu::CurrentSurfaceTexture::Success(_)
+                    | wgpu::CurrentSurfaceTexture::Suboptimal(_) => {
+                        egui::PaintOutcome::Failed(egui::PaintFailure::CoordinatorAborted)
+                    }
+                };
                 match (*self.config.on_surface_status)(&other) {
                     SurfaceErrorAction::Reconfigure => {
                         Self::configure_surface(surface_state, render_state, &self.config.surface);
@@ -625,7 +675,7 @@ impl Painter {
                     }
                     SurfaceErrorAction::SkipFrame => {}
                 }
-                return vsync_sec;
+                return PaintResult::new(vsync_sec, outcome);
             }
         };
 
@@ -769,19 +819,19 @@ impl Painter {
             vsync_sec += start.elapsed().as_secs_f32();
         }
 
-        vsync_sec
+        PaintResult::new(vsync_sec, egui::PaintOutcome::SubmittedToSwapchain)
     }
 
     /// Call this at the beginning of each frame to receive the requested screenshots.
-    pub fn handle_screenshots(&self, events: &mut Vec<Event>) {
+    pub fn handle_screenshots(&self, events: &mut Vec<egui::EventEnvelope>) {
         for (viewport_id, user_data, screenshot) in self.capture_rx.try_iter() {
             let screenshot = Arc::new(screenshot);
             for data in user_data {
-                events.push(Event::Screenshot {
+                events.push(egui::EventEnvelope::unknown(Event::Screenshot {
                     viewport_id,
                     user_data: data,
                     image: Arc::clone(&screenshot),
-                });
+                }));
             }
         }
     }

@@ -253,7 +253,7 @@ impl<'a, State> Harness<'a, State> {
         for event in events {
             match event {
                 EventType::Event(event) => {
-                    self.input.events.push(event);
+                    self.input.push_event(event);
                 }
                 EventType::Modifiers(modifiers) => {
                     self.input.modifiers = modifiers;
@@ -713,7 +713,7 @@ impl<'a, State> Harness<'a, State> {
         let image = std::sync::Arc::new(rgba_image_to_color_image(&image));
 
         for (viewport_id, user_data) in requests {
-            self.input.events.push(egui::Event::Screenshot {
+            self.input.push_event(egui::Event::Screenshot {
                 viewport_id,
                 user_data,
                 image: std::sync::Arc::clone(&image),

@@ -272,7 +272,9 @@ impl AppRunner {
             );
         }
 
+        let event_provenance = raw_input.event_provenance_snapshot();
         self.app.raw_input_hook(&self.egui_ctx, &mut raw_input);
+        raw_input.sanitize_hook_events(&event_provenance);
 
         let is_visible = raw_input
             .viewports
@@ -292,6 +294,8 @@ impl AppRunner {
             textures_delta,
             shapes,
             pixels_per_point,
+            pointer_receiver_journal: _,
+            pointer_hit_graph_candidate: _,
             viewport_output,
         } = full_output;
 
@@ -369,6 +373,7 @@ impl AppRunner {
             commands,
             cursor_icon,
             cursor_image: _, // TODO(alextournai): support custom bitmap cursors on the web (via CSS `url(...)`)
+            presentation_token: _, // native integrations may acknowledge this after presentation
             events: _,       // already handled
             mutable_text_under_cursor: _, // TODO(#4569): https://github.com/emilk/egui/issues/4569
             ime,

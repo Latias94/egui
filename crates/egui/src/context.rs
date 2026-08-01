@@ -1,6 +1,12 @@
 #![warn(missing_docs)] // Let's keep `Context` well-documented.
 
-use std::{borrow::Cow, cell::RefCell, panic::Location, sync::Arc, time::Duration};
+use std::{
+    borrow::Cow,
+    cell::{Cell, RefCell},
+    panic::Location,
+    sync::Arc,
+    time::Duration,
+};
 
 use emath::GuiRounding as _;
 use epaint::{
@@ -27,7 +33,11 @@ use crate::{
     epaint,
     hit_test::WidgetHits,
     input_state::{InputState, MultiTouchInfo, PointerEvent, SurrenderFocusOn},
-    interaction::InteractionSnapshot,
+    interaction::{
+        CapturedReceiver, InteractionSnapshot, PointerDelivery, PointerEventId, PointerEventKind,
+        PointerEventState, PointerReceiverAuthority, PointerReceiverJournal, PointerReceiverRecord,
+        PointerReceiverUnavailableReason, PointerRoute,
+    },
     layers::GraphicLayers,
     load::{self, Bytes, Loaders, SizedTexture},
     memory::{Options, Theme},
@@ -35,6 +45,9 @@ use crate::{
     output::FullOutput,
     pass_state::PassState,
     plugin::{self, TypedPluginHandle},
+    pointer_hit_graph::{
+        PointerHitGraphCandidate, PointerHitGraphSnapshot, PresentedPointerHitGraphAuthority,
+    },
     resize, response, scroll_area,
     util::IdTypeMap,
     viewport::ViewportClass,
@@ -64,6 +77,53 @@ pub struct RequestRepaintInfo {
 
 thread_local! {
     static IMMEDIATE_VIEWPORT_RENDERER: RefCell<Option<Box<ImmediateViewportRendererCallback>>> = Default::default();
+    static FORCE_EMBED_IMMEDIATE_VIEWPORTS: Cell<u32> = const { Cell::new(0) };
+}
+
+// ----------------------------------------------------------------------------
+
+/// A backend scope that embeds immediate viewports without changing deferred viewports.
+///
+/// This is an integration seam for backends that execute a complete physical
+/// viewport transaction. Immediate viewport callbacks still run synchronously,
+/// but as embedded windows inside the current physical viewport, so they cannot
+/// recursively consume native input or present outside the transaction.
+#[doc(hidden)]
+#[must_use = "dropping the guard restores the previous immediate viewport policy"]
+#[derive(Debug)]
+pub struct ImmediateViewportEmbeddingGuard {
+    _not_send: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+
+impl ImmediateViewportEmbeddingGuard {
+    /// Enters one nested immediate-viewport embedding scope on this thread.
+    pub fn enter() -> Self {
+        FORCE_EMBED_IMMEDIATE_VIEWPORTS.with(|depth| {
+            depth.set(
+                depth
+                    .get()
+                    .checked_add(1)
+                    .expect("immediate viewport embedding scope depth exhausted"),
+            );
+        });
+        Self {
+            _not_send: std::marker::PhantomData,
+        }
+    }
+}
+
+impl Drop for ImmediateViewportEmbeddingGuard {
+    fn drop(&mut self) {
+        FORCE_EMBED_IMMEDIATE_VIEWPORTS.with(|depth| {
+            let current = depth.get();
+            debug_assert!(current > 0, "embedding guard depth must remain balanced");
+            depth.set(current.saturating_sub(1));
+        });
+    }
+}
+
+fn immediate_viewports_are_forced_embedded() -> bool {
+    FORCE_EMBED_IMMEDIATE_VIEWPORTS.with(|depth| depth.get() > 0)
 }
 
 // ----------------------------------------------------------------------------
@@ -231,6 +291,12 @@ pub struct ViewportState {
     ///
     /// Based on the widgets from last pass, and input in this pass.
     pub interact_widgets: InteractionSnapshot,
+
+    /// Exact event-time pointer receiver facts produced in this pass.
+    pub pointer_receiver_journal: PointerReceiverJournal,
+
+    /// The last successfully presented pointer hit graph for this viewport incarnation.
+    pub(crate) presented_pointer_hit_graph: PresentedPointerHitGraphAuthority,
 
     // ----------------------
     // The output of a pass:
@@ -466,30 +532,113 @@ impl ContextImpl {
         viewport.this_pass.begin_pass();
 
         {
-            let mut layers: Vec<LayerId> = viewport.prev_pass.widgets.layer_ids().collect();
-            layers.sort_by(|&a, &b| self.memory.areas().compare_order(a, b));
+            let cumulative_pass_nr = viewport.repaint.cumulative_pass_nr;
+            let has_completed_widget_pass = 0 < cumulative_pass_nr;
+            let presented_hit_graph =
+                viewport
+                    .presented_pointer_hit_graph
+                    .presented()
+                    .filter(|graph| {
+                        has_completed_widget_pass
+                            && graph.viewport_id() == viewport_id
+                            && graph.widget_pass_nr() == cumulative_pass_nr - 1
+                    });
+            let mut pointer_events = viewport
+                .input
+                .pointer
+                .pointer_events
+                .iter()
+                .map(|pointer_event| {
+                    let event = PointerEventId {
+                        viewport_id,
+                        cumulative_pass_nr,
+                        raw_event_index: pointer_event.raw_event_index(),
+                        correlation: pointer_event.correlation(),
+                    };
+                    let (kind, position) = match pointer_event {
+                        PointerEvent::Moved { position, .. } => {
+                            (PointerEventKind::Moved, *position)
+                        }
+                        PointerEvent::Pressed {
+                            position, button, ..
+                        } => (PointerEventKind::Pressed(*button), *position),
+                        PointerEvent::Released {
+                            position, button, ..
+                        } => (PointerEventKind::Released(*button), *position),
+                    };
+                    let position_is_finite = position.x.is_finite() && position.y.is_finite();
+                    let (hit, hits) = if !position_is_finite {
+                        (
+                            PointerReceiverAuthority::Unknown(
+                                PointerReceiverUnavailableReason::InvalidPosition,
+                            ),
+                            WidgetHits::default(),
+                        )
+                    } else if !has_completed_widget_pass {
+                        (
+                            PointerReceiverAuthority::Unknown(
+                                PointerReceiverUnavailableReason::NoCompletedWidgetPass,
+                            ),
+                            WidgetHits::default(),
+                        )
+                    } else if let Some(presented) = &presented_hit_graph {
+                        match presented.probe_state(position) {
+                            Ok((hit, hits)) => (PointerReceiverAuthority::Known(hit), hits),
+                            Err(reason) => (
+                                PointerReceiverAuthority::Unknown(reason),
+                                WidgetHits::default(),
+                            ),
+                        }
+                    } else {
+                        (
+                            PointerReceiverAuthority::Unknown(
+                                PointerReceiverUnavailableReason::PreviousPassNotPresented,
+                            ),
+                            WidgetHits::default(),
+                        )
+                    };
+                    PointerEventState {
+                        record: PointerReceiverRecord {
+                            event,
+                            kind,
+                            position,
+                            hit,
+                            route_before: PointerRoute::default(),
+                            delivery: PointerDelivery::None,
+                            route_after: PointerRoute::default(),
+                        },
+                        hits,
+                    }
+                })
+                .collect::<Vec<_>>();
 
-            viewport.hits = if let Some(pos) = viewport.input.pointer.interact_pos() {
-                let interact_radius = self.memory.options.style().interaction.interact_radius;
-
-                crate::hit_test::hit_test(
-                    &viewport.prev_pass.widgets,
-                    &layers,
-                    &self.memory.to_global,
-                    pos,
-                    interact_radius,
-                )
-            } else {
-                WidgetHits::default()
-            };
+            viewport.hits = viewport
+                .input
+                .pointer
+                .interact_pos()
+                .and_then(|position| {
+                    presented_hit_graph
+                        .as_ref()?
+                        .probe_state(position)
+                        .ok()
+                        .map(|(_, hits)| hits)
+                })
+                .unwrap_or_default();
 
             viewport.interact_widgets = crate::interaction::interact(
                 &viewport.interact_widgets,
                 &viewport.prev_pass.widgets,
                 &viewport.hits,
+                &mut pointer_events,
                 &viewport.input,
                 self.memory.interaction_mut(),
             );
+            viewport.pointer_receiver_journal = PointerReceiverJournal {
+                records: pointer_events
+                    .into_iter()
+                    .map(|event| event.record)
+                    .collect(),
+            };
         }
 
         // Ensure we register the background area so panels and background ui can catch clicks:
@@ -897,7 +1046,9 @@ impl Context {
         profiling::function_scope!();
 
         let plugins = self.read(|ctx| ctx.plugins.ordered_plugins());
+        let event_provenance = new_input.event_provenance_snapshot();
         plugins.on_input(self, &mut new_input);
+        new_input.sanitize_hook_events(&event_provenance);
 
         self.write(|ctx| ctx.begin_pass(new_input));
     }
@@ -1421,8 +1572,12 @@ impl Context {
 
             res.flags.set(
                 Flags::IS_POINTER_BUTTON_DOWN_ON,
-                interaction.potential_click_id == Some(id)
-                    || interaction.potential_drag_id == Some(id),
+                interaction
+                    .potential_click
+                    .is_some_and(|captured| captured.id() == id)
+                    || interaction
+                        .potential_drag
+                        .is_some_and(|captured| captured.id() == id),
             );
 
             if res.enabled() {
@@ -1449,7 +1604,7 @@ impl Context {
 
             for pointer_event in &input.pointer.pointer_events {
                 match pointer_event {
-                    PointerEvent::Moved(_) => {}
+                    PointerEvent::Moved { .. } => {}
                     PointerEvent::Pressed { .. } => {
                         any_press = true;
                     }
@@ -1590,6 +1745,15 @@ impl Context {
     /// so reusing the same `Arc<[u8]>` across frames is cheap.
     pub fn set_cursor_image(&self, image: Option<crate::CustomCursorImage>) {
         self.output_mut(|o| o.cursor_image = image);
+    }
+
+    /// Associate an opaque token with the presentation emitted by this pass.
+    ///
+    /// Integrations receive it in [`PlatformOutput::presentation_token`]. Setting `None` clears a
+    /// token set earlier in the same pass. If egui performs multiple passes, only the token from
+    /// the latest pass is returned.
+    pub fn set_presentation_token(&self, token: Option<crate::UserData>) {
+        self.output_mut(|output| output.presentation_token = token);
     }
 
     /// Add a command to [`PlatformOutput::commands`],
@@ -2566,6 +2730,7 @@ impl ContextImpl {
 
         self.loaders.end_pass(viewport.repaint.cumulative_pass_nr);
 
+        let completed_pass_nr = viewport.repaint.cumulative_pass_nr;
         viewport.repaint.cumulative_pass_nr += 1;
 
         self.memory.end_pass(&viewport.this_pass.used_ids);
@@ -2642,6 +2807,26 @@ impl ContextImpl {
         };
 
         std::mem::swap(&mut viewport.prev_pass, &mut viewport.this_pass);
+
+        let pointer_hit_graph_candidate = Some(PointerHitGraphCandidate::new(
+            viewport.presented_pointer_hit_graph.clone(),
+            PointerHitGraphSnapshot::new(
+                ended_viewport_id,
+                completed_pass_nr,
+                viewport
+                    .input
+                    .viewport()
+                    .native_pixels_per_point
+                    .unwrap_or(1.0),
+                viewport.input.pixels_per_point(),
+                &viewport.prev_pass.widgets,
+                self.memory.areas(),
+                &self.memory.to_global,
+                self.memory.top_modal_layer(),
+                self.memory.options.style().interaction.interact_radius,
+                self.memory.focused(),
+            ),
+        ));
 
         if repaint_needed {
             self.request_repaint(ended_viewport_id, RepaintCause::new());
@@ -2743,6 +2928,14 @@ impl ContextImpl {
             textures_delta,
             shapes,
             pixels_per_point,
+            pointer_receiver_journal: std::mem::take(
+                &mut self
+                    .viewports
+                    .entry(ended_viewport_id)
+                    .or_default()
+                    .pointer_receiver_journal,
+            ),
+            pointer_hit_graph_candidate,
             viewport_output,
         }
     }
@@ -4019,7 +4212,7 @@ impl Context {
     ) -> T {
         profiling::function_scope!();
 
-        if self.embed_viewports() {
+        if self.embed_viewports() || immediate_viewports_are_forced_embedded() {
             return self.show_embedded_viewport(new_viewport_id, builder, |ui| {
                 viewport_ui_cb(ui, ViewportClass::EmbeddedWindow)
             });
@@ -4086,9 +4279,40 @@ impl Context {
 
 /// ## Interaction
 impl Context {
+    /// Returns the immutable hit graph from the last successfully presented
+    /// pass of `viewport_id`.
+    ///
+    /// This intentionally never exposes a current-pass candidate. A missing
+    /// result means the integration has no presentation authority for the
+    /// viewport and must fail closed instead of reconstructing a hit test from
+    /// mutable UI state.
+    pub fn presented_pointer_hit_graph_for(
+        &self,
+        viewport_id: ViewportId,
+    ) -> Option<PointerHitGraphSnapshot> {
+        self.read(|ctx| {
+            ctx.viewports
+                .get(&viewport_id)
+                .and_then(|viewport| viewport.presented_pointer_hit_graph.presented())
+        })
+    }
+
     /// Read which widgets are currently being interacted with.
     pub fn interaction_snapshot<R>(&self, reader: impl FnOnce(&InteractionSnapshot) -> R) -> R {
         self.write(|w| reader(&w.viewport().interact_widgets))
+    }
+
+    /// Read the ordered, event-time pointer receiver facts for the active viewport pass.
+    ///
+    /// This journal uses the previous pass's frozen widget graph and includes each source event's
+    /// sanitized backend derivative correlation. Native integrations must still validate that
+    /// correlation against their own provider lease, exact viewport/window incarnation, and
+    /// coordinator-owned event journal before treating it as platform authority.
+    pub fn pointer_receiver_journal<R>(
+        &self,
+        reader: impl FnOnce(&PointerReceiverJournal) -> R,
+    ) -> R {
+        self.write(|w| reader(&w.viewport().pointer_receiver_journal))
     }
 
     /// The widget currently being dragged, if any.
@@ -4135,7 +4359,7 @@ impl Context {
                 i.drag_started = Some(id);
             }
 
-            ctx.memory.interaction_mut().potential_drag_id = Some(id);
+            ctx.memory.interaction_mut().potential_drag = Some(CapturedReceiver::Programmatic(id));
         });
     }
 
@@ -4149,7 +4373,7 @@ impl Context {
                 i.dragged = None;
             }
 
-            ctx.memory.interaction_mut().potential_drag_id = None;
+            ctx.memory.interaction_mut().potential_drag = None;
         });
     }
 
@@ -4277,7 +4501,90 @@ fn warn_if_rect_changes_id(
 
 #[cfg(test)]
 mod test {
-    use super::Context;
+    use super::{
+        Context, IMMEDIATE_VIEWPORT_RENDERER, ImmediateViewportEmbeddingGuard,
+        immediate_viewports_are_forced_embedded,
+    };
+    use crate::{
+        BackendEventDerivation, BackendEventSequence, Event, EventCorrelation, Plugin, RawInput,
+        UserData,
+    };
+
+    struct ForgingInputPlugin;
+
+    #[test]
+    fn immediate_viewport_embedding_scope_is_nested_and_restored() {
+        assert!(!immediate_viewports_are_forced_embedded());
+        let outer = ImmediateViewportEmbeddingGuard::enter();
+        assert!(immediate_viewports_are_forced_embedded());
+        {
+            let _inner = ImmediateViewportEmbeddingGuard::enter();
+            assert!(immediate_viewports_are_forced_embedded());
+        }
+        assert!(immediate_viewports_are_forced_embedded());
+        drop(outer);
+        assert!(!immediate_viewports_are_forced_embedded());
+    }
+
+    #[test]
+    fn immediate_embedding_scope_executes_the_callback_without_the_native_renderer() {
+        let previous_renderer = IMMEDIATE_VIEWPORT_RENDERER.with(|renderer| {
+            renderer.replace(Some(Box::new(|_, _| {
+                panic!("the native immediate renderer must not run in an embedding scope")
+            })))
+        });
+        let context = Context::default();
+        context.set_embed_viewports(false);
+        let _guard = ImmediateViewportEmbeddingGuard::enter();
+        let mut observed_class = None;
+
+        let _ = context.run_ui(RawInput::default(), |ui| {
+            let result = ui.ctx().show_viewport_immediate(
+                crate::ViewportId::from_hash_of("transactional-immediate"),
+                crate::ViewportBuilder::default(),
+                |_, class| class,
+            );
+            observed_class = Some(result);
+        });
+
+        IMMEDIATE_VIEWPORT_RENDERER.with(|renderer| {
+            renderer.replace(previous_renderer);
+        });
+        assert!(matches!(
+            observed_class,
+            Some(crate::ViewportClass::EmbeddedWindow)
+        ));
+    }
+
+    impl Plugin for ForgingInputPlugin {
+        fn debug_name(&self) -> &'static str {
+            "forging input plugin"
+        }
+
+        fn input_hook(&mut self, _ctx: &Context, input: &mut RawInput) {
+            let mut forged = BackendEventDerivation::known(BackendEventSequence::new(999));
+            input.events.push(forged.envelope(Event::Copy));
+        }
+    }
+
+    #[test]
+    fn plugin_input_hook_cannot_forge_backend_event_provenance() {
+        let ctx = Context::default();
+        ctx.add_plugin(ForgingInputPlugin);
+
+        let mut backend = BackendEventDerivation::known(BackendEventSequence::new(7));
+        let input = RawInput {
+            events: vec![backend.envelope(Event::Cut)],
+            ..Default::default()
+        };
+
+        let _ = ctx.run_ui(input, |ui| {
+            ui.input(|input| {
+                assert!(input.raw.events[0].correlation().is_known());
+                assert_eq!(input.raw.events[1].correlation(), EventCorrelation::Unknown);
+            });
+        });
+    }
 
     #[test]
     fn test_single_pass() {
@@ -4416,5 +4723,30 @@ mod test {
                 "The request should have been cleared when fulfilled"
             );
         }
+    }
+
+    #[test]
+    fn presentation_token_comes_from_the_latest_pass() {
+        let ctx = Context::default();
+        ctx.options_mut(|options| options.max_passes = 2.try_into().unwrap());
+
+        let mut pass = 0_usize;
+        let output = ctx.run_ui(Default::default(), |ui| {
+            ui.ctx().set_presentation_token(Some(UserData::new(pass)));
+            if pass == 0 {
+                ui.request_discard("test latest presentation token");
+            }
+            pass += 1;
+        });
+
+        assert_eq!(pass, 2);
+        assert_eq!(
+            output
+                .platform_output
+                .presentation_token
+                .as_ref()
+                .and_then(UserData::downcast_ref::<usize>),
+            Some(&1)
+        );
     }
 }

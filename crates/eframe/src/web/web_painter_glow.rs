@@ -90,15 +90,15 @@ impl WebPainter for WebPainterGlow {
         self.painter.destroy();
     }
 
-    fn handle_screenshots(&mut self, events: &mut Vec<Event>) {
+    fn handle_screenshots(&mut self, events: &mut Vec<egui::EventEnvelope>) {
         for (image, data) in self.screenshots.drain(..) {
             let image = Arc::new(image);
             for data in data {
-                events.push(Event::Screenshot {
+                events.push(egui::EventEnvelope::unknown(Event::Screenshot {
                     viewport_id: ViewportId::default(),
                     image: Arc::clone(&image),
                     user_data: data,
-                });
+                }));
             }
         }
     }

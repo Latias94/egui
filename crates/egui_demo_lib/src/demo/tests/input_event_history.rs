@@ -88,6 +88,7 @@ impl crate::View for InputEventHistory {
     fn ui(&mut self, ui: &mut egui::Ui) {
         ui.input(|i| {
             for event in &i.raw.events {
+                let event = event.event();
                 if !self.include_pointer_movements
                     && matches!(
                         event,

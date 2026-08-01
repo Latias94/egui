@@ -4,7 +4,10 @@ use std::ops::Range;
 
 use epaint::text::CharIndex;
 
-use crate::{OrderedViewportIdMap, RepaintCause, ViewportOutput, WidgetType};
+use crate::{
+    OrderedViewportIdMap, PointerHitGraphCandidate, PointerReceiverJournal, RepaintCause,
+    ViewportOutput, WidgetType,
+};
 
 /// What egui emits each frame from [`crate::Context::run_ui`].
 ///
@@ -32,6 +35,19 @@ pub struct FullOutput {
     /// You can pass this to [`crate::Context::tessellate`] together with [`Self::shapes`].
     pub pixels_per_point: f32,
 
+    /// Ordered event-time pointer receiver facts for the viewport that was updated.
+    ///
+    /// A native integration must combine these egui-local facts with its own exact viewport
+    /// incarnation and global event sequence before treating them as cross-window authority.
+    pub pointer_receiver_journal: PointerReceiverJournal,
+
+    /// The immutable hit graph produced by the latest completed pass.
+    ///
+    /// This is not receiver authority until the integration reports a successful presentation
+    /// through [`PointerHitGraphCandidate::settle`]. When several passes are combined, only the
+    /// candidate matching the latest paint output is retained.
+    pub pointer_hit_graph_candidate: Option<PointerHitGraphCandidate>,
+
     /// All the active viewports, including the root.
     ///
     /// It is up to the integration to spawn a native window for each viewport,
@@ -49,6 +65,8 @@ impl FullOutput {
             textures_delta,
             shapes,
             pixels_per_point,
+            pointer_receiver_journal,
+            pointer_hit_graph_candidate,
             viewport_output,
         } = newer;
 
@@ -56,6 +74,14 @@ impl FullOutput {
         self.textures_delta.append(textures_delta);
         self.shapes = shapes; // Only paint the latest
         self.pixels_per_point = pixels_per_point; // Use latest
+        self.pointer_receiver_journal
+            .append(pointer_receiver_journal);
+        if let Some(superseded) = self.pointer_hit_graph_candidate.take() {
+            superseded.settle(&PaintOutcome::Skipped(
+                PaintSkipReason::SupersededByNewerPass,
+            ));
+        }
+        self.pointer_hit_graph_candidate = pointer_hit_graph_candidate;
 
         for (id, new_viewport) in viewport_output {
             match self.viewport_output.entry(id) {
@@ -130,6 +156,17 @@ pub struct PlatformOutput {
     #[cfg_attr(feature = "serde", serde(skip))]
     pub cursor_image: Option<CustomCursorImage>,
 
+    /// An opaque, pass-scoped token associated with the presentation being emitted.
+    ///
+    /// Native integrations can return this token with an exact renderer result after the
+    /// corresponding paint attempt reaches a terminal state. Egui preserves the token but does
+    /// not inspect it. A successful result does not prove compositor visibility. When several
+    /// passes are combined, only the latest pass token is retained.
+    ///
+    /// This value is ephemeral and is never serialized.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub presentation_token: Option<crate::UserData>,
+
     /// Events that may be useful to e.g. a screen reader.
     pub events: Vec<OutputEvent>,
 
@@ -167,6 +204,139 @@ pub struct PlatformOutput {
     pub request_discard_reasons: Vec<RepaintCause>,
 }
 
+/// The renderer's synchronous result for one frame carrying a
+/// [`PlatformOutput::presentation_token`].
+///
+/// Success means only that the renderer completed the named submission operation. It is not
+/// proof that a compositor displayed the frame.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PaintOutcome {
+    /// WGPU scheduled the rendered texture for presentation on its swapchain.
+    SubmittedToSwapchain,
+
+    /// The OpenGL window surface completed `swap_buffers`.
+    Swapped,
+
+    /// The renderer intentionally did not submit this frame.
+    Skipped(PaintSkipReason),
+
+    /// The renderer could not submit this frame.
+    Failed(PaintFailure),
+}
+
+/// Why a renderer intentionally skipped a frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PaintSkipReason {
+    /// A later logical pass replaced this output before the integration painted it.
+    SupersededByNewerPass,
+
+    /// The viewport was not visible when painting was scheduled.
+    NotVisible,
+
+    /// The viewport or its native rendering resources no longer existed.
+    ViewportUnavailable,
+
+    /// WGPU timed out while acquiring the next surface texture.
+    SurfaceAcquireTimeout,
+
+    /// WGPU reported that the surface was occluded.
+    SurfaceOccluded,
+
+    /// WGPU reported an outdated surface and scheduled recovery.
+    SurfaceOutdated,
+
+    /// WGPU reported a lost surface and scheduled recovery.
+    SurfaceLost,
+}
+
+/// Why a renderer failed to submit a frame.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PaintFailure {
+    /// Renderer state was unavailable after egui emitted the frame.
+    RendererUnavailable,
+
+    /// The viewport had no renderable surface after egui emitted the frame.
+    SurfaceUnavailable,
+
+    /// Creating or recreating a rendering surface failed.
+    SurfaceSetup(String),
+
+    /// WGPU rejected surface texture acquisition as invalid.
+    SurfaceAcquireValidation,
+
+    /// OpenGL buffer swapping failed.
+    SwapBuffers(String),
+
+    /// The native coordinator stopped processing the frame before reaching a renderer outcome.
+    CoordinatorAborted,
+}
+
+/// An exact correlation between an opaque frame token and its native renderer result.
+///
+/// The viewport identifier and token identify the callback output that produced this result. This
+/// contains no native window handle and no application-specific graph or binding identity.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PresentationResult {
+    /// The egui viewport for which the frame was emitted.
+    viewport_id: crate::ViewportId,
+
+    /// The untouched opaque value emitted in [`PlatformOutput::presentation_token`].
+    token: crate::UserData,
+
+    /// What the renderer synchronously proved about this frame.
+    outcome: PaintOutcome,
+
+    /// The hit graph installed by this successful presentation.
+    presented_pointer_hit_graph: Option<crate::PointerHitGraphSnapshot>,
+}
+
+impl PresentationResult {
+    /// Construct one terminal renderer result and promote its exact hit graph candidate.
+    ///
+    /// Skipped and failed outcomes never retain or promote `pointer_hit_graph_candidate`.
+    pub fn new(
+        viewport_id: crate::ViewportId,
+        token: crate::UserData,
+        outcome: PaintOutcome,
+        pointer_hit_graph_candidate: Option<crate::PointerHitGraphCandidate>,
+    ) -> Self {
+        let presented_pointer_hit_graph = pointer_hit_graph_candidate.and_then(|candidate| {
+            candidate
+                .settle_for(viewport_id, &outcome)
+                .then(|| candidate.snapshot().clone())
+        });
+
+        Self {
+            viewport_id,
+            token,
+            outcome,
+            presented_pointer_hit_graph,
+        }
+    }
+
+    /// Return the egui viewport for which the frame was emitted.
+    pub fn viewport_id(&self) -> crate::ViewportId {
+        self.viewport_id
+    }
+
+    /// Return the untouched opaque presentation token.
+    pub fn token(&self) -> &crate::UserData {
+        &self.token
+    }
+
+    /// Return the terminal renderer outcome.
+    pub fn outcome(&self) -> &PaintOutcome {
+        &self.outcome
+    }
+
+    /// Return the immutable hit graph installed by this successful presentation.
+    ///
+    /// This is `None` for skipped, failed, or superseded candidates.
+    pub fn presented_pointer_hit_graph(&self) -> Option<&crate::PointerHitGraphSnapshot> {
+        self.presented_pointer_hit_graph.as_ref()
+    }
+}
+
 impl PlatformOutput {
     /// This can be used by a text-to-speech system to describe the events (if any).
     pub fn events_description(&self) -> String {
@@ -192,6 +362,7 @@ impl PlatformOutput {
             mut commands,
             cursor_icon,
             cursor_image,
+            presentation_token,
             mut events,
             mutable_text_under_cursor,
             ime,
@@ -203,6 +374,7 @@ impl PlatformOutput {
         self.commands.append(&mut commands);
         self.cursor_icon = cursor_icon;
         self.cursor_image = cursor_image;
+        self.presentation_token = presentation_token;
         self.events.append(&mut events);
         self.mutable_text_under_cursor = mutable_text_under_cursor;
         self.ime = ime.or(self.ime);
@@ -226,6 +398,45 @@ impl PlatformOutput {
     /// Was [`crate::Context::request_discard`] called?
     pub fn requested_discard(&self) -> bool {
         !self.request_discard_reasons.is_empty()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PlatformOutput;
+    use crate::UserData;
+
+    #[test]
+    fn append_uses_the_latest_presentation_token() {
+        let mut output = PlatformOutput {
+            presentation_token: Some(UserData::new("older")),
+            ..Default::default()
+        };
+
+        output.append(PlatformOutput {
+            presentation_token: Some(UserData::new("newer")),
+            ..Default::default()
+        });
+
+        assert_eq!(
+            output
+                .presentation_token
+                .as_ref()
+                .and_then(UserData::downcast_ref::<&'static str>),
+            Some(&"newer")
+        );
+    }
+
+    #[test]
+    fn append_can_clear_an_older_presentation_token() {
+        let mut output = PlatformOutput {
+            presentation_token: Some(UserData::new("older")),
+            ..Default::default()
+        };
+
+        output.append(PlatformOutput::default());
+
+        assert!(output.presentation_token.is_none());
     }
 }
 

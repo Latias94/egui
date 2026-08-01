@@ -8,13 +8,13 @@ use crate::{
 };
 use crate::{
     data::input::{
-        Event, EventFilter, KeyboardShortcut, Modifiers, NUM_POINTER_BUTTONS, PointerButton,
-        RawInput, TouchDeviceId, ViewportInfo,
+        Event, EventCorrelation, EventEnvelopeClaim, EventFilter, KeyboardShortcut, Modifiers,
+        NUM_POINTER_BUTTONS, PointerButton, RawInput, TouchDeviceId, ViewportInfo,
     },
     input_state::wheel_state::WheelState,
 };
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashSet},
     time::Duration,
 };
 
@@ -327,6 +327,10 @@ pub struct InputState {
     /// In-order events received this frame
     pub events: Vec<Event>,
 
+    /// Raw envelope indices already claimed by exact semantic consumers this pass.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    claimed_event_envelopes: BTreeSet<usize>,
+
     /// Input state management configuration.
     ///
     /// This gets copied from `egui::Options` at the start of each frame for convenience.
@@ -357,6 +361,7 @@ impl Default for InputState {
             modifiers: Default::default(),
             keys_down: Default::default(),
             events: Default::default(),
+            claimed_event_envelopes: Default::default(),
             options: Default::default(),
         }
     }
@@ -399,7 +404,7 @@ impl InputState {
         self.wheel.smooth_wheel_delta = Vec2::ZERO;
 
         for event in &mut new.events {
-            match event {
+            match event.event_mut() {
                 Event::Key {
                     key,
                     pressed,
@@ -484,10 +489,50 @@ impl InputState {
             focused: new.focused,
             modifiers: new.modifiers,
             keys_down,
-            events: new.events.clone(), // TODO(emilk): remove clone() and use raw.events
+            events: new
+                .events
+                .iter()
+                .map(|event| event.event().clone())
+                .collect(), // TODO(emilk): remove clone() and use raw.events
+            claimed_event_envelopes: BTreeSet::new(),
             raw: new,
             options,
         }
+    }
+
+    /// Claims the first unclaimed immutable input envelope matching `predicate`.
+    ///
+    /// Claims are pass-local and affine: a raw event index can be returned only once, including
+    /// when its backend correlation is [`EventCorrelation::Unknown`]. This lets integrations bind
+    /// a semantic action to an exact envelope without reverse-matching the mutable `events` list
+    /// after widgets have consumed or aggregated it.
+    pub fn claim_event_envelope(
+        &mut self,
+        mut predicate: impl FnMut(&Event) -> bool,
+    ) -> Option<EventEnvelopeClaim> {
+        let (raw_event_index, correlation, envelope_identity) = self
+            .raw
+            .events
+            .iter()
+            .enumerate()
+            .find_map(|(raw_event_index, envelope)| {
+                (!self.claimed_event_envelopes.contains(&raw_event_index)
+                    && predicate(envelope.event()))
+                .then(|| {
+                    (
+                        raw_event_index,
+                        envelope.correlation(),
+                        envelope.hook_identity(),
+                    )
+                })
+            })?;
+        let inserted = self.claimed_event_envelopes.insert(raw_event_index);
+        debug_assert!(inserted, "an unclaimed envelope index must be affine");
+        Some(EventEnvelopeClaim::new(
+            raw_event_index,
+            correlation,
+            envelope_identity,
+        ))
     }
 
     /// Info about the active viewport
@@ -845,9 +890,9 @@ impl InputState {
 
     /// Scans `events` for device IDs of touch devices we have not seen before,
     /// and creates a new [`TouchState`] for each such device.
-    fn create_touch_states_for_new_devices(&mut self, events: &[Event]) {
+    fn create_touch_states_for_new_devices(&mut self, events: &[crate::EventEnvelope]) {
         for event in events {
-            if let Event::Touch { device_id, .. } = event {
+            if let Event::Touch { device_id, .. } = event.event() {
                 self.touch_states
                     .entry(*device_id)
                     .or_insert_with(|| TouchState::new(*device_id));
@@ -944,18 +989,52 @@ impl Click {
 #[derive(Clone, Debug, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
 pub(crate) enum PointerEvent {
-    Moved(Pos2),
+    Moved {
+        raw_event_index: usize,
+        #[cfg_attr(feature = "serde", serde(skip))]
+        correlation: EventCorrelation,
+        position: Pos2,
+    },
     Pressed {
+        raw_event_index: usize,
+        #[cfg_attr(feature = "serde", serde(skip))]
+        correlation: EventCorrelation,
         position: Pos2,
         button: PointerButton,
     },
     Released {
+        raw_event_index: usize,
+        #[cfg_attr(feature = "serde", serde(skip))]
+        correlation: EventCorrelation,
+        position: Pos2,
         click: Option<Click>,
         button: PointerButton,
     },
 }
 
 impl PointerEvent {
+    pub fn raw_event_index(&self) -> usize {
+        match self {
+            Self::Moved {
+                raw_event_index, ..
+            }
+            | Self::Pressed {
+                raw_event_index, ..
+            }
+            | Self::Released {
+                raw_event_index, ..
+            } => *raw_event_index,
+        }
+    }
+
+    pub fn correlation(&self) -> EventCorrelation {
+        match self {
+            Self::Moved { correlation, .. }
+            | Self::Pressed { correlation, .. }
+            | Self::Released { correlation, .. } => *correlation,
+        }
+    }
+
     pub fn is_press(&self) -> bool {
         matches!(self, Self::Pressed { .. })
     }
@@ -1106,8 +1185,9 @@ impl PointerState {
         }
 
         let mut clear_history_after_velocity_calculation = false;
-        for event in &new.events {
-            match event {
+        for (raw_event_index, event) in new.events.iter().enumerate() {
+            let correlation = event.correlation();
+            match event.event() {
                 Event::PointerMoved(pos) => {
                     let pos = *pos;
 
@@ -1120,7 +1200,11 @@ impl PointerState {
                     }
 
                     self.last_move_time = time;
-                    self.pointer_events.push(PointerEvent::Moved(pos));
+                    self.pointer_events.push(PointerEvent::Moved {
+                        raw_event_index,
+                        correlation,
+                        position: pos,
+                    });
                 }
                 Event::PointerButton {
                     pos,
@@ -1147,6 +1231,8 @@ impl PointerState {
                         self.press_start_time = Some(time);
                         self.has_moved_too_much_for_a_click = false;
                         self.pointer_events.push(PointerEvent::Pressed {
+                            raw_event_index,
+                            correlation,
                             position: pos,
                             button,
                         });
@@ -1188,8 +1274,13 @@ impl PointerState {
                             None
                         };
 
-                        self.pointer_events
-                            .push(PointerEvent::Released { click, button });
+                        self.pointer_events.push(PointerEvent::Released {
+                            raw_event_index,
+                            correlation,
+                            position: pos,
+                            click,
+                            button,
+                        });
 
                         self.press_origin = None;
                         self.press_start_time = None;
@@ -1426,7 +1517,7 @@ impl PointerState {
     pub fn button_clicked(&self, button: PointerButton) -> bool {
         self.pointer_events
             .iter()
-            .any(|event| matches!(event, &PointerEvent::Released { button: b, click: Some(_) } if button == b))
+            .any(|event| matches!(event, &PointerEvent::Released { button: b, click: Some(_), .. } if button == b))
     }
 
     /// Was the button given double clicked this frame?
@@ -1437,6 +1528,7 @@ impl PointerState {
                 PointerEvent::Released {
                     click: Some(click),
                     button: b,
+                    ..
                 } if *b == button && click.is_double()
             )
         })
@@ -1450,6 +1542,7 @@ impl PointerState {
                 PointerEvent::Released {
                     click: Some(click),
                     button: b,
+                    ..
                 } if *b == button && click.is_triple()
             )
         })
@@ -1591,6 +1684,7 @@ impl InputState {
             modifiers,
             keys_down,
             events,
+            claimed_event_envelopes: _,
             options: _,
         } = self;
 

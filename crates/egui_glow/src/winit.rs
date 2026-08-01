@@ -74,6 +74,8 @@ impl EguiGlow {
             textures_delta,
             shapes,
             pixels_per_point,
+            pointer_receiver_journal: _,
+            pointer_hit_graph_candidate: _,
             viewport_output,
         } = self.egui_ctx.run_ui(raw_input, run_ui);
 

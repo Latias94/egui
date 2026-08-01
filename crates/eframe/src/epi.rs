@@ -41,7 +41,65 @@ pub type EventLoopBuilderHook = Box<dyn FnOnce(&mut EventLoopBuilder<UserEvent>)
 #[cfg(any(feature = "glow", feature = "wgpu_no_default_features"))]
 pub type WindowBuilderHook = Box<dyn FnOnce(egui::ViewportBuilder) -> egui::ViewportBuilder>;
 
+/// Receives the exact native renderer result for an egui frame that carried a presentation token.
+///
+/// The hook may run re-entrantly while an immediate viewport is being rendered. It must not call
+/// back into eframe. Send the result to application-owned state instead.
+#[cfg(not(target_arch = "wasm32"))]
+#[cfg(any(feature = "glow", feature = "wgpu_no_default_features"))]
+pub type PresentationResultHook = std::sync::Arc<dyn Fn(egui::PresentationResult) + Send + Sync>;
+
 type DynError = Box<dyn std::error::Error + Send + Sync>;
+
+/// Error returned by one application-owned hosted viewport cycle hook.
+#[cfg(not(target_arch = "wasm32"))]
+#[cfg(any(feature = "glow", feature = "wgpu_no_default_features"))]
+pub type HostedViewportAppError = Box<dyn std::error::Error + Send + Sync>;
+
+/// Result returned by one application-owned hosted viewport cycle hook.
+#[cfg(not(target_arch = "wasm32"))]
+#[cfg(any(feature = "glow", feature = "wgpu_no_default_features"))]
+pub type HostedViewportAppResult<T> = Result<T, HostedViewportAppError>;
+
+/// Selects the native viewport execution contract used by an [`App`].
+///
+/// Compatibility mode preserves ordinary egui immediate viewports. Transactional
+/// mode instead requires every physical root and deferred viewport to participate
+/// in one complete hosted cycle and embeds immediate viewport callbacks inside
+/// their current physical viewport.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[cfg(not(target_arch = "wasm32"))]
+#[cfg(any(feature = "glow", feature = "wgpu_no_default_features"))]
+pub enum HostedViewportMode {
+    /// Preserve ordinary eframe behavior, including inline immediate viewports.
+    ///
+    /// The hosted roster covers physical root and deferred viewports only, so
+    /// its end hook is not an atomic barrier for recursively rendered immediate
+    /// viewports in this mode.
+    #[default]
+    Compatibility,
+
+    /// Require one complete, fail-closed physical viewport transaction.
+    ///
+    /// A native backend must hold a [`crate::HostedViewportTransactionGuard`]
+    /// around the complete cycle. The guard forces egui immediate viewport
+    /// callbacks to use embedded windows while leaving deferred viewports
+    /// physical. The renderer check remains a fail-closed defense against a
+    /// backend that bypasses that policy.
+    Transactional,
+}
+
+/// Whether eframe should run its default root or deferred viewport UI callback.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[cfg(not(target_arch = "wasm32"))]
+#[cfg(any(feature = "glow", feature = "wgpu_no_default_features"))]
+pub enum HostedViewportUiDisposition {
+    /// Run the ordinary root [`App::ui`] or deferred viewport callback.
+    #[default]
+    RunDefault,
+    /// The application handled this viewport UI through the hosted-cycle seam.
+    Handled,
+}
 
 /// This is how your app is created.
 ///
@@ -94,6 +152,15 @@ pub struct CreationContext<'s> {
     /// Raw platform display handle for window
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) raw_display_handle: Result<RawDisplayHandle, HandleError>,
+
+    /// A deterministic native event-loop driver available only to fork tests.
+    #[cfg(all(
+        not(target_arch = "wasm32"),
+        any(feature = "glow", feature = "wgpu_no_default_features"),
+        feature = "native-test-support"
+    ))]
+    #[doc(hidden)]
+    pub native_test_driver: Option<crate::NativeTestDriver>,
 }
 
 #[expect(unsafe_code)]
@@ -130,6 +197,12 @@ impl CreationContext<'_> {
             wgpu_render_state: None,
             #[cfg(not(target_arch = "wasm32"))]
             window: None,
+            #[cfg(all(
+                not(target_arch = "wasm32"),
+                any(feature = "glow", feature = "wgpu_no_default_features"),
+                feature = "native-test-support"
+            ))]
+            native_test_driver: None,
             #[cfg(not(target_arch = "wasm32"))]
             raw_window_handle: Err(HandleError::NotSupported),
             #[cfg(not(target_arch = "wasm32"))]
@@ -261,6 +334,14 @@ pub trait App {
     /// It can be used to prevent specific keyboard shortcuts or mouse events from being processed by egui.
     ///
     /// Additionally, it can be used to inject custom keyboard or mouse events into the input stream, which can be useful for implementing features like a virtual keyboard.
+    /// Injected events should use [`egui::RawInput::push_event`] and therefore have unknown backend
+    /// correlation. Existing known envelopes may be removed, but their relative order must remain
+    /// stable. Reordering, duplicating, replacing, or forging known envelopes causes their backend
+    /// correlation to be downgraded after this hook returns.
+    ///
+    /// A known [`egui::EventCorrelation`] only correlates derivatives of a backend event. It is not
+    /// proof of a native provider lease, window incarnation, pointer capture, receiver, coordinates,
+    /// or global release; native runtimes must validate those facts separately.
     ///
     /// # Arguments
     ///
@@ -271,6 +352,157 @@ pub trait App {
     ///
     /// This function does not return a value. Any changes to the input should be made directly to `_raw_input`.
     fn raw_input_hook(&mut self, _ctx: &egui::Context, _raw_input: &mut egui::RawInput) {}
+
+    /// Selects how native physical viewports participate in hosted cycles.
+    ///
+    /// The default is [`HostedViewportMode::Compatibility`], which preserves
+    /// existing immediate viewport behavior. Select
+    /// [`HostedViewportMode::Transactional`] only when application correctness
+    /// depends on a complete input-before-UI and output-before-render barrier.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(any(feature = "glow", feature = "wgpu_no_default_features"))]
+    fn hosted_viewport_mode(&self) -> HostedViewportMode {
+        HostedViewportMode::Compatibility
+    }
+
+    /// Observes one complete frozen physical root/deferred viewport input roster
+    /// before any UI callback in that roster.
+    ///
+    /// The inputs have already passed through [`Self::raw_input_hook`]. This
+    /// hook may update application protocol state, but it must not create UI or
+    /// paint. Deferred viewport callback order is not an input-order signal;
+    /// use backend event correlation carried by the raw events instead.
+    ///
+    /// In [`HostedViewportMode::Compatibility`], recursively rendered immediate
+    /// viewport input and UI are outside this barrier. A compliant
+    /// [`HostedViewportMode::Transactional`] backend instead embeds immediate
+    /// callbacks so the frozen roster remains the complete physical transaction.
+    ///
+    /// Native Glow and WGPU cycles expose their event-loop snapshot through
+    /// [`crate::HostedViewportCycle::native_host_ingress`]. Applications must
+    /// preserve its [`crate::NativeAuthority`] distinctions: an unavailable
+    /// hovered window, capture owner, or physical pointer fact is `Unknown`, not
+    /// evidence that no such owner or pointer exists. Likewise, an effect
+    /// dispatch result is not an acknowledgement; only a later correlated
+    /// property observation can prove application.
+    ///
+    /// # Errors
+    ///
+    /// Returning an error aborts the complete hosted cycle before any viewport
+    /// UI callback runs.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(any(feature = "glow", feature = "wgpu_no_default_features"))]
+    fn begin_hosted_viewport_cycle(
+        &mut self,
+        _ctx: &egui::Context,
+        _cycle: &crate::HostedViewportCycle,
+        _frame: &mut Frame,
+    ) -> HostedViewportAppResult<()> {
+        Ok(())
+    }
+
+    /// Intercepts one root or deferred viewport UI callback while the complete
+    /// hosted cycle remains active.
+    ///
+    /// Returning [`HostedViewportUiDisposition::RunDefault`] preserves the
+    /// ordinary behavior: eframe invokes [`Self::ui`] for the root viewport or
+    /// the registered deferred callback for a child viewport. Returning
+    /// [`HostedViewportUiDisposition::Handled`] suppresses that fallback. An
+    /// error aborts the complete cycle before any later viewport callback or
+    /// renderer work runs.
+    ///
+    /// UI still runs for hidden, occluded, and minimized physical viewports so
+    /// that application state and the output roster remain complete. A renderer
+    /// may skip painting such a viewport after the cycle seals.
+    /// Compatibility-mode immediate viewports do not pass through this hook.
+    ///
+    /// # Errors
+    ///
+    /// Returning an error aborts the complete hosted cycle and suppresses both
+    /// the default viewport callback and all later viewport callbacks.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(any(feature = "glow", feature = "wgpu_no_default_features"))]
+    fn hosted_viewport_ui(
+        &mut self,
+        _viewport_id: egui::ViewportId,
+        _ui: &mut egui::Ui,
+        _frame: &mut Frame,
+    ) -> HostedViewportAppResult<HostedViewportUiDisposition> {
+        Ok(HostedViewportUiDisposition::RunDefault)
+    }
+
+    /// Observes every staged physical root/deferred output after all callbacks
+    /// in that roster and before the native renderer processes those outputs.
+    /// Outputs are mutable only at this cycle-final boundary so a sealed protocol
+    /// may attach opaque presentation tokens.
+    ///
+    /// In [`HostedViewportMode::Compatibility`], an immediate viewport may have
+    /// already run UI and presented recursively; its input and output are outside
+    /// this hook. In [`HostedViewportMode::Transactional`], immediate rendering
+    /// is rejected and this hook seals the complete native viewport output
+    /// transaction before renderer work begins.
+    ///
+    /// This is the application preparation boundary for protocols that
+    /// coordinate multiple viewports. Semantic publication waits for
+    /// [`Self::commit_hosted_viewport_cycle`]. Renderer presentation is reported
+    /// separately through [`NativeOptions::presentation_result_hook`].
+    ///
+    /// # Errors
+    ///
+    /// Returning an error aborts ordinary rendering, but eframe retains every
+    /// staged output for terminal presentation-token and texture-resource
+    /// accounting. Once any viewport UI has started, the aborted cycle is fatal
+    /// for that host iteration and its unconsumed inputs must not be replayed.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(any(feature = "glow", feature = "wgpu_no_default_features"))]
+    fn end_hosted_viewport_cycle(
+        &mut self,
+        _ctx: &egui::Context,
+        _outputs: &mut [crate::HostedViewportOutput<egui::FullOutput>],
+        _frame: &mut Frame,
+    ) -> HostedViewportAppResult<()> {
+        Ok(())
+    }
+
+    /// Commits application-owned hosted-cycle state after the native host has
+    /// consolidated every output, configured renderer surfaces, preflighted
+    /// viewport creation, and committed its exact active viewport roster.
+    ///
+    /// Transactional applications should perform no semantic publication in
+    /// [`Self::end_hosted_viewport_cycle`]. That hook only prepares an affine
+    /// candidate; this hook is the first point at which the host transaction is
+    /// known to have sealed successfully. The transactional immediate-viewport
+    /// guard remains active throughout this callback.
+    ///
+    /// # Errors
+    ///
+    /// Returning an error is a fail-closed application invariant violation. The
+    /// implementation must complete all fallible validation before modifying
+    /// live state; after its first semantic publication it must return `Ok(())`.
+    /// On error, the backend invokes [`Self::abort_hosted_viewport_cycle`] and
+    /// suppresses rendering of the staged outputs.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(any(feature = "glow", feature = "wgpu_no_default_features"))]
+    fn commit_hosted_viewport_cycle(
+        &mut self,
+        _ctx: &egui::Context,
+        _outputs: &mut [crate::HostedViewportOutput<egui::FullOutput>],
+        _frame: &mut Frame,
+    ) -> HostedViewportAppResult<()> {
+        Ok(())
+    }
+
+    /// Aborts application-owned state after a hosted cycle began but did not
+    /// pass every viewport, end-hook, and output-authority barrier.
+    ///
+    /// This callback is also invoked when the begin hook returns an error, so
+    /// implementations must be idempotent and tolerate an absent active cycle.
+    /// It must not fail: the renderer is already committed to terminally
+    /// settling the aborted outputs and cannot recover another application
+    /// error at this boundary.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(any(feature = "glow", feature = "wgpu_no_default_features"))]
+    fn abort_hosted_viewport_cycle(&mut self, _ctx: &egui::Context, _frame: &mut Frame) {}
 }
 
 /// Options controlling the behavior of a native window.
@@ -353,6 +585,15 @@ pub struct NativeOptions {
     #[cfg(any(feature = "glow", feature = "wgpu_no_default_features"))]
     pub window_builder: Option<WindowBuilderHook>,
 
+    /// Receives one terminal renderer result for every emitted
+    /// [`egui::PlatformOutput::presentation_token`].
+    ///
+    /// Results identify an egui viewport and preserve the opaque token, but contain no native
+    /// window handle. A successful result proves only swapchain submission or buffer swapping,
+    /// not compositor visibility.
+    #[cfg(any(feature = "glow", feature = "wgpu_no_default_features"))]
+    pub presentation_result_hook: Option<PresentationResultHook>,
+
     /// On desktop: make the window position to be centered at initialization.
     ///
     /// Platform specific:
@@ -408,6 +649,9 @@ impl Clone for NativeOptions {
             #[cfg(any(feature = "glow", feature = "wgpu_no_default_features"))]
             window_builder: None, // Skip any builder callbacks if cloning
 
+            #[cfg(any(feature = "glow", feature = "wgpu_no_default_features"))]
+            presentation_result_hook: self.presentation_result_hook.clone(),
+
             #[cfg(feature = "glow")]
             glow_options: self.glow_options.clone(),
 
@@ -444,6 +688,9 @@ impl Default for NativeOptions {
 
             #[cfg(any(feature = "glow", feature = "wgpu_no_default_features"))]
             window_builder: None,
+
+            #[cfg(any(feature = "glow", feature = "wgpu_no_default_features"))]
+            presentation_result_hook: None,
 
             centered: false,
 

@@ -1,11 +1,13 @@
 use std::{any::Any, sync::Arc};
 
-/// A wrapper around `dyn Any`, used for passing custom user data
-/// to [`crate::ViewportCommand::Screenshot`].
+/// A wrapper around `dyn Any`, used for passing opaque user data through egui.
+///
+/// For example, this is used by [`crate::ViewportCommand::Screenshot`] and
+/// [`crate::PlatformOutput::presentation_token`]. Egui preserves the value but does not
+/// interpret it.
 #[derive(Clone, Debug, Default)]
 pub struct UserData {
-    /// A user value given to the screenshot command,
-    /// that will be returned in [`crate::Event::Screenshot`].
+    /// The opaque user value.
     pub data: Option<Arc<dyn Any + Send + Sync>>,
 }
 
@@ -15,6 +17,11 @@ impl UserData {
         Self {
             data: Some(Arc::new(user_info)),
         }
+    }
+
+    /// Returns the stored value when it has type `T`.
+    pub fn downcast_ref<T: Any>(&self) -> Option<&T> {
+        self.data.as_deref()?.downcast_ref()
     }
 }
 

@@ -396,15 +396,15 @@ impl WebPainter for WebPainterWgpu {
         Ok(())
     }
 
-    fn handle_screenshots(&mut self, events: &mut Vec<Event>) {
+    fn handle_screenshots(&mut self, events: &mut Vec<egui::EventEnvelope>) {
         for (viewport_id, user_data, screenshot) in self.capture_rx.try_iter() {
             let screenshot = Arc::new(screenshot);
             for data in user_data {
-                events.push(Event::Screenshot {
+                events.push(egui::EventEnvelope::unknown(Event::Screenshot {
                     viewport_id,
                     user_data: data,
                     image: Arc::clone(&screenshot),
-                });
+                }));
             }
         }
     }

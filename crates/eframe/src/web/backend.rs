@@ -55,7 +55,7 @@ impl WebInput {
         // log::debug!("on_web_page_focus_change: {focused}");
         self.raw.modifiers = egui::Modifiers::default(); // Avoid sticky modifier keys on alt-tab:
         self.raw.focused = focused;
-        self.raw.events.push(egui::Event::WindowFocused(focused));
+        self.raw.push_event(egui::Event::WindowFocused(focused));
         self.primary_touch = None;
     }
 }

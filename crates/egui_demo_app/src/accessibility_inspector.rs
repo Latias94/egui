@@ -48,9 +48,7 @@ impl egui::Plugin for AccessibilityInspectorPlugin {
 
     fn input_hook(&mut self, _ctx: &Context, input: &mut RawInput) {
         if let Some(queued_action) = self.queued_action.take() {
-            input
-                .events
-                .push(Event::AccessKitActionRequest(queued_action));
+            input.push_event(Event::AccessKitActionRequest(queued_action));
         }
     }
 

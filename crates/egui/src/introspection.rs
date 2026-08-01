@@ -210,13 +210,13 @@ impl Widget for &mut epaint::TessellationOptions {
 impl Widget for &memory::InteractionState {
     fn ui(self, ui: &mut Ui) -> Response {
         let memory::InteractionState {
-            potential_click_id,
-            potential_drag_id,
+            potential_click,
+            potential_drag,
         } = self;
 
         ui.vertical(|ui| {
-            ui.label(format!("potential_click_id: {potential_click_id:?}"));
-            ui.label(format!("potential_drag_id: {potential_drag_id:?}"));
+            ui.label(format!("potential_click: {potential_click:?}"));
+            ui.label(format!("potential_drag: {potential_drag:?}"));
         })
         .response
     }

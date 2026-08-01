@@ -197,6 +197,56 @@ pub use native::macos::WindowChromeMetrics;
 #[cfg(any(feature = "glow", feature = "wgpu_no_default_features"))]
 pub use native::run::EframeWinitApplication;
 
+#[cfg(not(target_arch = "wasm32"))]
+#[cfg(any(feature = "glow", feature = "wgpu_no_default_features"))]
+pub use native::hosted_cycle::{
+    HostedImmediateViewportViolation, HostedNativeStagingPresentation,
+    HostedNativeStagingPresentationError, HostedViewportCycle, HostedViewportCycleAbort,
+    HostedViewportCycleAbortParts, HostedViewportCycleDriver, HostedViewportCycleError,
+    HostedViewportInput, HostedViewportOutput, HostedViewportTransactionGuard,
+    check_hosted_immediate_viewport,
+};
+
+#[cfg(not(target_arch = "wasm32"))]
+#[cfg(any(feature = "glow", feature = "wgpu_no_default_features"))]
+pub use native::{
+    NativeEffectSink, NativeEffectSubmitError, NativeViewportCreateSink,
+    NativeViewportCreateSubmitError,
+};
+
+#[cfg(not(target_arch = "wasm32"))]
+#[cfg(any(feature = "glow", feature = "wgpu_no_default_features"))]
+#[cfg(feature = "native-test-support")]
+pub use native::{
+    NativeTestDriver, NativeTestPointerAction, NativeTestPointerEvent, NativeTestPointerLocation,
+};
+
+#[cfg(not(target_arch = "wasm32"))]
+#[cfg(any(feature = "glow", feature = "wgpu_no_default_features"))]
+pub use native::platform_provider::{
+    NativeAccessibilityAction, NativeAccessibilityEdge, NativeAuthority, NativeBackendCapabilities,
+    NativeBackendCapability, NativeCaptureOwner, NativeCloseState, NativeEffectAcknowledgement,
+    NativeEffectCorrelation, NativeEffectDispatchOutcome, NativeEffectProperty,
+    NativeEffectRequest, NativeEffectRequestId, NativeEffectResult, NativeEventEnvelopeReceipt,
+    NativeFiniteScrollVector, NativeFocusedWindow, NativeHostIngress, NativeHoveredWindow,
+    NativeIngressEvent, NativeIngressJournal, NativeIngressOrdinal, NativeIngressRecord, NativeKey,
+    NativeKeyEdge, NativeKeyEdgeKind, NativeObservationGeneration, NativePhysicalPoint,
+    NativePhysicalRect, NativePlatformError, NativePlatformFacts, NativePlatformGeneration,
+    NativePlatformSnapshot, NativePlatformSnapshotGeneration, NativePointerButton,
+    NativePointerCoordinateCapture, NativePointerDeliveryOwner, NativePointerDeviceId,
+    NativePointerEdge, NativePointerEdgeKind, NativePointerId, NativePointerIdentity,
+    NativePointerInputState, NativePointerJournal, NativePointerSequence, NativePointerSource,
+    NativePresentationResult, NativePresentationSerial, NativePresentationState,
+    NativePropertyObservation, NativeRetirementQuiesced, NativeRetirementTombstone,
+    NativeScrollCancelReason, NativeScrollDelta, NativeScrollEdge, NativeScrollModifiers,
+    NativeScrollMomentum, NativeScrollPhase, NativeScrollSequenceToken, NativeUnavailableReason,
+    NativeViewportBinding, NativeViewportCreateCorrelation, NativeViewportCreateDispatchOutcome,
+    NativeViewportCreateRequestId, NativeViewportCreateResult, NativeViewportIncarnation,
+    NativeWindowEffect, NativeWindowGeometry, NativeWindowSnapshot, NativeWorkArea,
+    NativeWorkAreaGeneration, NativeWorkAreaRosterObservation, NativeWorkAreaRoute,
+    NativeWorkAreaToken,
+};
+
 #[cfg(not(any(target_arch = "wasm32", target_os = "ios")))]
 #[cfg(any(feature = "glow", feature = "wgpu_no_default_features"))]
 pub use native::run::EframePumpStatus;
@@ -505,6 +555,16 @@ pub enum Error {
     /// Something went wrong in user code when creating the app.
     AppCreation(Box<dyn std::error::Error + Send + Sync>),
 
+    /// A native hosted viewport cycle aborted after its exact roster was frozen.
+    ///
+    /// This is fatal for the current host iteration. The payload retains staged
+    /// [`egui::FullOutput`] values, unconsumed inputs, and transactional
+    /// violations so the renderer can terminally settle presentation tokens and
+    /// texture resources instead of degrading the failure into a logged wait.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(any(feature = "glow", feature = "wgpu_no_default_features"))]
+    HostedViewportCycle(Box<HostedViewportCycleAbort<egui::FullOutput>>),
+
     /// An error from [`winit`].
     #[cfg(not(target_arch = "wasm32"))]
     Winit(winit::error::OsError),
@@ -530,7 +590,32 @@ pub enum Error {
     Wgpu(egui_wgpu::WgpuError),
 }
 
-impl std::error::Error for Error {}
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        #[cfg(not(target_arch = "wasm32"))]
+        #[cfg(any(feature = "glow", feature = "wgpu_no_default_features"))]
+        if let Self::HostedViewportCycle(abort) = self {
+            return Some(abort.as_ref());
+        }
+        None
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[cfg(any(feature = "glow", feature = "wgpu_no_default_features"))]
+impl From<HostedViewportCycleAbort<egui::FullOutput>> for Error {
+    fn from(abort: HostedViewportCycleAbort<egui::FullOutput>) -> Self {
+        Self::HostedViewportCycle(Box::new(abort))
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[cfg(any(feature = "glow", feature = "wgpu_no_default_features"))]
+impl From<HostedViewportCycleError> for Error {
+    fn from(error: HostedViewportCycleError) -> Self {
+        Self::HostedViewportCycle(Box::new(HostedViewportCycleAbort::from_error(error)))
+    }
+}
 
 #[cfg(not(target_arch = "wasm32"))]
 impl From<winit::error::OsError> for Error {
@@ -576,6 +661,12 @@ impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::AppCreation(err) => write!(f, "app creation error: {err}"),
+
+            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(any(feature = "glow", feature = "wgpu_no_default_features"))]
+            Self::HostedViewportCycle(abort) => {
+                write!(f, "fatal hosted viewport cycle error: {abort}")
+            }
 
             #[cfg(not(target_arch = "wasm32"))]
             Self::Winit(err) => {
