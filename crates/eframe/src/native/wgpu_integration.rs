@@ -697,6 +697,7 @@ impl WgpuWinitRunning<'_> {
             shapes,
             pixels_per_point,
             viewport_output,
+            ..
         } = full_output;
 
         remove_viewports_not_in(viewports, painter, viewport_from_window, &viewport_output);
@@ -730,15 +731,17 @@ impl WgpuWinitRunning<'_> {
                     true
                 }
             });
-            let vsync_secs = painter.paint_and_update_textures(
-                viewport_id,
-                pixels_per_point,
-                app.clear_color(&egui_ctx.global_style().visuals),
-                &clipped_primitives,
-                &textures_delta,
-                screenshot_commands,
-                window,
-            );
+            let vsync_secs = painter
+                .paint_and_update_textures(
+                    viewport_id,
+                    pixels_per_point,
+                    app.clear_color(&egui_ctx.global_style().visuals),
+                    &clipped_primitives,
+                    &textures_delta,
+                    screenshot_commands,
+                    window,
+                )
+                .vsync_seconds;
 
             for action in viewport.actions_requested.drain(..) {
                 match action {
@@ -746,10 +749,16 @@ impl WgpuWinitRunning<'_> {
                         // already handled above
                     }
                     ActionRequested::Cut => {
-                        egui_winit.egui_input_mut().events.push(egui::Event::Cut);
+                        egui_winit
+                            .egui_input_mut()
+                            .events
+                            .push(egui::Event::Cut.into());
                     }
                     ActionRequested::Copy => {
-                        egui_winit.egui_input_mut().events.push(egui::Event::Copy);
+                        egui_winit
+                            .egui_input_mut()
+                            .events
+                            .push(egui::Event::Copy.into());
                     }
                     ActionRequested::Paste => {
                         if let Some(contents) = egui_winit.clipboard_text() {
@@ -758,7 +767,7 @@ impl WgpuWinitRunning<'_> {
                                 egui_winit
                                     .egui_input_mut()
                                     .events
-                                    .push(egui::Event::Paste(contents));
+                                    .push(egui::Event::Paste(contents).into());
                             }
                         }
                     }
@@ -1110,6 +1119,7 @@ fn render_immediate_viewport(
         shapes,
         pixels_per_point,
         viewport_output,
+        ..
     } = egui_ctx.run_ui(input, |ui| {
         viewport_ui_cb(ui);
     });

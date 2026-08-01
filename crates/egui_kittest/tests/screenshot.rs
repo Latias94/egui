@@ -35,7 +35,7 @@ fn screenshot_viewport_command() {
                 // Capture the screenshot once it's delivered.
                 ui.input(|i| {
                     for event in &i.raw.events {
-                        if let egui::Event::Screenshot { image, .. } = event {
+                        if let egui::Event::Screenshot { image, .. } = event.event() {
                             state.screenshot = Some(Arc::clone(image));
                         }
                     }

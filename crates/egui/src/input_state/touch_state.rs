@@ -140,7 +140,7 @@ impl TouchState {
     pub fn begin_pass(&mut self, time: f64, new: &RawInput, pointer_pos: Option<Pos2>) {
         let mut added_or_removed_touches = false;
         for event in &new.events {
-            match *event {
+            match *event.event() {
                 Event::Touch {
                     device_id,
                     id,

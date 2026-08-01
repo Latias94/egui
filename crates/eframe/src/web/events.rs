@@ -164,7 +164,7 @@ fn install_keydown(runner_ref: &WebRunner, target: &EventTarget) -> Result<(), J
                     (runner.web_options.should_stop_propagation)(&egui_event);
                 let should_prevent_default =
                     (runner.web_options.should_prevent_default)(&egui_event);
-                runner.input.raw.events.push(egui_event);
+                runner.input.raw.push_event(egui_event);
                 runner.needs_repaint.repaint_asap();
 
                 // If this is indeed text, then prevent any other action.
@@ -210,7 +210,7 @@ pub(crate) fn on_keydown(event: web_sys::KeyboardEvent, runner: &mut AppRunner) 
             modifiers,
         };
         let should_stop_propagation = (runner.web_options.should_stop_propagation)(&egui_event);
-        runner.input.raw.events.push(egui_event);
+        runner.input.raw.push_event(egui_event);
         runner.needs_repaint.repaint_asap();
 
         let prevent_default = should_prevent_default_for_key(runner, &modifiers, egui_key);
@@ -300,7 +300,7 @@ pub(crate) fn on_keyup(event: web_sys::KeyboardEvent, runner: &mut AppRunner) {
             modifiers,
         };
         should_stop_propagation &= (runner.web_options.should_stop_propagation)(&egui_event);
-        runner.input.raw.events.push(egui_event);
+        runner.input.raw.push_event(egui_event);
     }
 
     if event.key() == "Meta" || event.key() == "Control" {
@@ -321,7 +321,7 @@ pub(crate) fn on_keyup(event: web_sys::KeyboardEvent, runner: &mut AppRunner) {
                 modifiers,
             };
             should_stop_propagation &= (runner.web_options.should_stop_propagation)(&egui_event);
-            runner.input.raw.events.push(egui_event);
+            runner.input.raw.push_event(egui_event);
         }
     }
 
@@ -351,7 +351,7 @@ fn install_copy_cut_paste(runner_ref: &WebRunner, target: &EventTarget) -> Resul
                 let egui_event = egui::Event::Paste(text);
                 should_stop_propagation = (runner.web_options.should_stop_propagation)(&egui_event);
                 should_prevent_default = (runner.web_options.should_prevent_default)(&egui_event);
-                runner.input.raw.events.push(egui_event);
+                runner.input.raw.push_event(egui_event);
                 runner.needs_repaint.repaint_asap();
             }
 
@@ -371,7 +371,7 @@ fn install_copy_cut_paste(runner_ref: &WebRunner, target: &EventTarget) -> Resul
             return; // The eframe app is not interested
         }
 
-        runner.input.raw.events.push(egui::Event::Cut);
+        runner.input.raw.push_event(egui::Event::Cut);
 
         // In Safari we are only allowed to write to the clipboard during the
         // event callback, which is why we run the app logic here and now:
@@ -395,7 +395,7 @@ fn install_copy_cut_paste(runner_ref: &WebRunner, target: &EventTarget) -> Resul
             return; // The eframe app is not interested
         }
 
-        runner.input.raw.events.push(egui::Event::Copy);
+        runner.input.raw.push_event(egui::Event::Copy);
 
         // In Safari we are only allowed to write to the clipboard during the
         // event callback, which is why we run the app logic here and now:
@@ -547,7 +547,7 @@ fn install_pointerdown(runner_ref: &WebRunner, target: &EventTarget) -> Result<(
                     modifiers,
                 };
                 should_stop_propagation = (runner.web_options.should_stop_propagation)(&egui_event);
-                runner.input.raw.events.push(egui_event);
+                runner.input.raw.push_event(egui_event);
 
                 // In Safari we are only allowed to write to the clipboard during the
                 // event callback, which is why we run the app logic here and now:
@@ -592,7 +592,7 @@ fn install_pointerup(runner_ref: &WebRunner, target: &EventTarget) -> Result<(),
                     (runner.web_options.should_stop_propagation)(&egui_event);
                 let should_prevent_default =
                     (runner.web_options.should_prevent_default)(&egui_event);
-                runner.input.raw.events.push(egui_event);
+                runner.input.raw.push_event(egui_event);
 
                 // Previously on iOS, the canvas would not receive focus on
                 // any touch event, which resulted in the on-screen keyboard
@@ -658,7 +658,7 @@ fn install_mousemove(runner_ref: &WebRunner, target: &EventTarget) -> Result<(),
             let egui_event = egui::Event::PointerMoved(pos);
             let should_stop_propagation = (runner.web_options.should_stop_propagation)(&egui_event);
             let should_prevent_default = (runner.web_options.should_prevent_default)(&egui_event);
-            runner.input.raw.events.push(egui_event);
+            runner.input.raw.push_event(egui_event);
             runner.needs_repaint.repaint();
 
             // Use web options to tell if the web event should be propagated to parent elements based on the egui event.
@@ -678,7 +678,7 @@ fn install_mouseleave(runner_ref: &WebRunner, target: &EventTarget) -> Result<()
         target,
         "mouseleave",
         |event: web_sys::MouseEvent, runner| {
-            runner.input.raw.events.push(egui::Event::PointerGone);
+            runner.input.raw.push_event(egui::Event::PointerGone);
             runner.needs_repaint.repaint_asap();
 
             // Use web options to tell if the web event should be propagated to parent elements based on the egui event.
@@ -709,7 +709,7 @@ fn install_touchstart(runner_ref: &WebRunner, target: &EventTarget) -> Result<()
                 };
                 should_stop_propagation = (runner.web_options.should_stop_propagation)(&egui_event);
                 should_prevent_default = (runner.web_options.should_prevent_default)(&egui_event);
-                runner.input.raw.events.push(egui_event);
+                runner.input.raw.push_event(egui_event);
             }
 
             push_touches(runner, egui::TouchPhase::Start, &event);
@@ -738,7 +738,7 @@ fn install_touchmove(runner_ref: &WebRunner, target: &EventTarget) -> Result<(),
             let egui_event = egui::Event::PointerMoved(pos);
             let should_stop_propagation = (runner.web_options.should_stop_propagation)(&egui_event);
             let should_prevent_default = (runner.web_options.should_prevent_default)(&egui_event);
-            runner.input.raw.events.push(egui_event);
+            runner.input.raw.push_event(egui_event);
 
             push_touches(runner, egui::TouchPhase::Move, &event);
             runner.needs_repaint.repaint();
@@ -774,13 +774,13 @@ fn install_touchend(runner_ref: &WebRunner, target: &EventTarget) -> Result<(), 
             };
             should_stop_propagation &= (runner.web_options.should_stop_propagation)(&egui_event);
             should_prevent_default &= (runner.web_options.should_prevent_default)(&egui_event);
-            runner.input.raw.events.push(egui_event);
+            runner.input.raw.push_event(egui_event);
             // Then remove hover effect:
             should_stop_propagation &=
                 (runner.web_options.should_stop_propagation)(&egui::Event::PointerGone);
             should_prevent_default &=
                 (runner.web_options.should_prevent_default)(&egui::Event::PointerGone);
-            runner.input.raw.events.push(egui::Event::PointerGone);
+            runner.input.raw.push_event(egui::Event::PointerGone);
 
             push_touches(runner, egui::TouchPhase::End, &event);
 
@@ -851,7 +851,7 @@ fn install_wheel(runner_ref: &WebRunner, target: &EventTarget) -> Result<(), JsV
         };
         let should_stop_propagation = (runner.web_options.should_stop_propagation)(&egui_event);
         let should_prevent_default = (runner.web_options.should_prevent_default)(&egui_event);
-        runner.input.raw.events.push(egui_event);
+        runner.input.raw.push_event(egui_event);
 
         runner.needs_repaint.repaint();
 
@@ -907,7 +907,7 @@ fn handle_gesture(event: web_sys::Event, runner: &mut AppRunner) {
 
         should_stop_propagation &= (runner.web_options.should_stop_propagation)(&zoom_event);
         should_prevent_default &= (runner.web_options.should_prevent_default)(&zoom_event);
-        runner.input.raw.events.push(zoom_event);
+        runner.input.raw.push_event(zoom_event);
     }
 
     if rotation_delta != 0.0 {
@@ -915,7 +915,7 @@ fn handle_gesture(event: web_sys::Event, runner: &mut AppRunner) {
 
         should_stop_propagation &= (runner.web_options.should_stop_propagation)(&rotate_event);
         should_prevent_default &= (runner.web_options.should_prevent_default)(&rotate_event);
-        runner.input.raw.events.push(rotate_event);
+        runner.input.raw.push_event(rotate_event);
     }
 
     if scale_delta != 1.0 || rotation_delta != 0.0 {

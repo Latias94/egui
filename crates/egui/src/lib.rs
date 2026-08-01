@@ -413,6 +413,7 @@ mod painter;
 mod pass_state;
 pub(crate) mod placer;
 pub mod plugin;
+mod pointer_hit_graph;
 pub mod response;
 mod sense;
 pub mod style;
@@ -462,13 +463,14 @@ pub mod text {
 pub use self::{
     atomics::*,
     containers::{menu::MenuBar, *},
-    context::{Context, RepaintCause, RequestRepaintInfo},
+    context::{Context, ImmediateViewportEmbeddingGuard, RepaintCause, RequestRepaintInfo},
     data::{
         Key, UserData,
         input::*,
         output::{
-            self, CursorIcon, CustomCursorImage, FullOutput, OpenUrl, OutputCommand,
-            PlatformOutput, UserAttentionType, WidgetInfo,
+            self, CursorIcon, CustomCursorImage, FullOutput, OpenUrl, OutputCommand, PaintFailure,
+            PaintOutcome, PaintSkipReason, PlatformOutput, PresentationResult, UserAttentionType,
+            WidgetInfo,
         },
     },
     drag_and_drop::DragAndDrop,
@@ -477,12 +479,19 @@ pub use self::{
     id::{AsId, Id, IdMap, IdSet},
     id_salt::{AsIdSalt, IdSalt},
     input_state::{InputOptions, InputState, MultiTouchInfo, PointerState, SurrenderFocusOn},
+    interaction::{
+        CapturedReceiver, ExactCapturedReceiver, InteractionSnapshot, PointerDelivery,
+        PointerEventId, PointerEventKind, PointerHit, PointerReceiverAuthority,
+        PointerReceiverJournal, PointerReceiverRecord, PointerReceiverUnavailableReason,
+        PointerRoute, WidgetReceiver,
+    },
     layers::{LayerId, Order},
     layout::*,
     load::SizeHint,
     memory::{FocusDirection, Memory, Options, Theme, ThemePreference},
     painter::Painter,
     plugin::Plugin,
+    pointer_hit_graph::{PointerHitGraphCandidate, PointerHitGraphSnapshot},
     response::{InnerResponse, Response},
     sense::Sense,
     style::{FontSelection, Spacing, Style, TextStyle, Visuals},

@@ -34,6 +34,8 @@ pub trait Plugin: Send + Sync + std::any::Any + 'static {
     /// Called just before the input is processed.
     ///
     /// Useful to inspect or modify the input.
+    /// Known event envelopes may only be filtered while preserving their relative order. Events
+    /// injected, duplicated, replaced, or reordered by a plugin lose known backend correlation.
     /// Since this is called outside a pass, don't show ui here. Using `Context::debug_painter` is fine though.
     fn input_hook(&mut self, ctx: &Context, input: &mut RawInput) {}
 

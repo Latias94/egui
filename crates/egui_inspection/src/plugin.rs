@@ -144,7 +144,7 @@ impl egui::Plugin for InspectionPlugin {
         for ev in &input.events {
             let egui::Event::Screenshot {
                 user_data, image, ..
-            } = ev
+            } = ev.event()
             else {
                 continue;
             };
@@ -209,7 +209,9 @@ impl egui::Plugin for InspectionPlugin {
                     true
                 }
                 Request::ApplyEvents { events } => {
-                    input.events.extend(events.iter().cloned());
+                    input
+                        .events
+                        .extend(events.iter().cloned().map(egui::EventEnvelope::unknown));
                     // Reply with `Done` at the end of the frame so the agent can be sure the
                     // events were *executed* (e.g. a button click that created a file), not
                     // merely received.

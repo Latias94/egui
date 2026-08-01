@@ -5,7 +5,6 @@ use egui_wgpu::{
     RenderState, SurfaceErrorAction,
     capture::{CaptureReceiver, CaptureSender, CaptureState, capture_channel},
 };
-use wasm_bindgen::JsValue;
 use web_sys::HtmlCanvasElement;
 
 use super::web_painter::WebPainter;
@@ -166,15 +165,13 @@ impl WebPainter for WebPainterWgpu {
         pixels_per_point: f32,
         textures_delta: &egui::TexturesDelta,
         capture_data: Vec<UserData>,
-    ) -> Result<(), JsValue> {
+    ) -> egui::PaintOutcome {
         let capture = !capture_data.is_empty();
 
         let size_in_pixels = [self.canvas.width(), self.canvas.height()];
 
         let Some(render_state) = &self.render_state else {
-            return Err(JsValue::from_str(
-                "Can't paint, wgpu renderer was already disposed",
-            ));
+            return egui::PaintOutcome::Failed(egui::PaintFailure::RendererUnavailable);
         };
 
         // If the previous frame produced `CurrentSurfaceTexture::Lost`, drop and recreate the
@@ -260,6 +257,27 @@ impl WebPainter for WebPainterWgpu {
                     frame
                 }
                 other => {
+                    let outcome = match &other {
+                        wgpu::CurrentSurfaceTexture::Timeout => egui::PaintOutcome::Skipped(
+                            egui::PaintSkipReason::SurfaceAcquireTimeout,
+                        ),
+                        wgpu::CurrentSurfaceTexture::Occluded => {
+                            egui::PaintOutcome::Skipped(egui::PaintSkipReason::SurfaceOccluded)
+                        }
+                        wgpu::CurrentSurfaceTexture::Outdated => {
+                            egui::PaintOutcome::Skipped(egui::PaintSkipReason::SurfaceOutdated)
+                        }
+                        wgpu::CurrentSurfaceTexture::Lost => {
+                            egui::PaintOutcome::Skipped(egui::PaintSkipReason::SurfaceLost)
+                        }
+                        wgpu::CurrentSurfaceTexture::Validation => {
+                            egui::PaintOutcome::Failed(egui::PaintFailure::SurfaceAcquireValidation)
+                        }
+                        wgpu::CurrentSurfaceTexture::Success(_)
+                        | wgpu::CurrentSurfaceTexture::Suboptimal(_) => {
+                            egui::PaintOutcome::Failed(egui::PaintFailure::CoordinatorAborted)
+                        }
+                    };
                     match (*self.on_surface_status)(&other) {
                         SurfaceErrorAction::Reconfigure => {
                             self.surface
@@ -275,7 +293,7 @@ impl WebPainter for WebPainterWgpu {
                         }
                         SurfaceErrorAction::SkipFrame => {}
                     }
-                    return Ok(());
+                    return outcome;
                 }
             };
 
@@ -367,7 +385,7 @@ impl WebPainter for WebPainterWgpu {
             .queue
             .submit(std::iter::chain(user_cmd_bufs, [encoder.finish()]));
 
-        if let Some((frame, capture_buffer)) = frame_and_capture_buffer {
+        let outcome = if let Some((frame, capture_buffer)) = frame_and_capture_buffer {
             if let Some(capture_buffer) = capture_buffer
                 && let Some(capture_state) = &self.screen_capture_state
             {
@@ -381,7 +399,10 @@ impl WebPainter for WebPainterWgpu {
             }
 
             frame.present();
-        }
+            egui::PaintOutcome::SubmittedToSwapchain
+        } else {
+            egui::PaintOutcome::Skipped(egui::PaintSkipReason::ViewportUnavailable)
+        };
 
         // Free textures marked for destruction **after** queue submit since they might still be used in the current frame.
         // Calling `wgpu::Texture::destroy` on a texture that is still in use would invalidate the command buffer(s) it is used in.
@@ -393,18 +414,18 @@ impl WebPainter for WebPainterWgpu {
             }
         }
 
-        Ok(())
+        outcome
     }
 
-    fn handle_screenshots(&mut self, events: &mut Vec<Event>) {
+    fn handle_screenshots(&mut self, events: &mut Vec<egui::EventEnvelope>) {
         for (viewport_id, user_data, screenshot) in self.capture_rx.try_iter() {
             let screenshot = Arc::new(screenshot);
             for data in user_data {
-                events.push(Event::Screenshot {
+                events.push(egui::EventEnvelope::unknown(Event::Screenshot {
                     viewport_id,
                     user_data: data,
                     image: Arc::clone(&screenshot),
-                });
+                }));
             }
         }
     }

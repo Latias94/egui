@@ -330,7 +330,7 @@ impl<'a> VisualTests<'a> {
         self.add("pressed", |harness| {
             harness.get_next_widget().hover();
             let rect = harness.get_next_widget().rect();
-            harness.input_mut().events.push(Event::PointerButton {
+            harness.input_mut().push_event(Event::PointerButton {
                 button: PointerButton::Primary,
                 pos: rect.center(),
                 pressed: true,

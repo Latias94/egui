@@ -175,6 +175,7 @@ impl<'a, State> Harness<'a, State> {
             #[cfg(feature = "snapshot")]
             snapshot_results: SnapshotResults::default(),
         };
+        accept_headless_frame(&harness.output);
         // Fulfill any screenshot requested during the initial frame above (which didn't go
         // through `_step`).
         #[cfg(any(feature = "wgpu", feature = "snapshot"))]
@@ -253,7 +254,7 @@ impl<'a, State> Harness<'a, State> {
         for event in events {
             match event {
                 EventType::Event(event) => {
-                    self.input.events.push(event);
+                    self.input.push_event(event);
                 }
                 EventType::Modifiers(modifiers) => {
                     self.input.modifiers = modifiers;
@@ -279,6 +280,7 @@ impl<'a, State> Harness<'a, State> {
         );
         self.renderer.handle_delta(&output.textures_delta);
         self.output = output;
+        accept_headless_frame(&self.output);
 
         #[cfg(any(feature = "wgpu", feature = "snapshot"))]
         self.handle_screenshots();
@@ -713,7 +715,7 @@ impl<'a, State> Harness<'a, State> {
         let image = std::sync::Arc::new(rgba_image_to_color_image(&image));
 
         for (viewport_id, user_data) in requests {
-            self.input.events.push(egui::Event::Screenshot {
+            self.input.push_event(egui::Event::Screenshot {
                 viewport_id,
                 user_data,
                 image: std::sync::Arc::clone(&image),
@@ -843,6 +845,12 @@ impl<'a, State> Harness<'a, State> {
             Box::new(|_cc| Ok(eframe_app)),
         )
         .unwrap();
+    }
+}
+
+fn accept_headless_frame(output: &egui::FullOutput) {
+    if let Some(candidate) = &output.pointer_hit_graph_candidate {
+        let _accepted = candidate.accept_for_headless_host();
     }
 }
 

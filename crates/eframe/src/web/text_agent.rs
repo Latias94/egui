@@ -106,7 +106,7 @@ impl TextAgent {
                         text,
                         active_range_chars,
                     });
-                    runner.input.raw.events.push(event);
+                    runner.input.raw.push_event(event);
                 } else {
                     if text.is_empty() {
                         return;
@@ -114,7 +114,7 @@ impl TextAgent {
 
                     input.set_value("");
                     let event = egui::Event::Text(text);
-                    runner.input.raw.events.push(event);
+                    runner.input.raw.push_event(event);
                 }
 
                 runner.needs_repaint.repaint_asap();
@@ -135,7 +135,7 @@ impl TextAgent {
                 let Some(text) = event.data() else { return };
                 input.set_value("");
                 let event = egui::Event::Ime(egui::ImeEvent::Commit(text));
-                runner.input.raw.events.push(event);
+                runner.input.raw.push_event(event);
                 runner.needs_repaint.repaint_asap();
             }
         };

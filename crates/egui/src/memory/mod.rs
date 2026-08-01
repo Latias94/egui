@@ -6,8 +6,8 @@ use ahash::{HashMap, HashSet};
 use epaint::emath::TSTransform;
 
 use crate::{
-    EventFilter, Id, IdMap, LayerId, Order, Pos2, Rangef, RawInput, Rect, Style, Vec2, ViewportId,
-    ViewportIdMap, ViewportIdSet, area, vec2,
+    CapturedReceiver, EventFilter, Id, IdMap, LayerId, Order, Pos2, Rangef, RawInput, Rect, Style,
+    Vec2, ViewportId, ViewportIdMap, ViewportIdSet, area, vec2,
 };
 
 mod theme;
@@ -470,7 +470,7 @@ impl Options {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct InteractionState {
     /// A widget interested in clicks that has a mouse press on it.
-    pub potential_click_id: Option<Id>,
+    pub potential_click: Option<CapturedReceiver>,
 
     /// A widget interested in drags that has a mouse press on it.
     ///
@@ -478,7 +478,7 @@ pub(crate) struct InteractionState {
     /// so the widget may not yet be marked as "dragged"
     /// as that can only happen after the mouse has moved a bit
     /// (at least if the widget is interesated in both clicks and drags).
-    pub potential_drag_id: Option<Id>,
+    pub potential_drag: Option<CapturedReceiver>,
 }
 
 /// Keeps tracks of what widget has keyboard focus
@@ -541,7 +541,7 @@ impl FocusWidget {
 impl InteractionState {
     /// Are we currently clicking or dragging an egui widget?
     pub fn is_using_pointer(&self) -> bool {
-        self.potential_click_id.is_some() || self.potential_drag_id.is_some()
+        self.potential_click.is_some() || self.potential_drag.is_some()
     }
 }
 
@@ -564,6 +564,7 @@ impl Focus {
         self.focus_direction = FocusDirection::None;
 
         for event in &new_input.events {
+            let event = event.event();
             if !event_filter.matches(event)
                 && let crate::Event::Key {
                     key,

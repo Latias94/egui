@@ -274,7 +274,9 @@ impl EpiIntegration {
 
         let close_requested = raw_input.viewport().close_requested();
 
+        let event_provenance = raw_input.event_provenance_snapshot();
         app.raw_input_hook(&self.egui_ctx, &mut raw_input);
+        raw_input.sanitize_hook_events(&event_provenance);
 
         let full_output = self.egui_ctx.run_ui(raw_input, |ui| {
             if let Some(viewport_ui_cb) = viewport_ui_cb {

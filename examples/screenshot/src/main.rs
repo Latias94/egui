@@ -74,7 +74,7 @@ impl eframe::App for MyApp {
             // Check for returned screenshot:
             ui.input(|i| {
                 for event in &i.raw.events {
-                    if let egui::Event::Screenshot { image, .. } = event {
+                    if let egui::Event::Screenshot { image, .. } = event.event() {
                         if self.save_to_file {
                             let pixels_per_point = i.pixels_per_point();
                             let region = egui::Rect::from_two_pos(

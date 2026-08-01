@@ -2,6 +2,7 @@
 
 mod dropped_file;
 mod event;
+mod event_envelope;
 mod event_filter;
 mod hovered_file;
 mod ime_event;
@@ -18,6 +19,10 @@ mod viewport_info;
 pub use self::{
     dropped_file::DroppedFile,
     event::Event,
+    event_envelope::{
+        BackendEventDerivation, BackendEventSequence, EventCorrelation, EventEnvelope,
+        EventEnvelopeClaim,
+    },
     event_filter::EventFilter,
     hovered_file::HoveredFile,
     ime_event::ImeEvent,

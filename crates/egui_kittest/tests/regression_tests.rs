@@ -235,7 +235,7 @@ pub fn menus_should_close_even_if_submenu_disappears() {
         // We click manually, since we want to precisely time that the sub menu disappears when the
         // button is released
         let center = harness.get_by_label(OTHER_BUTTON).rect().center();
-        harness.input_mut().events.push(egui::Event::PointerButton {
+        harness.input_mut().push_event(egui::Event::PointerButton {
             pos: center,
             button: egui::PointerButton::Primary,
             pressed: true,
@@ -250,7 +250,7 @@ pub fn menus_should_close_even_if_submenu_disappears() {
         harness.run_steps(frame_delay);
 
         // Actually close the menu by clicking somewhere outside
-        harness.input_mut().events.push(egui::Event::PointerButton {
+        harness.input_mut().push_event(egui::Event::PointerButton {
             pos: center,
             button: egui::PointerButton::Primary,
             pressed: false,

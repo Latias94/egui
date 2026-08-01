@@ -665,6 +665,7 @@ impl GlowWinitRunning<'_> {
             shapes,
             pixels_per_point,
             viewport_output,
+            ..
         } = full_output;
 
         glutin.remove_viewports_not_in(&viewport_output);
@@ -717,20 +718,26 @@ impl GlowWinitRunning<'_> {
                     match action {
                         ActionRequested::Screenshot(user_data) => {
                             let screenshot = painter.read_screen_rgba(screen_size_in_pixels);
-                            egui_winit
-                                .egui_input_mut()
-                                .events
-                                .push(egui::Event::Screenshot {
+                            egui_winit.egui_input_mut().events.push(
+                                egui::Event::Screenshot {
                                     viewport_id,
                                     user_data,
                                     image: screenshot.into(),
-                                });
+                                }
+                                .into(),
+                            );
                         }
                         ActionRequested::Cut => {
-                            egui_winit.egui_input_mut().events.push(egui::Event::Cut);
+                            egui_winit
+                                .egui_input_mut()
+                                .events
+                                .push(egui::Event::Cut.into());
                         }
                         ActionRequested::Copy => {
-                            egui_winit.egui_input_mut().events.push(egui::Event::Copy);
+                            egui_winit
+                                .egui_input_mut()
+                                .events
+                                .push(egui::Event::Copy.into());
                         }
                         ActionRequested::Paste => {
                             if let Some(contents) = egui_winit.clipboard_text() {
@@ -739,7 +746,7 @@ impl GlowWinitRunning<'_> {
                                     egui_winit
                                         .egui_input_mut()
                                         .events
-                                        .push(egui::Event::Paste(contents));
+                                        .push(egui::Event::Paste(contents).into());
                                 }
                             }
                         }
@@ -1566,6 +1573,7 @@ fn render_immediate_viewport(
         shapes,
         pixels_per_point,
         viewport_output,
+        ..
     } = egui_ctx.run_ui(input, |ui| {
         viewport_ui_cb(ui);
     });
