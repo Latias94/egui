@@ -43,9 +43,9 @@ pub struct FullOutput {
 
     /// The immutable hit graph produced by the latest completed pass.
     ///
-    /// This is not receiver authority until the integration reports a successful presentation
-    /// through [`PointerHitGraphCandidate::settle`]. When several passes are combined, only the
-    /// candidate matching the latest paint output is retained.
+    /// This is not receiver authority until the integration reports a successful terminal render
+    /// or presentation boundary through [`PointerHitGraphCandidate::settle`]. When several passes
+    /// are combined, only the candidate matching the latest paint output is retained.
     pub pointer_hit_graph_candidate: Option<PointerHitGraphCandidate>,
 
     /// All the active viewports, including the root.
@@ -211,6 +211,12 @@ pub struct PlatformOutput {
 /// proof that a compositor displayed the frame.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PaintOutcome {
+    /// WebGL completed drawing into the browser-managed canvas.
+    ///
+    /// Browser composition is owned by the user agent and cannot be correlated back to this egui
+    /// frame. This proves that the canvas paint ran, but not that a compositor displayed it.
+    SubmittedToBrowserCanvas,
+
     /// WGPU scheduled the rendered texture for presentation on its swapchain.
     SubmittedToSwapchain,
 

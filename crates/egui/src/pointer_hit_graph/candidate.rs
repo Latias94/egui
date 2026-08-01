@@ -6,12 +6,13 @@ use crate::{PaintOutcome, ViewportId};
 
 use super::{PointerHitGraphSnapshot, authority::PresentedPointerHitGraphAuthority};
 
-/// A completed egui pass that can become pointer receiver authority after presentation.
+/// A completed egui pass that can become pointer receiver authority after host settlement.
 ///
 /// The candidate is bound to the egui viewport identity that produced it. Native integrations
 /// must bind that identity to their own exact window incarnation. Integrations should call
 /// [`Self::settle_for`] exactly when the corresponding renderer attempt reaches a terminal
-/// outcome.
+/// outcome. A successful settlement means the host accepted this pass as its latest interactable
+/// visual output; it does not claim that a compositor has already displayed it.
 #[derive(Clone)]
 pub struct PointerHitGraphCandidate {
     authority: PresentedPointerHitGraphAuthority,
@@ -54,21 +55,38 @@ impl PointerHitGraphCandidate {
         self.settle_for(self.snapshot.viewport_id(), outcome)
     }
 
+    /// Accept this candidate as the current semantic frame in an explicitly headless host.
+    ///
+    /// This is intended for deterministic test harnesses that have no physical renderer. Regular
+    /// integrations must instead call [`Self::settle`] after their renderer reaches a terminal
+    /// outcome. Calling this method before an ordinary production frame is painted would violate
+    /// the pointer authority contract.
+    pub fn accept_for_headless_host(&self) -> bool {
+        self.settle_terminal(self.snapshot.viewport_id(), true)
+    }
+
     /// Settle this candidate for the egui viewport that received the renderer outcome.
     ///
     /// The viewport identity check and terminal settlement are atomic across all candidate clones.
     /// A mismatched viewport terminally rejects the candidate and cannot be retried later.
     pub fn settle_for(&self, expected_viewport: ViewportId, outcome: &PaintOutcome) -> bool {
+        let rendered = matches!(
+            outcome,
+            PaintOutcome::SubmittedToBrowserCanvas
+                | PaintOutcome::SubmittedToSwapchain
+                | PaintOutcome::Swapped
+        );
+        self.settle_terminal(expected_viewport, rendered)
+    }
+
+    fn settle_terminal(&self, expected_viewport: ViewportId, rendered: bool) -> bool {
         let mut settlement = self.settlement.lock();
         if *settlement != CandidateSettlement::Pending {
             return false;
         }
 
         let presented = self.snapshot.viewport_id() == expected_viewport
-            && matches!(
-                outcome,
-                PaintOutcome::SubmittedToSwapchain | PaintOutcome::Swapped
-            )
+            && rendered
             && self.authority.promote(&self.snapshot);
         *settlement = if presented {
             CandidateSettlement::Presented

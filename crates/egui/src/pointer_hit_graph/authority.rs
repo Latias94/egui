@@ -4,7 +4,7 @@ use epaint::mutex::Mutex;
 
 use super::PointerHitGraphSnapshot;
 
-/// Shared promotion state for one egui viewport incarnation.
+/// Shared host-settled promotion state for one egui viewport incarnation.
 #[derive(Clone, Default)]
 pub(crate) struct PresentedPointerHitGraphAuthority {
     presented: Arc<Mutex<Option<PointerHitGraphSnapshot>>>,

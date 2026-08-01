@@ -25,10 +25,16 @@ pub struct AppRunner {
     // Output for the last run:
     textures_delta: TexturesDelta,
     clipped_primitives: Option<Vec<egui::ClippedPrimitive>>,
+    pending_pointer_hit_graph_candidate: Option<egui::PointerHitGraphCandidate>,
 }
 
 impl Drop for AppRunner {
     fn drop(&mut self) {
+        if let Some(candidate) = self.pending_pointer_hit_graph_candidate.take() {
+            candidate.settle(&egui::PaintOutcome::Skipped(
+                egui::PaintSkipReason::ViewportUnavailable,
+            ));
+        }
         log::debug!("AppRunner has fully dropped");
     }
 }
@@ -161,6 +167,7 @@ impl AppRunner {
             screenshot_commands_with_frame_delay: vec![],
             textures_delta: Default::default(),
             clipped_primitives: None,
+            pending_pointer_hit_graph_candidate: None,
         };
 
         runner.input.raw.max_texture_side = Some(runner.painter.max_texture_side());
@@ -295,9 +302,16 @@ impl AppRunner {
             shapes,
             pixels_per_point,
             pointer_receiver_journal: _,
-            pointer_hit_graph_candidate: _,
+            pointer_hit_graph_candidate,
             viewport_output,
         } = full_output;
+
+        if let Some(superseded) = self.pending_pointer_hit_graph_candidate.take() {
+            superseded.settle(&egui::PaintOutcome::Skipped(
+                egui::PaintSkipReason::SupersededByNewerPass,
+            ));
+        }
+        self.clipped_primitives = None;
 
         if viewport_output.len() > 1 {
             log::warn!("Multiple viewports not yet supported on the web");
@@ -323,6 +337,11 @@ impl AppRunner {
         if is_visible {
             self.textures_delta.append(textures_delta);
             self.clipped_primitives = Some(self.egui_ctx.tessellate(shapes, pixels_per_point));
+            self.pending_pointer_hit_graph_candidate = pointer_hit_graph_candidate;
+        } else if let Some(candidate) = pointer_hit_graph_candidate {
+            candidate.settle(&egui::PaintOutcome::Skipped(
+                egui::PaintSkipReason::NotVisible,
+            ));
         }
     }
 
@@ -330,8 +349,9 @@ impl AppRunner {
     pub fn paint(&mut self) {
         let textures_delta = std::mem::take(&mut self.textures_delta);
         let clipped_primitives = std::mem::take(&mut self.clipped_primitives);
+        let pointer_hit_graph_candidate = self.pending_pointer_hit_graph_candidate.take();
 
-        if let Some(clipped_primitives) = clipped_primitives {
+        let outcome = if let Some(clipped_primitives) = clipped_primitives {
             let mut screenshot_commands = vec![];
             self.screenshot_commands_with_frame_delay
                 .retain_mut(|(user_data, frame_delay)| {
@@ -347,15 +367,22 @@ impl AppRunner {
                 self.egui_ctx().request_repaint();
             }
 
-            if let Err(err) = self.painter.paint_and_update_textures(
+            self.painter.paint_and_update_textures(
                 self.app.clear_color(&self.egui_ctx.global_style().visuals),
                 &clipped_primitives,
                 self.egui_ctx.pixels_per_point(),
                 &textures_delta,
                 screenshot_commands,
-            ) {
-                log::error!("Failed to paint: {}", super::string_from_js_value(&err));
-            }
+            )
+        } else {
+            egui::PaintOutcome::Skipped(egui::PaintSkipReason::ViewportUnavailable)
+        };
+
+        if let egui::PaintOutcome::Failed(failure) = &outcome {
+            log::error!("Failed to paint: {failure:?}");
+        }
+        if let Some(candidate) = pointer_hit_graph_candidate {
+            candidate.settle(&outcome);
         }
     }
 

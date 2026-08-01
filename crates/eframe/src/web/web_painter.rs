@@ -1,5 +1,4 @@
 use egui::UserData;
-use wasm_bindgen::JsValue;
 
 /// Renderer for a browser canvas.
 /// As of writing we're not allowing to decide on the painter at runtime,
@@ -26,7 +25,7 @@ pub(crate) trait WebPainter {
         pixels_per_point: f32,
         textures_delta: &egui::TexturesDelta,
         capture: Vec<UserData>,
-    ) -> Result<(), JsValue>;
+    ) -> egui::PaintOutcome;
 
     fn handle_screenshots(&mut self, events: &mut Vec<egui::EventEnvelope>);
 

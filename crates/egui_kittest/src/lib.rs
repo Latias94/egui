@@ -175,6 +175,7 @@ impl<'a, State> Harness<'a, State> {
             #[cfg(feature = "snapshot")]
             snapshot_results: SnapshotResults::default(),
         };
+        accept_headless_frame(&harness.output);
         // Fulfill any screenshot requested during the initial frame above (which didn't go
         // through `_step`).
         #[cfg(any(feature = "wgpu", feature = "snapshot"))]
@@ -279,6 +280,7 @@ impl<'a, State> Harness<'a, State> {
         );
         self.renderer.handle_delta(&output.textures_delta);
         self.output = output;
+        accept_headless_frame(&self.output);
 
         #[cfg(any(feature = "wgpu", feature = "snapshot"))]
         self.handle_screenshots();
@@ -843,6 +845,12 @@ impl<'a, State> Harness<'a, State> {
             Box::new(|_cc| Ok(eframe_app)),
         )
         .unwrap();
+    }
+}
+
+fn accept_headless_frame(output: &egui::FullOutput) {
+    if let Some(candidate) = &output.pointer_hit_graph_candidate {
+        let _accepted = candidate.accept_for_headless_host();
     }
 }
 

@@ -4279,12 +4279,13 @@ impl Context {
 
 /// ## Interaction
 impl Context {
-    /// Returns the immutable hit graph from the last successfully presented
-    /// pass of `viewport_id`.
+    /// Returns the immutable hit graph from the last pass successfully settled by its host for
+    /// `viewport_id`.
     ///
-    /// This intentionally never exposes a current-pass candidate. A missing
-    /// result means the integration has no presentation authority for the
-    /// viewport and must fail closed instead of reconstructing a hit test from
+    /// Host settlement means the integration accepted the pass as its latest interactable visual
+    /// output; it is not proof of compositor visibility. This intentionally never exposes a
+    /// current-pass candidate. A missing result means the integration has no presentation
+    /// authority for the viewport and must fail closed instead of reconstructing a hit test from
     /// mutable UI state.
     pub fn presented_pointer_hit_graph_for(
         &self,

@@ -253,14 +253,23 @@ impl winit::application::ApplicationHandler<UserEvent> for GlowApp {
 
                 // draw things behind egui here
 
-                self.egui_glow
+                let pending_presentation = self
+                    .egui_glow
                     .as_mut()
                     .unwrap()
                     .paint(self.gl_window.as_mut().unwrap().window());
 
                 // draw things on top of egui here
 
-                self.gl_window.as_mut().unwrap().swap_buffers().unwrap();
+                let swap_result = self.gl_window.as_mut().unwrap().swap_buffers();
+                let paint_outcome = match &swap_result {
+                    Ok(()) => egui::PaintOutcome::Swapped,
+                    Err(error) => egui::PaintOutcome::Failed(egui::PaintFailure::SwapBuffers(
+                        error.to_string(),
+                    )),
+                };
+                let _presented = pending_presentation.complete(&paint_outcome);
+                swap_result.unwrap();
                 self.gl_window.as_mut().unwrap().window().set_visible(true);
             }
         };

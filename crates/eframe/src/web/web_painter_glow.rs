@@ -2,7 +2,6 @@ use egui::{Event, UserData, ViewportId};
 use egui_glow::glow;
 use std::sync::Arc;
 use wasm_bindgen::JsCast as _;
-use wasm_bindgen::JsValue;
 use web_sys::HtmlCanvasElement;
 
 use crate::{WebGlContextOption, WebOptions};
@@ -63,27 +62,33 @@ impl WebPainter for WebPainterGlow {
         pixels_per_point: f32,
         textures_delta: &egui::TexturesDelta,
         capture: Vec<UserData>,
-    ) -> Result<(), JsValue> {
+    ) -> egui::PaintOutcome {
         let canvas_dimension = [self.canvas.width(), self.canvas.height()];
 
         for (id, image_delta) in &textures_delta.set {
             self.painter.set_texture(*id, image_delta);
         }
 
-        egui_glow::painter::clear(self.painter.gl(), canvas_dimension, clear_color);
-        self.painter
-            .paint_primitives(canvas_dimension, pixels_per_point, clipped_primitives);
+        let outcome = if canvas_dimension.contains(&0) {
+            egui::PaintOutcome::Skipped(egui::PaintSkipReason::ViewportUnavailable)
+        } else {
+            egui_glow::painter::clear(self.painter.gl(), canvas_dimension, clear_color);
+            self.painter
+                .paint_primitives(canvas_dimension, pixels_per_point, clipped_primitives);
 
-        if !capture.is_empty() {
-            let image = self.painter.read_screen_rgba(canvas_dimension);
-            self.screenshots.push((image, capture));
-        }
+            if !capture.is_empty() {
+                let image = self.painter.read_screen_rgba(canvas_dimension);
+                self.screenshots.push((image, capture));
+            }
+
+            egui::PaintOutcome::SubmittedToBrowserCanvas
+        };
 
         for &id in &textures_delta.free {
             self.painter.free_texture(id);
         }
 
-        Ok(())
+        outcome
     }
 
     fn destroy(&mut self) {

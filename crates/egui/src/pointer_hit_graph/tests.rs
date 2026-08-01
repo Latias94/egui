@@ -103,6 +103,38 @@ fn successful_promotion_authorizes_immediately_following_pass() {
 }
 
 #[test]
+fn browser_canvas_submission_promotes_without_claiming_compositor_visibility() {
+    let context = Context::default();
+    let output = run_pass(&context, vec![], |ui| register_target(ui, BACKGROUND));
+    let Some(candidate) = output.pointer_hit_graph_candidate else {
+        panic!("completed pass must emit a hit graph candidate");
+    };
+
+    assert!(candidate.settle(&PaintOutcome::SubmittedToBrowserCanvas));
+    assert!(
+        context
+            .presented_pointer_hit_graph_for(crate::ViewportId::ROOT)
+            .is_some()
+    );
+}
+
+#[test]
+fn explicit_headless_acceptance_promotes_without_a_renderer_outcome() {
+    let context = Context::default();
+    let output = run_pass(&context, vec![], |ui| register_target(ui, BACKGROUND));
+    let Some(candidate) = output.pointer_hit_graph_candidate else {
+        panic!("completed pass must emit a hit graph candidate");
+    };
+
+    assert!(candidate.accept_for_headless_host());
+    assert!(
+        context
+            .presented_pointer_hit_graph_for(crate::ViewportId::ROOT)
+            .is_some()
+    );
+}
+
+#[test]
 fn context_exposes_only_the_successfully_presented_graph_for_one_viewport() {
     let context = Context::default();
     assert!(
@@ -212,8 +244,10 @@ fn failed_candidate_cannot_authorize_or_be_resurrected() {
         panic!("completed pass must emit a hit graph candidate");
     };
     let retained_clone = failed_candidate.clone();
+    let retained_headless_clone = failed_candidate.clone();
     assert!(!failed_candidate.settle(&PaintOutcome::Failed(PaintFailure::RendererUnavailable)));
     assert!(!retained_clone.settle(&PaintOutcome::Swapped));
+    assert!(!retained_headless_clone.accept_for_headless_host());
 
     let next = run_pass(&context, vec![press(target_rect().center())], |ui| {
         register_target(ui, REPLACEMENT);
@@ -237,7 +271,9 @@ fn skipped_candidate_leaves_the_following_pass_unknown() {
     let Some(candidate) = skipped.pointer_hit_graph_candidate else {
         panic!("completed pass must emit a hit graph candidate");
     };
+    let retained_headless_clone = candidate.clone();
     assert!(!candidate.settle(&PaintOutcome::Skipped(PaintSkipReason::NotVisible)));
+    assert!(!retained_headless_clone.accept_for_headless_host());
 
     let next = run_pass(&context, vec![press(target_rect().center())], |ui| {
         register_target(ui, BACKGROUND);
@@ -400,11 +436,13 @@ fn full_output_append_keeps_only_the_latest_candidate() {
     let Some(superseded) = first.pointer_hit_graph_candidate.clone() else {
         panic!("completed pass must emit a hit graph candidate");
     };
+    let superseded_headless_clone = superseded.clone();
     let second = run_pass(&context, vec![], |ui| register_target(ui, REPLACEMENT));
 
     first.append(second);
 
     assert!(!superseded.settle(&PaintOutcome::Swapped));
+    assert!(!superseded_headless_clone.accept_for_headless_host());
     let Some(candidate) = first.pointer_hit_graph_candidate else {
         panic!("combined output must retain its latest candidate");
     };
