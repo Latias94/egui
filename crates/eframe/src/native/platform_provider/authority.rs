@@ -309,6 +309,12 @@ pub enum NativePlatformError {
     WindowSnapshotMismatch,
     /// The current cycle does not contain exactly one snapshot per active binding.
     IncompletePlatformRoster,
+    /// A previously prepared host-ingress batch has not reached its settlement boundary.
+    HostIngressInFlight,
+    /// A fatal hosted-cycle abort made the native ingress provider unusable.
+    HostIngressPoisoned,
+    /// A host-ingress settlement ticket does not name the prepared batch.
+    HostIngressSettlementMismatch,
     /// A monotonically increasing identity was exhausted.
     CounterExhausted,
 }
@@ -341,6 +347,13 @@ impl std::fmt::Display for NativePlatformError {
             }
             Self::IncompletePlatformRoster => {
                 "native platform snapshot does not exactly cover the active roster"
+            }
+            Self::HostIngressInFlight => {
+                "a native host-ingress batch is already awaiting settlement"
+            }
+            Self::HostIngressPoisoned => "a fatal hosted-cycle abort poisoned native host ingress",
+            Self::HostIngressSettlementMismatch => {
+                "native host-ingress settlement does not match the prepared batch"
             }
             Self::CounterExhausted => "native platform monotonic counter was exhausted",
         })

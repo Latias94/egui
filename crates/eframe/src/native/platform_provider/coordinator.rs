@@ -60,6 +60,7 @@ pub(crate) struct NativePlatformCoordinator {
     pending_ingress_records: Vec<NativeIngressRecord>,
     pointer_sequence: u64,
     pointer_watermark: u64,
+    host_ingress_settlement: HostIngressSettlementState,
     observation_generations:
         BTreeMap<(NativeViewportBinding, NativeEffectProperty), NativeObservationGeneration>,
     next_effect_id: u64,
@@ -68,6 +69,37 @@ pub(crate) struct NativePlatformCoordinator {
     pending_viewport_creates: BTreeMap<egui::ViewportId, PendingViewportCreate>,
     pending_window_snapshots: BTreeMap<NativeViewportBinding, NativeWindowSnapshot>,
     pending_global_facts: Option<PendingGlobalFacts>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+enum HostIngressSettlementState {
+    #[default]
+    Idle,
+    Prepared(PreparedHostIngressSettlement),
+    Poisoned,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PreparedHostIngressSettlement {
+    key: NativeHostIngressSettlementKey,
+    snapshot_generation: u64,
+    ingress_through: u64,
+    pointer_through: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct NativeHostIngressSettlementKey(NativeIngressOrdinal);
+
+#[derive(Debug)]
+pub(crate) struct PreparedNativeHostIngress {
+    ingress: NativeHostIngress,
+    settlement: NativeHostIngressSettlementKey,
+}
+
+impl PreparedNativeHostIngress {
+    pub(crate) fn into_parts(self) -> (NativeHostIngress, NativeHostIngressSettlementKey) {
+        (self.ingress, self.settlement)
+    }
 }
 
 #[derive(Debug, Default)]
@@ -1023,7 +1055,18 @@ impl NativePlatformCoordinator {
         Ok(())
     }
 
-    pub(crate) fn freeze_host_ingress(&mut self) -> Result<NativeHostIngress, NativePlatformError> {
+    pub(crate) fn prepare_host_ingress(
+        &mut self,
+    ) -> Result<PreparedNativeHostIngress, NativePlatformError> {
+        match self.host_ingress_settlement {
+            HostIngressSettlementState::Idle => {}
+            HostIngressSettlementState::Prepared(_) => {
+                return Err(NativePlatformError::HostIngressInFlight);
+            }
+            HostIngressSettlementState::Poisoned => {
+                return Err(NativePlatformError::HostIngressPoisoned);
+            }
+        }
         let Some(global) = self.pending_global_facts.as_ref() else {
             return Err(NativePlatformError::IncompletePlatformRoster);
         };
@@ -1099,9 +1142,64 @@ impl NativePlatformCoordinator {
             retirement_quiescences,
             viewport_create_results,
         };
-        self.snapshot_generation = snapshot_generation.get();
-        self.ingress_watermark = self.ingress_ordinal;
-        self.pointer_watermark = through_pointer.get();
+        let settlement = NativeHostIngressSettlementKey(ingress.ordered().through());
+        self.host_ingress_settlement =
+            HostIngressSettlementState::Prepared(PreparedHostIngressSettlement {
+                key: settlement,
+                snapshot_generation: snapshot_generation.get(),
+                ingress_through: ingress.ordered().through().get(),
+                pointer_through: through_pointer.get(),
+            });
+        Ok(PreparedNativeHostIngress {
+            ingress,
+            settlement,
+        })
+    }
+
+    pub(crate) fn commit_host_ingress(
+        &mut self,
+        key: NativeHostIngressSettlementKey,
+    ) -> Result<(), NativePlatformError> {
+        let prepared = match self.host_ingress_settlement {
+            HostIngressSettlementState::Prepared(prepared) => prepared,
+            HostIngressSettlementState::Poisoned => {
+                return Err(NativePlatformError::HostIngressPoisoned);
+            }
+            HostIngressSettlementState::Idle => {
+                return Err(NativePlatformError::HostIngressSettlementMismatch);
+            }
+        };
+        if prepared.key != key {
+            return Err(NativePlatformError::HostIngressSettlementMismatch);
+        }
+        self.snapshot_generation = prepared.snapshot_generation;
+        self.ingress_watermark = prepared.ingress_through;
+        self.pointer_watermark = prepared.pointer_through;
+        self.host_ingress_settlement = HostIngressSettlementState::Idle;
+        Ok(())
+    }
+
+    pub(crate) fn abort_host_ingress(
+        &mut self,
+        key: NativeHostIngressSettlementKey,
+    ) -> Result<(), NativePlatformError> {
+        match self.host_ingress_settlement {
+            HostIngressSettlementState::Prepared(prepared) if prepared.key == key => {
+                self.host_ingress_settlement = HostIngressSettlementState::Poisoned;
+                Ok(())
+            }
+            HostIngressSettlementState::Poisoned => Err(NativePlatformError::HostIngressPoisoned),
+            HostIngressSettlementState::Idle | HostIngressSettlementState::Prepared(_) => {
+                Err(NativePlatformError::HostIngressSettlementMismatch)
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn freeze_host_ingress(&mut self) -> Result<NativeHostIngress, NativePlatformError> {
+        let prepared = self.prepare_host_ingress()?;
+        let (ingress, settlement) = prepared.into_parts();
+        self.commit_host_ingress(settlement)?;
         Ok(ingress)
     }
 
@@ -1450,6 +1548,95 @@ mod tests {
         let ingress = coordinator.freeze_host_ingress().unwrap();
 
         assert_eq!(ingress.platform().capabilities(), capabilities);
+    }
+
+    #[test]
+    fn prepared_ingress_advances_committed_watermarks_only_at_settlement() {
+        let mut coordinator = NativePlatformCoordinator::default();
+        let binding = coordinator.register_viewport(viewport("prepared")).unwrap();
+        let pointer_sequence = coordinator
+            .record_pointer_edge(
+                NativePointerSource::Viewport(binding),
+                pointer(1, 1),
+                NativePointerEdgeKind::Moved,
+                NativeAuthority::known(NativePhysicalPoint::new(10, 20)),
+                unknown_hover(),
+                unknown_capture(),
+            )
+            .unwrap();
+        record_complete_window_snapshot(&mut coordinator, binding);
+        record_unknown_platform_facts(&mut coordinator);
+
+        let prepared = coordinator.prepare_host_ingress().unwrap();
+        let (ingress, settlement) = prepared.into_parts();
+
+        assert_eq!(coordinator.snapshot_generation, 0);
+        assert_eq!(coordinator.ingress_watermark, 0);
+        assert_eq!(coordinator.pointer_watermark, 0);
+        assert_eq!(ingress.pointer_journal().through(), pointer_sequence);
+
+        coordinator.commit_host_ingress(settlement).unwrap();
+
+        assert_eq!(
+            coordinator.snapshot_generation,
+            ingress.platform().snapshot_generation().get()
+        );
+        assert_eq!(
+            coordinator.ingress_watermark,
+            ingress.ordered().through().get()
+        );
+        assert_eq!(coordinator.pointer_watermark, pointer_sequence.get());
+    }
+
+    #[test]
+    fn ingress_commit_does_not_consume_records_that_arrived_after_prepare() {
+        let mut coordinator = NativePlatformCoordinator::default();
+        let binding = coordinator
+            .register_viewport(viewport("post-prepare"))
+            .unwrap();
+        record_complete_window_snapshot(&mut coordinator, binding);
+        record_unknown_platform_facts(&mut coordinator);
+        let first = coordinator.prepare_host_ingress().unwrap();
+        let (first_ingress, settlement) = first.into_parts();
+
+        let later_pointer = coordinator
+            .record_pointer_edge(
+                NativePointerSource::Viewport(binding),
+                pointer(1, 1),
+                NativePointerEdgeKind::Moved,
+                NativeAuthority::known(NativePhysicalPoint::new(30, 40)),
+                unknown_hover(),
+                unknown_capture(),
+            )
+            .unwrap();
+        coordinator.commit_host_ingress(settlement).unwrap();
+        record_complete_window_snapshot(&mut coordinator, binding);
+        record_unknown_platform_facts(&mut coordinator);
+
+        let second = coordinator.prepare_host_ingress().unwrap();
+        let (second_ingress, second_settlement) = second.into_parts();
+
+        assert_eq!(
+            second_ingress.ordered().previous(),
+            first_ingress.ordered().through()
+        );
+        assert_eq!(second_ingress.pointer_journal().through(), later_pointer);
+        coordinator.commit_host_ingress(second_settlement).unwrap();
+    }
+
+    #[test]
+    fn aborted_ingress_poison_prevents_a_successor_batch() {
+        let mut coordinator = NativePlatformCoordinator::default();
+        record_unknown_platform_facts(&mut coordinator);
+        let prepared = coordinator.prepare_host_ingress().unwrap();
+        let (_, settlement) = prepared.into_parts();
+
+        coordinator.abort_host_ingress(settlement).unwrap();
+
+        assert_eq!(
+            coordinator.prepare_host_ingress().unwrap_err(),
+            NativePlatformError::HostIngressPoisoned
+        );
     }
 
     #[test]

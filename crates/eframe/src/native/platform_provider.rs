@@ -32,7 +32,10 @@ pub use authority::{
 };
 #[cfg(test)]
 pub(crate) use coordinator::NativePlatformCoordinator;
-pub(crate) use coordinator::{NativePointerEdgeFacts, SharedNativePlatformCoordinator};
+pub(crate) use coordinator::{
+    NativeHostIngressSettlementKey, NativePointerEdgeFacts, PreparedNativeHostIngress,
+    SharedNativePlatformCoordinator,
+};
 pub(crate) use create::NativeViewportCreateRequest;
 pub use create::{
     NativeViewportCreateCorrelation, NativeViewportCreateDispatchOutcome,

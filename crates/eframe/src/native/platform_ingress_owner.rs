@@ -9,6 +9,7 @@ use egui::ViewportId;
 use winit::window::{Window, WindowId};
 
 use super::native_work_area_authority::NativeWorkAreaAuthority;
+use super::platform_provider::NativeHostIngressSettlementKey;
 use super::platform_provider::{
     NativeAccessibilityEdge, NativeAuthority, NativeBackendCapabilities, NativeCaptureOwner,
     NativeCloseState, NativeEffectDispatchOutcome, NativeEffectProperty, NativeEffectRequest,
@@ -19,7 +20,7 @@ use super::platform_provider::{
     NativePointerIdentity, NativePointerInputState, NativePointerSource, NativePresentationState,
     NativeScrollCancelReason, NativeScrollDelta, NativeScrollEdge, NativeScrollModifiers,
     NativeScrollPhase, NativeScrollSequenceToken, NativeUnavailableReason, NativeViewportBinding,
-    NativeWindowEffect, NativeWorkAreaRoute, ObservationAcknowledgement,
+    NativeWindowEffect, NativeWorkAreaRoute, ObservationAcknowledgement, PreparedNativeHostIngress,
     SharedNativePlatformCoordinator,
 };
 #[cfg(feature = "native-test-support")]
@@ -119,6 +120,50 @@ pub(super) struct FrozenNativePlatformIngress {
     native_staging_presentations: Vec<NativeViewportBinding>,
     effect_sink: crate::NativeEffectSink,
     viewport_create_sink: crate::NativeViewportCreateSink,
+    settlement: NativeHostIngressSettlement,
+}
+
+#[must_use = "a frozen native ingress batch must reach the hosted commit boundary"]
+pub(super) struct NativeHostIngressSettlement {
+    coordinator: SharedNativePlatformCoordinator,
+    key: Option<NativeHostIngressSettlementKey>,
+}
+
+impl NativeHostIngressSettlement {
+    fn new(
+        coordinator: SharedNativePlatformCoordinator,
+        key: NativeHostIngressSettlementKey,
+    ) -> Self {
+        Self {
+            coordinator,
+            key: Some(key),
+        }
+    }
+
+    pub(super) fn commit(mut self) -> Result<(), NativePlatformIngressError> {
+        let key = self
+            .key
+            .expect("an affine native ingress settlement is consumed once");
+        let result = self.coordinator.lock().commit_host_ingress(key);
+        self.key
+            .take()
+            .expect("an affine native ingress settlement is consumed once");
+        result?;
+        Ok(())
+    }
+}
+
+impl Drop for NativeHostIngressSettlement {
+    fn drop(&mut self) {
+        let Some(key) = self.key.take() else {
+            return;
+        };
+        let aborted = self.coordinator.lock().abort_host_ingress(key);
+        debug_assert!(
+            aborted.is_ok(),
+            "an unsettled native ingress ticket must poison its prepared batch"
+        );
+    }
 }
 
 pub(super) struct NativeEffectDispatchBatch {
@@ -140,12 +185,14 @@ impl FrozenNativePlatformIngress {
         Vec<NativeViewportBinding>,
         crate::NativeEffectSink,
         crate::NativeViewportCreateSink,
+        NativeHostIngressSettlement,
     ) {
         (
             self.ingress,
             self.native_staging_presentations,
             self.effect_sink,
             self.viewport_create_sink,
+            self.settlement,
         )
     }
 }
@@ -1145,7 +1192,9 @@ impl NativePlatformIngressOwner {
         let pointer_route = super::native_pointer_probe::probe(&bound_windows);
         self.hovered = pointer_route.hovered;
         self.capture = pointer_route.capture;
-        let ingress = self.freeze_facts(&facts)?;
+        let prepared_ingress = self.prepare_facts(&facts)?;
+        let (ingress, settlement_key) = prepared_ingress.into_parts();
+        let settlement = NativeHostIngressSettlement::new(self.coordinator(), settlement_key);
         let native_staging_presentations = facts
             .iter()
             .filter(|facts| facts.native_staging_surface)
@@ -1164,6 +1213,7 @@ impl NativePlatformIngressOwner {
             native_staging_presentations,
             effect_sink,
             viewport_create_sink,
+            settlement,
         })
     }
 
@@ -1205,10 +1255,10 @@ impl NativePlatformIngressOwner {
         Ok(())
     }
 
-    fn freeze_facts(
+    fn prepare_facts(
         &mut self,
         facts: &[WinitWindowFacts],
-    ) -> Result<NativeHostIngress, NativePlatformIngressError> {
+    ) -> Result<PreparedNativeHostIngress, NativePlatformIngressError> {
         self.reconcile_roster(facts)?;
 
         let focused_bindings = facts
@@ -1242,8 +1292,19 @@ impl NativePlatformIngressOwner {
             )?;
         self.coordinator
             .lock()
-            .freeze_host_ingress()
+            .prepare_host_ingress()
             .map_err(Into::into)
+    }
+
+    #[cfg(test)]
+    fn freeze_facts(
+        &mut self,
+        facts: &[WinitWindowFacts],
+    ) -> Result<NativeHostIngress, NativePlatformIngressError> {
+        let prepared = self.prepare_facts(facts)?;
+        let (ingress, settlement) = prepared.into_parts();
+        self.coordinator.lock().commit_host_ingress(settlement)?;
+        Ok(ingress)
     }
 
     fn reconcile_roster(
@@ -2017,6 +2078,39 @@ mod tests {
             device_id: winit::event::DeviceId::dummy(),
             stream: WinitPointerStream::Mouse,
         }
+    }
+
+    #[test]
+    fn dropping_unsettled_native_ingress_poison_prevents_reuse() {
+        let mut owner = NativePlatformIngressOwner::default();
+        let prepared = owner.prepare_facts(&[]).unwrap();
+        let (_, key) = prepared.into_parts();
+        let settlement = NativeHostIngressSettlement::new(owner.coordinator(), key);
+
+        drop(settlement);
+
+        assert!(matches!(
+            owner.prepare_facts(&[]),
+            Err(NativePlatformIngressError::Platform(
+                NativePlatformError::HostIngressPoisoned
+            ))
+        ));
+    }
+
+    #[test]
+    fn committed_native_ingress_settlement_allows_the_successor_batch() {
+        let mut owner = NativePlatformIngressOwner::default();
+        let prepared = owner.prepare_facts(&[]).unwrap();
+        let (_, key) = prepared.into_parts();
+        NativeHostIngressSettlement::new(owner.coordinator(), key)
+            .commit()
+            .unwrap();
+
+        let successor = owner.prepare_facts(&[]).unwrap();
+        let (_, successor_key) = successor.into_parts();
+        NativeHostIngressSettlement::new(owner.coordinator(), successor_key)
+            .commit()
+            .unwrap();
     }
 
     #[test]

@@ -47,6 +47,7 @@ struct FrozenGlowHostedCycle {
     native_staging_presentations: Vec<crate::NativeViewportBinding>,
     native_effect_sink: crate::NativeEffectSink,
     native_viewport_create_sink: crate::NativeViewportCreateSink,
+    native_ingress_settlement: super::platform_ingress_owner::NativeHostIngressSettlement,
 }
 
 struct SealedGlowHostedCycle {
@@ -217,27 +218,6 @@ fn freeze_complete_roster(
         );
     }
 
-    let native_windows = glutin
-        .viewports
-        .iter()
-        .filter_map(|(viewport_id, viewport)| {
-            viewport
-                .window
-                .as_ref()
-                .map(|window| (*viewport_id, Arc::clone(window)))
-        })
-        .collect::<Vec<_>>();
-    let frozen_native_ingress = glutin
-        .platform_ingress
-        .freeze(native_windows, &egui_ctx)
-        .map_err(std::io::Error::other)?;
-    let (
-        native_ingress,
-        native_staging_presentations,
-        native_effect_sink,
-        native_viewport_create_sink,
-    ) = frozen_native_ingress.into_parts();
-
     let mut raw_inputs = Vec::with_capacity(callback_order.len());
     for viewport_id in &callback_order {
         let Some(viewport) = glutin.viewports.get_mut(viewport_id) else {
@@ -261,6 +241,28 @@ fn freeze_complete_roster(
         raw_inputs.push(raw_input);
     }
 
+    let native_windows = glutin
+        .viewports
+        .iter()
+        .filter_map(|(viewport_id, viewport)| {
+            viewport
+                .window
+                .as_ref()
+                .map(|window| (*viewport_id, Arc::clone(window)))
+        })
+        .collect::<Vec<_>>();
+    let frozen_native_ingress = glutin
+        .platform_ingress
+        .freeze(native_windows, &egui_ctx)
+        .map_err(std::io::Error::other)?;
+    let (
+        native_ingress,
+        native_staging_presentations,
+        native_effect_sink,
+        native_viewport_create_sink,
+        native_ingress_settlement,
+    ) = frozen_native_ingress.into_parts();
+
     Ok(Some(FrozenGlowHostedCycle {
         raw_inputs,
         callback_order,
@@ -269,6 +271,7 @@ fn freeze_complete_roster(
         native_staging_presentations,
         native_effect_sink,
         native_viewport_create_sink,
+        native_ingress_settlement,
     }))
 }
 
@@ -287,6 +290,7 @@ fn stage_and_seal(
         native_staging_presentations,
         native_effect_sink,
         native_viewport_create_sink,
+        native_ingress_settlement,
     } = frozen_cycle;
 
     let hosted_viewport_mode = app.hosted_viewport_mode();
@@ -398,6 +402,22 @@ fn stage_and_seal(
         }
         return Err(abort_completed_cycle(
             HostedViewportCycleError::CommitHook { source },
+            outputs,
+            integration,
+            app,
+            painter,
+            presentation_results,
+        ));
+    }
+    if let Err(error) = native_ingress_settlement.commit() {
+        retained_effect_sink.close_and_cancel();
+        for schedule in viewport_create_schedules {
+            schedule.cancel(&retained_viewport_create_sink);
+        }
+        return Err(abort_completed_cycle(
+            HostedViewportCycleError::Runtime {
+                source: Box::new(error),
+            },
             outputs,
             integration,
             app,
