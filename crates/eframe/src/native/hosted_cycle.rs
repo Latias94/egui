@@ -183,6 +183,9 @@ pub struct HostedViewportCycle {
     inputs: BTreeMap<ViewportId, RawInput>,
     native_ingress: Option<Arc<crate::NativeHostIngress>>,
     claimed_native_event_envelopes: Arc<egui::mutex::Mutex<BTreeSet<(ViewportId, usize)>>>,
+    settled_native_scroll_edges: Arc<
+        egui::mutex::Mutex<BTreeSet<(crate::NativeViewportBinding, crate::NativePointerSequence)>>,
+    >,
     native_effect_sink: Option<crate::NativeEffectSink>,
     native_viewport_create_sink: Option<crate::NativeViewportCreateSink>,
     native_staging_presentations: Arc<BTreeSet<crate::NativeViewportBinding>>,
@@ -1294,6 +1297,7 @@ impl HostedViewportCycle {
             inputs: roster,
             native_ingress,
             claimed_native_event_envelopes: Arc::default(),
+            settled_native_scroll_edges: Arc::default(),
             native_effect_sink,
             native_viewport_create_sink,
             native_staging_presentations: Arc::new(native_staging_presentations),
@@ -1367,11 +1371,14 @@ impl HostedViewportCycle {
         Some(receipt)
     }
 
-    /// Affinely claims the egui wheel derivative of one exact native scroll edge.
+    /// Affinely settles the egui wheel derivative of one exact native scroll edge.
     ///
-    /// A successful claim removes that derivative before the viewport begins its egui pass,
-    /// preventing a native protocol consumer and egui's `WheelState` from consuming the same
-    /// physical sample. Unknown, ambiguous, foreign, and mismatched correlations fail closed.
+    /// A successful settlement either removes the one correlated derivative before the viewport
+    /// begins its egui pass or proves that this backend event produced no egui derivative. The
+    /// latter is required for native test and accessibility drivers that publish directly into
+    /// the native journal. Both outcomes prevent a native protocol consumer and egui's
+    /// `WheelState` from consuming the same physical sample. Unknown, ambiguous, foreign,
+    /// mismatched, and repeated settlements fail closed.
     pub fn claim_native_scroll_derivative(
         &self,
         binding: crate::NativeViewportBinding,
@@ -1397,22 +1404,46 @@ impl HostedViewportCycle {
         let Some(backend_sequence) = record.backend_event_sequence() else {
             return false;
         };
-        let Some(input) = self.inputs.get(&binding.viewport_id()) else {
+        if !self.inputs.contains_key(&binding.viewport_id()) {
             return false;
-        };
-        let mut derivatives = input.events.iter().enumerate().filter(|(_, envelope)| {
-            envelope.correlation().sequence() == Some(backend_sequence)
-                && matches!(envelope.event(), egui::Event::MouseWheel { .. })
+        }
+        let mut derivatives = self.inputs.iter().flat_map(|(viewport_id, input)| {
+            input
+                .events
+                .iter()
+                .enumerate()
+                .filter_map(move |(index, envelope)| {
+                    (envelope.correlation().sequence() == Some(backend_sequence)
+                        && matches!(envelope.event(), egui::Event::MouseWheel { .. }))
+                    .then_some((*viewport_id, index))
+                })
         });
-        let Some((raw_event_index, _)) = derivatives.next() else {
-            return false;
-        };
+        let derivative = derivatives.next();
         if derivatives.next().is_some() {
             return false;
         }
-        self.claimed_native_event_envelopes
+        let scroll_key = (binding, pointer_sequence);
+        let mut settled_scroll_edges = self.settled_native_scroll_edges.lock();
+        if !settled_scroll_edges.insert(scroll_key) {
+            return false;
+        }
+        let Some((derivative_viewport, raw_event_index)) = derivative else {
+            return true;
+        };
+        if derivative_viewport != binding.viewport_id() {
+            settled_scroll_edges.remove(&scroll_key);
+            return false;
+        }
+        if self
+            .claimed_native_event_envelopes
             .lock()
-            .insert((binding.viewport_id(), raw_event_index))
+            .insert((derivative_viewport, raw_event_index))
+        {
+            true
+        } else {
+            settled_scroll_edges.remove(&scroll_key);
+            false
+        }
     }
 
     fn take_viewport_input(&mut self, viewport_id: ViewportId) -> Option<RawInput> {

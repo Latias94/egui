@@ -2287,6 +2287,53 @@ mod tests {
     }
 
     #[test]
+    fn journal_only_scroll_proves_that_no_egui_derivative_exists() {
+        let mut coordinator = NativePlatformCoordinator::default();
+        let binding = coordinator
+            .register_viewport(egui::ViewportId::ROOT)
+            .unwrap();
+        let backend_sequence = egui::BackendEventSequence::new(65);
+        let scroll = NativeScrollEdge::new(
+            NativePointerDeviceId::new(9),
+            None,
+            NativeScrollPhase::Discrete,
+            Some(NativeScrollDelta::Lines(
+                NativeFiniteScrollVector::new(0.0, 1.0).unwrap(),
+            )),
+            NativeAuthority::unknown(NativeUnavailableReason::NotObserved),
+            NativeAuthority::known(crate::NativeScrollModifiers::default()),
+        )
+        .unwrap();
+        let pointer_sequence = coordinator
+            .record_pointer_edge_for_backend(
+                backend_sequence,
+                NativePointerEdgeFacts::new(
+                    NativePointerSource::Viewport(binding),
+                    native_delivery(binding),
+                    pointer(9, 1),
+                    NativePointerEdgeKind::Scrolled(scroll),
+                    unknown_point(),
+                    unknown_hover(),
+                    unknown_capture(),
+                ),
+            )
+            .unwrap();
+        let raw_input = egui::RawInput {
+            viewport_id: egui::ViewportId::ROOT,
+            ..Default::default()
+        };
+        let ingress = freeze_single_binding(&mut coordinator, binding);
+        let cycle = crate::HostedViewportCycle::with_native_ingress([raw_input], ingress)
+            .expect("a journal-only scroll still forms one exact native cycle");
+
+        assert!(cycle.claim_native_scroll_derivative(binding, pointer_sequence));
+        assert!(
+            !cycle.claim_native_scroll_derivative(binding, pointer_sequence),
+            "proving the absence of a derivative is affine"
+        );
+    }
+
+    #[test]
     fn viewport_create_result_waits_for_native_binding_materialization() {
         let mut coordinator = NativePlatformCoordinator::default();
         let parent = coordinator
