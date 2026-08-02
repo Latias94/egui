@@ -414,14 +414,7 @@ impl NativePlatformIngressOwner {
                     stream: WinitPointerStream::Mouse,
                 };
                 let source = NativePointerSource::Viewport(binding);
-                let position = self
-                    .pointer_states
-                    .get(&key)
-                    .filter(|state| state.source == source)
-                    .map_or_else(
-                        || NativeAuthority::unknown(NativeUnavailableReason::NotObserved),
-                        |state| state.position.clone(),
-                    );
+                let position = self.retained_pointer_position(key, source);
                 let button = native_mouse_button(*button);
                 let kind = match state {
                     winit::event::ElementState::Pressed => {
@@ -479,8 +472,19 @@ impl NativePlatformIngressOwner {
                     *phase,
                     self.modifiers.get(&binding).copied(),
                 )?;
-                let position = NativeAuthority::unknown(NativeUnavailableReason::NotObserved);
-                let coordinates = NativeAuthority::unknown(NativeUnavailableReason::NotObserved);
+                let position = self.retained_pointer_position(key, source);
+                let hovered_coordinates = pointer_coordinate_capture(
+                    &bound_route_windows,
+                    &pointer_route.hovered,
+                    &position,
+                    egui_ctx,
+                );
+                let delivery_coordinates = pointer_delivery_coordinate_capture(
+                    &bound_route_windows,
+                    &pointer_route.delivery_owner,
+                    &position,
+                    egui_ctx,
+                );
                 let work_area = self.event_work_area(&pointer_route.hovered, &position);
                 self.record_pointer_facts(
                     source,
@@ -490,8 +494,8 @@ impl NativePlatformIngressOwner {
                     WinitPointerAuthority {
                         delivery_owner: pointer_route.delivery_owner.clone(),
                         hovered: pointer_route.hovered.clone(),
-                        hovered_coordinates: coordinates.clone(),
-                        delivery_coordinates: coordinates,
+                        hovered_coordinates,
+                        delivery_coordinates,
                         work_area,
                         capture: pointer_route.capture.clone(),
                     },
@@ -818,6 +822,20 @@ impl NativePlatformIngressOwner {
             capture_after.map_or(NativeCaptureOwner::None, NativeCaptureOwner::Viewport),
         );
         Ok(repaint_viewport)
+    }
+
+    fn retained_pointer_position(
+        &self,
+        key: WinitPointerKey,
+        source: NativePointerSource,
+    ) -> NativeAuthority<NativePhysicalPoint> {
+        self.pointer_states
+            .get(&key)
+            .filter(|state| state.source == source)
+            .map_or_else(
+                || NativeAuthority::unknown(NativeUnavailableReason::NotObserved),
+                |state| state.position.clone(),
+            )
     }
 
     #[cfg(feature = "accesskit")]
@@ -2059,6 +2077,44 @@ mod tests {
                 egui::BackendEventSequence::new(1),
             )
             .expect("device removal must not replay a retired viewport binding");
+    }
+
+    #[test]
+    fn wheel_reuses_only_the_exact_source_pointer_position() {
+        let mut owner = NativePlatformIngressOwner::default();
+        let viewport_id = viewport("wheel-position");
+        let initial = facts(window_id(), viewport_id, false);
+        let binding = owner
+            .freeze_facts(std::slice::from_ref(&initial))
+            .unwrap()
+            .platform()
+            .inventory()[0];
+        let key = mouse_pointer_key();
+        let position = NativePhysicalPoint::new(123, 456);
+        owner.pointer_states.insert(
+            key,
+            WinitPointerState {
+                identity: NativePointerIdentity::new(
+                    NativePointerDeviceId::new(9),
+                    NativePointerId::new(1),
+                ),
+                source: NativePointerSource::Viewport(binding),
+                position: NativeAuthority::known(position),
+            },
+        );
+
+        assert_eq!(
+            owner
+                .retained_pointer_position(key, NativePointerSource::Viewport(binding))
+                .value(),
+            Some(&position)
+        );
+        assert!(
+            owner
+                .retained_pointer_position(key, NativePointerSource::Foreign)
+                .value()
+                .is_none()
+        );
     }
 
     #[test]
