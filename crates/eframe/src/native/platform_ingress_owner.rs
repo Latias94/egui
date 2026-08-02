@@ -758,19 +758,13 @@ impl NativePlatformIngressOwner {
             ),
             NativeTestPointerAction::Scroll(delta) => {
                 let delta = native_scroll_delta(native_test_scroll_delta(delta))?;
-                let modifiers = source_binding
-                    .and_then(|binding| self.modifiers.get(&binding).copied())
-                    .map_or_else(
-                        || NativeAuthority::unknown(NativeUnavailableReason::NotObserved),
-                        NativeAuthority::known,
-                    );
                 let scroll = NativeScrollEdge::new(
                     state.identity.device_id(),
                     None,
                     NativeScrollPhase::Discrete,
                     Some(delta),
                     NativeAuthority::unknown(NativeUnavailableReason::NotObserved),
-                    modifiers,
+                    NativeAuthority::known(NativeScrollModifiers::default()),
                 )
                 .ok_or(NativePlatformIngressError::InvalidScrollEdge)?;
                 (NativePointerEdgeKind::Scrolled(scroll), state.capture_owner)

@@ -50,7 +50,7 @@ pub enum NativeTestPointerAction {
     PrimaryPressed,
     /// Release the synthetic primary pointer button.
     PrimaryReleased,
-    /// Deliver one independent wheel sample without inventing a smooth-scroll sequence.
+    /// Deliver one independent wheel sample with exact default modifiers and no smooth sequence.
     Scroll(NativeTestScrollDelta),
 }
 
