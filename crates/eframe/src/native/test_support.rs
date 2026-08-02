@@ -4,8 +4,45 @@ use winit::event_loop::{EventLoopClosed, EventLoopProxy};
 
 use super::winit_integration::UserEvent;
 
+/// A high-level scroll delta accepted by the native test driver.
+///
+/// This test-only value carries no viewport binding, provider identity, or
+/// ingress position. The native event loop resolves those authoritative facts
+/// when it consumes the enclosing pointer event.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum NativeTestScrollDelta {
+    /// Platform-defined line units.
+    Lines {
+        /// Horizontal content movement.
+        x: f32,
+        /// Vertical content movement.
+        y: f32,
+    },
+    /// Native physical pixels.
+    PhysicalPixels {
+        /// Horizontal content movement.
+        x: f64,
+        /// Vertical content movement.
+        y: f64,
+    },
+}
+
+impl NativeTestScrollDelta {
+    /// Creates a line-unit scroll delta.
+    #[must_use]
+    pub const fn lines(x: f32, y: f32) -> Self {
+        Self::Lines { x, y }
+    }
+
+    /// Creates a physical-pixel scroll delta.
+    #[must_use]
+    pub const fn physical_pixels(x: f64, y: f64) -> Self {
+        Self::PhysicalPixels { x, y }
+    }
+}
+
 /// A high-level pointer action accepted by the native test driver.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum NativeTestPointerAction {
     /// Move the synthetic pointer without changing its primary-button state.
     Move,
@@ -13,6 +50,8 @@ pub enum NativeTestPointerAction {
     PrimaryPressed,
     /// Release the synthetic primary pointer button.
     PrimaryReleased,
+    /// Deliver one independent wheel sample without inventing a smooth-scroll sequence.
+    Scroll(NativeTestScrollDelta),
 }
 
 /// The destination of one deterministic native pointer edge.
