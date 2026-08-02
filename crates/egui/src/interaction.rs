@@ -88,6 +88,9 @@ pub enum PointerReceiverUnavailableReason {
 
     /// The pointer position was non-finite.
     InvalidPosition,
+
+    /// A scroll delta contained a non-finite component.
+    InvalidScrollDelta,
 }
 
 /// Whether a receiver fact is authoritative for this egui pass.

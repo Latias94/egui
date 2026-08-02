@@ -1,6 +1,9 @@
 use ahash::HashMap;
 
-use crate::{Align, Id, IdMap, LayerId, Rangef, Rect, Vec2, WidgetRects, id::IdSet, style};
+use crate::{
+    Align, Id, IdMap, LayerId, Rangef, Rect, Vec2, WidgetRects, id::IdSet,
+    scroll_receiver::ScrollReceiverRoster, style,
+};
 
 #[cfg(debug_assertions)]
 use crate::{Align2, Color32, FontId, NumExt as _, Painter, pos2};
@@ -192,6 +195,9 @@ pub struct PassState {
     /// All widgets produced this pass.
     pub widgets: WidgetRects,
 
+    /// Scroll receivers reserved and finalized during this pass.
+    pub(crate) scroll_receivers: ScrollReceiverRoster,
+
     /// Per-layer state.
     ///
     /// Not all layers registers themselves there though.
@@ -237,6 +243,7 @@ impl Default for PassState {
         Self {
             used_ids: Default::default(),
             widgets: Default::default(),
+            scroll_receivers: Default::default(),
             layers: Default::default(),
             tooltips: Default::default(),
             root_ui_available_rect: None,
@@ -258,6 +265,7 @@ impl PassState {
         let Self {
             used_ids,
             widgets,
+            scroll_receivers,
             tooltips,
             layers,
             root_ui_available_rect,
@@ -273,6 +281,7 @@ impl PassState {
 
         used_ids.clear();
         widgets.clear();
+        scroll_receivers.clear();
         tooltips.clear();
         layers.clear();
         *root_ui_available_rect = None;

@@ -704,6 +704,9 @@ struct Prepared {
     /// The response from dragging the background (if enabled)
     background_drag_response: Option<Response>,
 
+    /// Slot reserved before nested scroll receivers are registered.
+    wheel_receiver_reservation: Option<crate::ScrollReceiverReservation>,
+
     animated: bool,
 }
 
@@ -732,6 +735,9 @@ impl ScrollArea {
 
         let id_salt = id_salt.unwrap_or_else(|| IdSalt::new("scroll_area"));
         let id = ui.make_persistent_id(id_salt);
+        let wheel_receiver_reservation = scroll_source
+            .mouse_wheel
+            .then(|| ui.reserve_scroll_receiver(id.with("wheel")));
         ctx.check_for_id_clash(
             id,
             Rect::from_min_size(ui.available_rect_before_wrap().min, Vec2::ZERO),
@@ -950,6 +956,7 @@ impl ScrollArea {
             stick_to_end,
             saved_scroll_target,
             background_drag_response,
+            wheel_receiver_reservation,
             animated,
         }
     }
@@ -1077,6 +1084,7 @@ impl Prepared {
             stick_to_end,
             saved_scroll_target,
             background_drag_response,
+            wheel_receiver_reservation,
             animated,
         } = self;
 
@@ -1527,6 +1535,39 @@ impl Prepared {
         let available_offset = content_size - inner_rect.size();
         state.offset = state.offset.min(available_offset);
         state.offset = state.offset.max(Vec2::ZERO);
+
+        if let Some(reservation) = wheel_receiver_reservation {
+            let projection = if ui.style().always_scroll_the_only_direction
+                && direction_enabled[0] != direction_enabled[1]
+            {
+                if direction_enabled[0] {
+                    crate::ScrollProjection::SumToHorizontal
+                } else {
+                    crate::ScrollProjection::SumToVertical
+                }
+            } else {
+                crate::ScrollProjection::Independent
+            };
+            let maximum_offset = available_offset.max(Vec2::ZERO);
+            let config = crate::ScrollReceiverConfig::new(
+                projection,
+                wheel_scroll_multiplier,
+                crate::ScrollAxisCapabilities::new(
+                    direction_enabled[0] && state.offset[0] < maximum_offset[0],
+                    direction_enabled[0] && state.offset[0] > 0.0,
+                ),
+                crate::ScrollAxisCapabilities::new(
+                    direction_enabled[1] && state.offset[1] < maximum_offset[1],
+                    direction_enabled[1] && state.offset[1] > 0.0,
+                ),
+            );
+            if let Err(error) = ui.finalize_scroll_receiver(reservation, outer_rect, config) {
+                debug_assert!(
+                    false,
+                    "failed to finalize ScrollArea wheel receiver: {error}"
+                );
+            }
+        }
 
         let suppress_stuck_recompute = Vec2b::new(
             had_explicit_scroll_adjustment[0] && state.offset_target[0].is_some(),

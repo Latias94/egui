@@ -1367,6 +1367,71 @@ impl HostedViewportCycle {
         Some(receipt)
     }
 
+    /// Affinely claims the egui wheel derivative of one exact native scroll edge.
+    ///
+    /// A successful claim removes that derivative before the viewport begins its egui pass,
+    /// preventing a native protocol consumer and egui's `WheelState` from consuming the same
+    /// physical sample. Unknown, ambiguous, foreign, and mismatched correlations fail closed.
+    pub fn claim_native_scroll_derivative(
+        &self,
+        binding: crate::NativeViewportBinding,
+        pointer_sequence: crate::NativePointerSequence,
+    ) -> bool {
+        let Some(ingress) = self.native_ingress.as_deref() else {
+            return false;
+        };
+        let mut records = ingress.ordered().records().iter().filter(|record| {
+            matches!(
+                record.event(),
+                crate::NativeIngressEvent::PointerEdge(edge)
+                    if edge.sequence() == pointer_sequence
+                        && matches!(edge.kind(), crate::NativePointerEdgeKind::Scrolled(_))
+            )
+        });
+        let Some(record) = records.next() else {
+            return false;
+        };
+        if records.next().is_some() || !native_ingress_record_matches_binding(record, binding) {
+            return false;
+        }
+        let Some(backend_sequence) = record.backend_event_sequence() else {
+            return false;
+        };
+        let Some(input) = self.inputs.get(&binding.viewport_id()) else {
+            return false;
+        };
+        let mut derivatives = input.events.iter().enumerate().filter(|(_, envelope)| {
+            envelope.correlation().sequence() == Some(backend_sequence)
+                && matches!(envelope.event(), egui::Event::MouseWheel { .. })
+        });
+        let Some((raw_event_index, _)) = derivatives.next() else {
+            return false;
+        };
+        if derivatives.next().is_some() {
+            return false;
+        }
+        self.claimed_native_event_envelopes
+            .lock()
+            .insert((binding.viewport_id(), raw_event_index))
+    }
+
+    fn take_viewport_input(&mut self, viewport_id: ViewportId) -> Option<RawInput> {
+        let mut input = self.inputs.remove(&viewport_id)?;
+        let claimed = self.claimed_native_event_envelopes.lock();
+        if claimed.iter().any(|(viewport, _)| *viewport == viewport_id) {
+            input.events = input
+                .events
+                .into_iter()
+                .enumerate()
+                .filter_map(|(index, envelope)| {
+                    (!claimed.contains(&(viewport_id, index))).then_some(envelope)
+                })
+                .collect();
+        }
+        drop(claimed);
+        Some(input)
+    }
+
     /// Returns the cycle-scoped sink for exact native window operations.
     ///
     /// A native backend closes this sink after the output transaction seals.
@@ -1503,7 +1568,7 @@ impl HostedViewportCycle {
         let mut outputs = Vec::with_capacity(callback_order.len());
         for viewport_id in callback_order {
             let native_authority = self.native_output_authority(viewport_id);
-            let Some(raw_input) = self.inputs.remove(&viewport_id) else {
+            let Some(raw_input) = self.take_viewport_input(viewport_id) else {
                 let violations = guard.finish();
                 return Err(self.into_abort(
                     HostedViewportCycleError::MissingCallback { viewport_id },
@@ -1673,7 +1738,7 @@ impl HostedViewportCycle {
         let mut outputs = Vec::with_capacity(callback_order.len());
         for viewport_id in callback_order {
             let native_authority = self.native_output_authority(viewport_id);
-            let Some(raw_input) = self.inputs.remove(&viewport_id) else {
+            let Some(raw_input) = self.take_viewport_input(viewport_id) else {
                 return Err(self.abort_driven_cycle(
                     driver,
                     guard,

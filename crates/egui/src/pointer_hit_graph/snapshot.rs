@@ -5,8 +5,9 @@ use emath::TSTransform;
 
 use crate::hit_test::WidgetHits;
 use crate::{
-    Id, LayerId, PointerHit, PointerReceiverAuthority, PointerReceiverUnavailableReason, Pos2,
-    ViewportId, WidgetReceiver, WidgetRects, memory::Areas,
+    Id, InputOptions, LayerId, Modifiers, PointerHit, PointerReceiverAuthority,
+    PointerReceiverUnavailableReason, Pos2, ScrollDeltaNormalization, ScrollProbe, ScrollReceiver,
+    ViewportId, WidgetReceiver, WidgetRects, memory::Areas, scroll_receiver::ScrollReceiverRoster,
 };
 
 /// An immutable, completed-pass pointer hit graph.
@@ -30,6 +31,8 @@ struct PointerHitGraphSnapshotData {
     top_modal_layer: Option<LayerId>,
     interact_radius: f32,
     focused_receiver: Option<WidgetReceiver>,
+    scroll_receivers: Vec<ScrollReceiver>,
+    input_options: InputOptions,
 }
 
 impl PointerHitGraphSnapshot {
@@ -44,6 +47,8 @@ impl PointerHitGraphSnapshot {
         top_modal_layer: Option<LayerId>,
         interact_radius: f32,
         focused_id: Option<Id>,
+        scroll_receivers: &ScrollReceiverRoster,
+        input_options: InputOptions,
     ) -> Self {
         let mut interaction_layers: Vec<_> = widgets.layer_ids().collect();
         interaction_layers.sort_by(|&a, &b| areas.compare_order(a, b));
@@ -70,6 +75,8 @@ impl PointerHitGraphSnapshot {
                     .and_then(|id| widgets.get(id))
                     .copied()
                     .map(WidgetReceiver::from),
+                scroll_receivers: scroll_receivers.ready().collect(),
+                input_options,
             }),
         }
     }
@@ -139,6 +146,83 @@ impl PointerHitGraphSnapshot {
         }
     }
 
+    /// Probe the frozen scroll roster with one exact wheel sample.
+    ///
+    /// Modifier-axis normalization and receiver projection happen here so native
+    /// adapters cannot choose a receiver using a different event interpretation.
+    pub fn probe_scroll(
+        &self,
+        position: Pos2,
+        delta: crate::Vec2,
+        modifiers: Modifiers,
+    ) -> PointerReceiverAuthority<ScrollProbe> {
+        if !position.x.is_finite() || !position.y.is_finite() {
+            return PointerReceiverAuthority::Unknown(
+                PointerReceiverUnavailableReason::InvalidPosition,
+            );
+        }
+        let normalized_delta = match self.normalize_scroll_delta(delta, modifiers) {
+            PointerReceiverAuthority::Known(ScrollDeltaNormalization::Scroll(delta)) => delta,
+            PointerReceiverAuthority::Known(ScrollDeltaNormalization::AwaitingDelta) => {
+                return PointerReceiverAuthority::Known(ScrollProbe::AwaitingDelta);
+            }
+            PointerReceiverAuthority::Known(ScrollDeltaNormalization::FrameworkOwned) => {
+                return PointerReceiverAuthority::Known(ScrollProbe::FrameworkOwned);
+            }
+            PointerReceiverAuthority::Unknown(reason) => {
+                return PointerReceiverAuthority::Unknown(reason);
+            }
+        };
+
+        let blocking_layer = self.blocking_layer_at(position);
+        let mut lower_receiver = false;
+        for receiver in self.data.scroll_receivers.iter().rev() {
+            if !receiver.enabled() || !self.receiver_contains(*receiver, position) {
+                continue;
+            }
+            if blocking_layer.is_some_and(|layer| receiver.layer_id() != layer) {
+                lower_receiver = true;
+                continue;
+            }
+            if receiver.config().accepts(normalized_delta) {
+                return PointerReceiverAuthority::Known(ScrollProbe::Receiver {
+                    receiver: *receiver,
+                    normalized_delta,
+                });
+            }
+        }
+        PointerReceiverAuthority::Known(if lower_receiver {
+            ScrollProbe::Blocked
+        } else {
+            ScrollProbe::NoReceiver
+        })
+    }
+
+    /// Normalize one wheel sample using the input options frozen with this pass.
+    pub fn normalize_scroll_delta(
+        &self,
+        delta: crate::Vec2,
+        modifiers: Modifiers,
+    ) -> PointerReceiverAuthority<ScrollDeltaNormalization> {
+        if !delta.x.is_finite() || !delta.y.is_finite() {
+            return PointerReceiverAuthority::Unknown(
+                PointerReceiverUnavailableReason::InvalidScrollDelta,
+            );
+        }
+        let Some(delta) = crate::scroll_receiver::normalize_scroll_delta(
+            delta,
+            modifiers,
+            self.data.input_options,
+        ) else {
+            return PointerReceiverAuthority::Known(ScrollDeltaNormalization::FrameworkOwned);
+        };
+        PointerReceiverAuthority::Known(if delta == crate::Vec2::ZERO {
+            ScrollDeltaNormalization::AwaitingDelta
+        } else {
+            ScrollDeltaNormalization::Scroll(delta)
+        })
+    }
+
     pub(crate) fn probe_state(
         &self,
         position: Pos2,
@@ -192,6 +276,16 @@ impl PointerHitGraphSnapshot {
         } else {
             Some(layer)
         }
+    }
+
+    fn receiver_contains(&self, receiver: ScrollReceiver, position: Pos2) -> bool {
+        let local = self
+            .data
+            .layer_to_global
+            .get(&receiver.layer_id())
+            .copied()
+            .map_or(position, |transform| transform.inverse() * position);
+        receiver.interact_rect().contains(local)
     }
 }
 

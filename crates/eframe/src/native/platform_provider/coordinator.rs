@@ -2219,6 +2219,74 @@ mod tests {
     }
 
     #[test]
+    fn dock_owned_scroll_derivative_is_removed_before_the_egui_pass() {
+        let mut coordinator = NativePlatformCoordinator::default();
+        let binding = coordinator
+            .register_viewport(egui::ViewportId::ROOT)
+            .unwrap();
+        let backend_sequence = egui::BackendEventSequence::new(64);
+        let scroll = NativeScrollEdge::new(
+            NativePointerDeviceId::new(9),
+            None,
+            NativeScrollPhase::Discrete,
+            Some(NativeScrollDelta::Lines(
+                NativeFiniteScrollVector::new(0.0, 1.0).unwrap(),
+            )),
+            NativeAuthority::unknown(NativeUnavailableReason::NotObserved),
+            NativeAuthority::unknown(NativeUnavailableReason::NotObserved),
+        )
+        .unwrap();
+        let pointer_sequence = coordinator
+            .record_pointer_edge_for_backend(
+                backend_sequence,
+                NativePointerEdgeFacts::new(
+                    NativePointerSource::Viewport(binding),
+                    native_delivery(binding),
+                    pointer(9, 1),
+                    NativePointerEdgeKind::Scrolled(scroll),
+                    unknown_point(),
+                    unknown_hover(),
+                    unknown_capture(),
+                ),
+            )
+            .unwrap();
+        let mut derivation = egui::BackendEventDerivation::known(backend_sequence);
+        let raw_input = egui::RawInput {
+            viewport_id: egui::ViewportId::ROOT,
+            events: vec![derivation.envelope(egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Line,
+                delta: egui::vec2(0.0, 1.0),
+                phase: egui::TouchPhase::Move,
+                modifiers: egui::Modifiers::NONE,
+            })],
+            ..Default::default()
+        };
+        let ingress = freeze_single_binding(&mut coordinator, binding);
+        let cycle = crate::HostedViewportCycle::with_native_ingress([raw_input], ingress)
+            .expect("the wheel derivative and native journal form one exact cycle");
+
+        assert!(cycle.claim_native_scroll_derivative(binding, pointer_sequence));
+        assert!(
+            !cycle.claim_native_scroll_derivative(binding, pointer_sequence),
+            "the exact wheel derivative is affine"
+        );
+        cycle
+            .run(
+                [egui::ViewportId::ROOT],
+                |_| Ok(()),
+                |input| {
+                    assert!(
+                        input.raw_input().events.is_empty(),
+                        "a core-owned wheel derivative must not reach egui WheelState"
+                    );
+                    Ok(())
+                },
+                |_| Ok(()),
+            )
+            .expect("the filtered hosted cycle remains complete");
+    }
+
+    #[test]
     fn viewport_create_result_waits_for_native_binding_materialization() {
         let mut coordinator = NativePlatformCoordinator::default();
         let parent = coordinator

@@ -902,6 +902,38 @@ impl Ui {
 
 /// # Interaction
 impl Ui {
+    /// Reserves the receiver order used by the completed-pass scroll hit graph.
+    ///
+    /// Containers should reserve before rendering nested contents, then call
+    /// [`Self::finalize_scroll_receiver`] after their final geometry is known.
+    pub fn reserve_scroll_receiver(&self, id: Id) -> crate::ScrollReceiverReservation {
+        let viewport_id = self.ctx().viewport_id();
+        let pass_nr = self.ctx().cumulative_pass_nr();
+        let layer_id = self.layer_id();
+        self.ctx().pass_state_mut(|state| {
+            state
+                .scroll_receivers
+                .reserve(viewport_id, pass_nr, layer_id, id)
+        })
+    }
+
+    /// Finalizes one scroll receiver with geometry and capability from this exact pass.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the reservation escaped its pass/layer, geometry is invalid,
+    /// or the reservation was already consumed or conflicted.
+    pub fn finalize_scroll_receiver(
+        &self,
+        reservation: crate::ScrollReceiverReservation,
+        rect: Rect,
+        config: crate::ScrollReceiverConfig,
+    ) -> Result<crate::ScrollReceiver, crate::ScrollReceiverFinalizeError> {
+        let receiver = crate::scroll_receiver::receiver_from_ui(self, &reservation, rect, config)?;
+        self.ctx()
+            .pass_state_mut(|state| state.scroll_receivers.finalize(reservation, receiver))
+    }
+
     /// Check for clicks, drags and/or hover on a specific region of this [`Ui`].
     pub fn interact(&self, rect: Rect, id: Id, sense: Sense) -> Response {
         self.interact_opt(rect, id, sense, Default::default())

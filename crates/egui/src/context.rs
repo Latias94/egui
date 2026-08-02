@@ -2825,6 +2825,8 @@ impl ContextImpl {
                 self.memory.top_modal_layer(),
                 self.memory.options.style().interaction.interact_radius,
                 self.memory.focused(),
+                &viewport.prev_pass.scroll_receivers,
+                self.memory.options.input_options,
             ),
         ));
 

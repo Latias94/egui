@@ -415,6 +415,7 @@ pub(crate) mod placer;
 pub mod plugin;
 mod pointer_hit_graph;
 pub mod response;
+mod scroll_receiver;
 mod sense;
 pub mod style;
 pub mod text_selection;
@@ -493,6 +494,11 @@ pub use self::{
     plugin::Plugin,
     pointer_hit_graph::{PointerHitGraphCandidate, PointerHitGraphSnapshot},
     response::{InnerResponse, Response},
+    scroll_receiver::{
+        ScrollAxisCapabilities, ScrollDeltaNormalization, ScrollProbe, ScrollProjection,
+        ScrollReceiver, ScrollReceiverConfig, ScrollReceiverFinalizeError,
+        ScrollReceiverReservation,
+    },
     sense::Sense,
     style::{FontSelection, Spacing, Style, TextStyle, Visuals},
     text::{Galley, TextFormat},
