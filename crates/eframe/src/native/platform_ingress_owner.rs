@@ -53,6 +53,11 @@ struct WinitScrollSequenceState {
     source: NativePointerSource,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct WinitRetiredScrollTail {
+    token: NativeScrollSequenceToken,
+}
+
 #[derive(Debug)]
 struct RetiredPointerIngress {
     binding: NativeViewportBinding,
@@ -292,6 +297,7 @@ pub(super) struct NativePlatformIngressOwner {
     pointer_devices: HashMap<winit::event::DeviceId, NativePointerDeviceId>,
     pointer_states: HashMap<WinitPointerKey, WinitPointerState>,
     scroll_sequences: HashMap<WinitPointerKey, WinitScrollSequenceState>,
+    retired_scroll_tails: HashMap<WinitPointerKey, WinitRetiredScrollTail>,
     #[cfg(feature = "native-test-support")]
     test_pointer_state: Option<NativeTestPointerState>,
     dispatched_effects:
@@ -314,6 +320,7 @@ impl Default for NativePlatformIngressOwner {
             pointer_devices: Default::default(),
             pointer_states: Default::default(),
             scroll_sequences: Default::default(),
+            retired_scroll_tails: Default::default(),
             #[cfg(feature = "native-test-support")]
             test_pointer_state: None,
             dispatched_effects: Default::default(),
@@ -1059,6 +1066,31 @@ impl NativePlatformIngressOwner {
             let Some(state) = self.pointer_states.remove(&key) else {
                 continue;
             };
+            let scroll = self
+                .scroll_sequences
+                .remove(&key)
+                .map(|sequence| (sequence.source, sequence.token))
+                .or_else(|| {
+                    self.retired_scroll_tails
+                        .remove(&key)
+                        .map(|tail| (state.source, tail.token))
+                });
+            if let Some((source, token)) = scroll {
+                let scroll = NativeScrollEdge::new(
+                    state.identity.device_id(),
+                    Some(token),
+                    NativeScrollPhase::Cancel(NativeScrollCancelReason::DeviceRemoved),
+                    None,
+                    NativeAuthority::unknown(NativeUnavailableReason::Retired),
+                    NativeAuthority::unknown(NativeUnavailableReason::Retired),
+                )
+                .expect("device retirement has a legal provider scroll terminal shape");
+                self.coordinator.lock().record_synthetic_scroll_cancel(
+                    source,
+                    state.identity,
+                    scroll,
+                )?;
+            }
             self.coordinator.lock().record_pointer_edge_for_backend(
                 backend_event_sequence,
                 NativePointerEdgeFacts::new(
@@ -1073,6 +1105,8 @@ impl NativePlatformIngressOwner {
             )?;
         }
         self.scroll_sequences
+            .retain(|key, _| key.device_id != device_id);
+        self.retired_scroll_tails
             .retain(|key, _| key.device_id != device_id);
         self.pointer_devices.remove(&device_id);
         Ok(())
@@ -1152,7 +1186,9 @@ impl NativePlatformIngressOwner {
         let delta = native_scroll_delta(delta)?;
         let (source, sequence, phase) = match phase {
             winit::event::TouchPhase::Started => {
-                if self.scroll_sequences.contains_key(&key) {
+                if self.scroll_sequences.contains_key(&key)
+                    || self.retired_scroll_tails.contains_key(&key)
+                {
                     return Err(NativePlatformIngressError::ScrollSequenceOutOfOrder(phase));
                 }
                 self.next_scroll_sequence = self
@@ -1169,37 +1205,48 @@ impl NativePlatformIngressOwner {
                 );
                 (source, Some(sequence), NativeScrollPhase::Begin)
             }
-            winit::event::TouchPhase::Moved => self.scroll_sequences.get(&key).copied().map_or(
-                (source, None, NativeScrollPhase::Discrete),
-                |sequence| {
+            winit::event::TouchPhase::Moved => {
+                if let Some(sequence) = self.scroll_sequences.get(&key).copied() {
                     (
                         sequence.source,
                         Some(sequence.token),
                         NativeScrollPhase::Update,
                     )
-                },
-            ),
+                } else if let Some(tail) = self.retired_scroll_tails.get(&key).copied() {
+                    (source, Some(tail.token), NativeScrollPhase::Update)
+                } else {
+                    (source, None, NativeScrollPhase::Discrete)
+                }
+            }
             winit::event::TouchPhase::Ended => {
-                let sequence = self
-                    .scroll_sequences
-                    .remove(&key)
-                    .ok_or(NativePlatformIngressError::ScrollSequenceOutOfOrder(phase))?;
-                (
-                    sequence.source,
-                    Some(sequence.token),
-                    NativeScrollPhase::End,
-                )
+                if let Some(sequence) = self.scroll_sequences.remove(&key) {
+                    (
+                        sequence.source,
+                        Some(sequence.token),
+                        NativeScrollPhase::End,
+                    )
+                } else if let Some(tail) = self.retired_scroll_tails.remove(&key) {
+                    (source, Some(tail.token), NativeScrollPhase::End)
+                } else {
+                    return Err(NativePlatformIngressError::ScrollSequenceOutOfOrder(phase));
+                }
             }
             winit::event::TouchPhase::Cancelled => {
-                let sequence = self
-                    .scroll_sequences
-                    .remove(&key)
-                    .ok_or(NativePlatformIngressError::ScrollSequenceOutOfOrder(phase))?;
-                (
-                    sequence.source,
-                    Some(sequence.token),
-                    NativeScrollPhase::Cancel(NativeScrollCancelReason::PlatformCancelled),
-                )
+                if let Some(sequence) = self.scroll_sequences.remove(&key) {
+                    (
+                        sequence.source,
+                        Some(sequence.token),
+                        NativeScrollPhase::Cancel(NativeScrollCancelReason::PlatformCancelled),
+                    )
+                } else if let Some(tail) = self.retired_scroll_tails.remove(&key) {
+                    (
+                        source,
+                        Some(tail.token),
+                        NativeScrollPhase::Cancel(NativeScrollCancelReason::PlatformCancelled),
+                    )
+                } else {
+                    return Err(NativePlatformIngressError::ScrollSequenceOutOfOrder(phase));
+                }
             }
         };
         let delta = (!matches!(phase, NativeScrollPhase::Cancel(_))).then_some(delta);
@@ -1560,28 +1607,49 @@ impl NativePlatformIngressOwner {
                 .copied()
                 .filter(|scroll| scroll.source == source)
             {
+                if self.retired_scroll_tails.contains_key(key) {
+                    return Err(NativePlatformIngressError::IncompleteRoster);
+                }
                 let scroll = NativeScrollEdge::new(
                     state.identity.device_id(),
                     Some(scroll.token),
-                    NativeScrollPhase::Cancel(NativeScrollCancelReason::DeviceRemoved),
+                    NativeScrollPhase::Cancel(NativeScrollCancelReason::BindingRetired),
                     None,
                     NativeAuthority::unknown(NativeUnavailableReason::Retired),
                     NativeAuthority::unknown(NativeUnavailableReason::Retired),
                 )
                 .expect("a provider-owned scroll cancellation has a legal terminal shape");
-                self.coordinator.lock().record_terminal_pointer_edge(
+                self.coordinator.lock().record_synthetic_scroll_cancel(
                     source,
                     state.identity,
-                    NativePointerEdgeKind::Scrolled(scroll),
+                    scroll,
                 )?;
-                self.scroll_sequences.remove(key);
+                let retired = self
+                    .scroll_sequences
+                    .remove(key)
+                    .expect("the frozen scroll sequence remains active until cancellation records");
+                self.retired_scroll_tails.insert(
+                    *key,
+                    WinitRetiredScrollTail {
+                        token: retired.token,
+                    },
+                );
             }
             if state.source == source {
-                if let Some(scroll) = self.scroll_sequences.get(key).copied() {
+                let retained_source = self
+                    .scroll_sequences
+                    .get(key)
+                    .map(|scroll| scroll.source)
+                    .or_else(|| {
+                        self.retired_scroll_tails
+                            .contains_key(key)
+                            .then_some(NativePointerSource::None)
+                    });
+                if let Some(retained_source) = retained_source {
                     self.pointer_states.insert(
                         *key,
                         WinitPointerState {
-                            source: scroll.source,
+                            source: retained_source,
                             ..state
                         },
                     );
@@ -1623,6 +1691,11 @@ impl NativePlatformIngressOwner {
                 .all(|state| state.source != source)
             && self
                 .scroll_sequences
+                .keys()
+                .all(|key| self.pointer_states.contains_key(key));
+        let pointer_routes_clear = pointer_routes_clear
+            && self
+                .retired_scroll_tails
                 .keys()
                 .all(|key| self.pointer_states.contains_key(key));
         #[cfg(feature = "native-test-support")]
@@ -2436,14 +2509,14 @@ mod tests {
                 matches!(
                     record.event(),
                     crate::NativeIngressEvent::PointerEdge(edge)
-                        if edge.ends_stream()
+                        if !edge.ends_stream()
                             && matches!(
                                 edge.kind(),
                                 NativePointerEdgeKind::Scrolled(scroll)
                                     if scroll.sequence() == Some(NativeScrollSequenceToken::new(11))
                                         && scroll.phase()
                                             == NativeScrollPhase::Cancel(
-                                                NativeScrollCancelReason::DeviceRemoved,
+                                                NativeScrollCancelReason::BindingRetired,
                                             )
                             )
                 )
@@ -2472,8 +2545,22 @@ mod tests {
         assert!(cancel < retirement);
         assert!(retirement < binding_quiesced);
 
-        assert!(!owner.pointer_states.contains_key(&retired_key));
+        assert_eq!(
+            owner
+                .pointer_states
+                .get(&retired_key)
+                .map(|state| state.source),
+            Some(NativePointerSource::None),
+            "the provider tail keeps identity without retaining the binding route",
+        );
         assert!(!owner.scroll_sequences.contains_key(&retired_key));
+        assert_eq!(
+            owner
+                .retired_scroll_tails
+                .get(&retired_key)
+                .map(|tail| tail.token),
+            Some(NativeScrollSequenceToken::new(11)),
+        );
         assert!(owner.pointer_states.contains_key(&unrelated_key));
         assert!(owner.scroll_sequences.contains_key(&unrelated_key));
         owner
@@ -2483,6 +2570,7 @@ mod tests {
                 egui::BackendEventSequence::new(1),
             )
             .expect("device removal must not replay a retired viewport binding");
+        assert!(!owner.retired_scroll_tails.contains_key(&retired_key));
     }
 
     #[test]
@@ -2529,7 +2617,7 @@ mod tests {
                                     if scroll.sequence() == Some(NativeScrollSequenceToken::new(11))
                                         && scroll.phase()
                                             == NativeScrollPhase::Cancel(
-                                                NativeScrollCancelReason::DeviceRemoved,
+                                                NativeScrollCancelReason::BindingRetired,
                                             )
                             )
                 )
@@ -2549,10 +2637,211 @@ mod tests {
         assert!(cancel < quiesced);
         assert!(!owner.scroll_sequences.contains_key(&key));
         assert_eq!(
+            owner.retired_scroll_tails.get(&key).map(|tail| tail.token),
+            Some(NativeScrollSequenceToken::new(11)),
+        );
+        assert_eq!(
             owner.pointer_states.get(&key).map(|state| state.source),
             Some(NativePointerSource::Foreign),
             "the current non-retired pointer route remains live",
         );
+
+        let (late_source, late_end) = owner
+            .native_scroll_edge(
+                key,
+                NativePointerSource::Foreign,
+                identity.device_id(),
+                winit::event::MouseScrollDelta::LineDelta(0.0, 0.0),
+                winit::event::TouchPhase::Ended,
+                None,
+            )
+            .expect("the binding-neutral tail accepts the provider terminal");
+        assert_eq!(late_source, NativePointerSource::Foreign);
+        assert_eq!(
+            late_end.sequence(),
+            Some(NativeScrollSequenceToken::new(11))
+        );
+        assert_eq!(late_end.phase(), NativeScrollPhase::End);
+        assert!(!owner.retired_scroll_tails.contains_key(&key));
+    }
+
+    #[test]
+    fn retired_scroll_tail_rejects_a_successor_until_late_cancel_arrives() {
+        let mut owner = NativePlatformIngressOwner::default();
+        let viewport_id = viewport("retired-scroll-tail");
+        let initial = facts(window_id(), viewport_id, false);
+        let binding = owner
+            .freeze_facts(std::slice::from_ref(&initial))
+            .unwrap()
+            .platform()
+            .inventory()[0];
+        let key = mouse_pointer_key();
+        let identity =
+            NativePointerIdentity::new(NativePointerDeviceId::new(9), NativePointerId::new(1));
+        owner.pointer_states.insert(
+            key,
+            WinitPointerState {
+                identity,
+                source: NativePointerSource::Viewport(binding),
+                position: NativeAuthority::unknown(NativeUnavailableReason::NotObserved),
+            },
+        );
+        let (_, begin) = owner
+            .native_scroll_edge(
+                key,
+                NativePointerSource::Viewport(binding),
+                identity.device_id(),
+                winit::event::MouseScrollDelta::LineDelta(0.0, 1.0),
+                winit::event::TouchPhase::Started,
+                None,
+            )
+            .unwrap();
+        let retired_token = begin.sequence().expect("phaseful scroll has a token");
+
+        let ingress = owner.freeze_facts(&[]).unwrap();
+        let cancel = ingress
+            .ordered()
+            .records()
+            .iter()
+            .find_map(|record| match record.event() {
+                crate::NativeIngressEvent::PointerEdge(edge) => match edge.kind() {
+                    NativePointerEdgeKind::Scrolled(scroll)
+                        if scroll.phase()
+                            == NativeScrollPhase::Cancel(
+                                NativeScrollCancelReason::BindingRetired,
+                            ) =>
+                    {
+                        Some(edge)
+                    }
+                    _ => None,
+                },
+                _ => None,
+            })
+            .expect("binding retirement emits a semantic scroll cancellation");
+        assert!(!cancel.ends_stream());
+
+        let successor_error = owner
+            .native_scroll_edge(
+                key,
+                NativePointerSource::Foreign,
+                identity.device_id(),
+                winit::event::MouseScrollDelta::LineDelta(0.0, 1.0),
+                winit::event::TouchPhase::Started,
+                None,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            successor_error,
+            NativePlatformIngressError::ScrollSequenceOutOfOrder(winit::event::TouchPhase::Started)
+        ));
+
+        let (late_move_source, late_move) = owner
+            .native_scroll_edge(
+                key,
+                NativePointerSource::Foreign,
+                identity.device_id(),
+                winit::event::MouseScrollDelta::LineDelta(0.0, 2.0),
+                winit::event::TouchPhase::Moved,
+                None,
+            )
+            .expect("a late update remains attached to the retired provider token");
+        assert_eq!(late_move_source, NativePointerSource::Foreign);
+        assert_eq!(late_move.sequence(), Some(retired_token));
+        assert_eq!(late_move.phase(), NativeScrollPhase::Update);
+        assert!(owner.retired_scroll_tails.contains_key(&key));
+
+        let (late_cancel_source, late_cancel) = owner
+            .native_scroll_edge(
+                key,
+                NativePointerSource::Foreign,
+                identity.device_id(),
+                winit::event::MouseScrollDelta::LineDelta(0.0, 0.0),
+                winit::event::TouchPhase::Cancelled,
+                None,
+            )
+            .expect("the provider terminal consumes the retired tail");
+        assert_eq!(late_cancel_source, NativePointerSource::Foreign);
+        assert_eq!(late_cancel.sequence(), Some(retired_token));
+        assert_eq!(
+            late_cancel.phase(),
+            NativeScrollPhase::Cancel(NativeScrollCancelReason::PlatformCancelled)
+        );
+        assert!(!owner.retired_scroll_tails.contains_key(&key));
+
+        let (_, successor) = owner
+            .native_scroll_edge(
+                key,
+                NativePointerSource::Foreign,
+                identity.device_id(),
+                winit::event::MouseScrollDelta::LineDelta(0.0, 1.0),
+                winit::event::TouchPhase::Started,
+                None,
+            )
+            .expect("a successor may begin only after the retired tail terminates");
+        assert_ne!(successor.sequence(), Some(retired_token));
+        assert_eq!(successor.phase(), NativeScrollPhase::Begin);
+    }
+
+    #[test]
+    fn device_removal_terminalizes_a_binding_neutral_scroll_tail() {
+        let mut owner = NativePlatformIngressOwner::default();
+        let key = mouse_pointer_key();
+        let identity =
+            NativePointerIdentity::new(NativePointerDeviceId::new(9), NativePointerId::new(1));
+        let token = NativeScrollSequenceToken::new(11);
+        owner.pointer_states.insert(
+            key,
+            WinitPointerState {
+                identity,
+                source: NativePointerSource::None,
+                position: NativeAuthority::unknown(NativeUnavailableReason::Retired),
+            },
+        );
+        owner
+            .retired_scroll_tails
+            .insert(key, WinitRetiredScrollTail { token });
+
+        owner
+            .record_device_event(
+                key.device_id,
+                &winit::event::DeviceEvent::Removed,
+                egui::BackendEventSequence::new(1),
+            )
+            .unwrap();
+        let ingress = owner.freeze_facts(&[]).unwrap();
+        let records = ingress.ordered().records();
+        let scroll_terminal = records
+            .iter()
+            .position(|record| {
+                matches!(
+                    record.event(),
+                    crate::NativeIngressEvent::PointerEdge(edge)
+                        if matches!(
+                            edge.kind(),
+                            NativePointerEdgeKind::Scrolled(scroll)
+                                if scroll.sequence() == Some(token)
+                                    && scroll.phase()
+                                        == NativeScrollPhase::Cancel(
+                                            NativeScrollCancelReason::DeviceRemoved,
+                                        )
+                        )
+                )
+            })
+            .expect("device removal emits the provider scroll terminal");
+        let pointer_terminal = records
+            .iter()
+            .position(|record| {
+                matches!(
+                    record.event(),
+                    crate::NativeIngressEvent::PointerEdge(edge)
+                        if matches!(edge.kind(), NativePointerEdgeKind::Cancelled)
+                )
+            })
+            .expect("device removal still emits the physical pointer cancellation");
+
+        assert!(scroll_terminal < pointer_terminal);
+        assert!(!owner.pointer_states.contains_key(&key));
+        assert!(!owner.retired_scroll_tails.contains_key(&key));
     }
 
     #[test]

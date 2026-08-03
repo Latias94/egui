@@ -77,6 +77,11 @@ pub enum NativeScrollCancelReason {
     PlatformCancelled,
     /// The physical device retired.
     DeviceRemoved,
+    /// The viewport binding that owned the scroll receiver retired.
+    ///
+    /// This terminates the semantic owner without claiming that the physical
+    /// pointer stream or the provider sequence has reached its terminal event.
+    BindingRetired,
 }
 
 /// Native phase retained without inventing timer-based terminality.

@@ -39,6 +39,7 @@ use super::{
         NativeBindingIngressQuiesced, NativePresentationSerial, NativePresentationTicket,
         NativeRetirementTombstone,
     },
+    scroll::NativeScrollEdge,
     snapshot::{
         NativeBackendCapabilities, NativeGlobalObservation, NativePlatformFacts,
         NativePlatformSnapshot, NativePlatformSnapshotGeneration, NativeWindowGeometry,
@@ -544,11 +545,11 @@ impl NativePlatformCoordinator {
         )
     }
 
-    pub(crate) fn record_terminal_pointer_edge(
+    pub(crate) fn record_synthetic_scroll_cancel(
         &mut self,
         source: NativePointerSource,
         identity: NativePointerIdentity,
-        kind: NativePointerEdgeKind,
+        scroll: NativeScrollEdge,
     ) -> Result<NativePointerSequence, NativePlatformError> {
         let delivery_owner = NativeAuthority::known(match source {
             NativePointerSource::Viewport(binding) => NativePointerDeliveryOwner::Viewport(binding),
@@ -564,12 +565,11 @@ impl NativePlatformCoordinator {
                 source,
                 delivery_owner,
                 identity,
-                kind,
+                NativePointerEdgeKind::Scrolled(scroll),
                 NativeAuthority::unknown(NativeUnavailableReason::Retired),
                 NativeAuthority::unknown(NativeUnavailableReason::Retired),
                 NativeAuthority::unknown(NativeUnavailableReason::Retired),
-            )
-            .ending_stream(),
+            ),
         )
     }
 
