@@ -1011,9 +1011,15 @@ impl GlutinWindowContext {
             }
         }
 
+        let recorded_correlated_create_failure = !failed_correlated_creates.is_empty();
         for viewport_id in failed_correlated_creates {
             self.discard_failed_viewport(viewport_id);
         }
+
+        request_root_repaint_after_correlated_create_failure(
+            &self.egui_ctx,
+            recorded_correlated_create_failure,
+        );
     }
 
     fn discard_failed_viewport(&mut self, viewport_id: ViewportId) {
@@ -1264,6 +1270,17 @@ impl GlutinWindowContext {
         self.initialize_all_windows(event_loop);
 
         self.remove_viewports_not_in(viewport_output);
+    }
+}
+
+fn request_root_repaint_after_correlated_create_failure(
+    egui_ctx: &egui::Context,
+    recorded_failure: bool,
+) {
+    if recorded_failure {
+        // GL window materialization happens after the hosted application commit. Wake the root so
+        // the next ingress cycle can deliver the terminal create result.
+        egui_ctx.request_repaint_of(ViewportId::ROOT);
     }
 }
 
@@ -1554,4 +1571,27 @@ pub(super) fn save_screenshot_and_exit(
 
     #[expect(clippy::exit)]
     std::process::exit(0);
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::*;
+
+    #[test]
+    fn correlated_create_failure_wakes_root_ingress() {
+        let context = egui::Context::default();
+        let repaints = Arc::new(egui::mutex::Mutex::new(Vec::new()));
+        let observed = Arc::clone(&repaints);
+        context.set_request_repaint_callback(move |request| {
+            observed.lock().push(request.viewport_id);
+        });
+
+        request_root_repaint_after_correlated_create_failure(&context, false);
+        assert!(repaints.lock().is_empty());
+
+        request_root_repaint_after_correlated_create_failure(&context, true);
+        assert!(repaints.lock().contains(&ViewportId::ROOT));
+    }
 }
