@@ -186,6 +186,7 @@ mod tests {
             device_id: winit::event::DeviceId::dummy(),
             delta: winit::dpi::PhysicalPosition::new(1.0, -2.0),
             phase: winit::event::TouchPhase::Moved,
+            modifiers: None,
             position: None,
         };
 

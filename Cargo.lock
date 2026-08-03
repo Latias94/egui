@@ -1243,7 +1243,7 @@ checksum = "75b325c5dbd37f80359721ad39aca5a29fb04c89279657cffdda8736d0c0b9d2"
 [[package]]
 name = "dpi"
 version = "0.1.1"
-source = "git+https://github.com/Latias94/winit?rev=bc2d69433d733d113f7b0b507fe060d62f30b7d1#bc2d69433d733d113f7b0b507fe060d62f30b7d1"
+source = "git+https://github.com/Latias94/winit?rev=ae4e6c5ee0af4b68c4ea1c2a2763b97e3ab7ae4c#ae4e6c5ee0af4b68c4ea1c2a2763b97e3ab7ae4c"
 
 [[package]]
 name = "ecolor"
@@ -5884,7 +5884,7 @@ checksum = "271414315aff87387382ec3d271b52d7ae78726f5d44ac98b4f4030c91880486"
 [[package]]
 name = "winit"
 version = "0.30.13"
-source = "git+https://github.com/Latias94/winit?rev=bc2d69433d733d113f7b0b507fe060d62f30b7d1#bc2d69433d733d113f7b0b507fe060d62f30b7d1"
+source = "git+https://github.com/Latias94/winit?rev=ae4e6c5ee0af4b68c4ea1c2a2763b97e3ab7ae4c#ae4e6c5ee0af4b68c4ea1c2a2763b97e3ab7ae4c"
 dependencies = [
  "ahash",
  "android-activity",

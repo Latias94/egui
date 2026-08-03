@@ -194,6 +194,7 @@ impl NativeTestWindowScroll {
             device_id,
             delta,
             phase: TouchPhase::Moved,
+            modifiers: Some(winit::keyboard::ModifiersState::empty()),
             position: Some(PhysicalPosition::new(self.position[0], self.position[1])),
         }
     }
@@ -261,6 +262,7 @@ mod tests {
         let WindowEvent::MouseWheel {
             delta: MouseScrollDelta::PixelDelta(delta),
             phase,
+            modifiers,
             position: Some(position),
             ..
         } = event
@@ -269,6 +271,7 @@ mod tests {
         };
         assert_eq!(delta, PhysicalPosition::new(-3.5, 4.75));
         assert_eq!(phase, TouchPhase::Moved);
+        assert_eq!(modifiers, Some(winit::keyboard::ModifiersState::empty()));
         assert_eq!(position, PhysicalPosition::new(31.0, 47.0));
     }
 

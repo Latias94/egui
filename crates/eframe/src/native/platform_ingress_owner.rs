@@ -74,6 +74,7 @@ struct WinitScrollSample {
     device_id: winit::event::DeviceId,
     delta: winit::event::MouseScrollDelta,
     phase: winit::event::TouchPhase,
+    modifiers: Option<winit::keyboard::ModifiersState>,
     position: Option<winit::dpi::PhysicalPosition<f64>>,
     backend_event_sequence: egui::BackendEventSequence,
 }
@@ -255,7 +256,6 @@ pub(super) struct NativePlatformIngressOwner {
     pointer_devices: HashMap<winit::event::DeviceId, NativePointerDeviceId>,
     pointer_states: HashMap<WinitPointerKey, WinitPointerState>,
     scroll_sequences: HashMap<WinitPointerKey, NativeScrollSequenceToken>,
-    modifiers: BTreeMap<NativeViewportBinding, NativeScrollModifiers>,
     #[cfg(feature = "native-test-support")]
     test_pointer_state: Option<NativeTestPointerState>,
     dispatched_effects:
@@ -278,7 +278,6 @@ impl Default for NativePlatformIngressOwner {
             pointer_devices: Default::default(),
             pointer_states: Default::default(),
             scroll_sequences: Default::default(),
-            modifiers: Default::default(),
             #[cfg(feature = "native-test-support")]
             test_pointer_state: None,
             dispatched_effects: Default::default(),
@@ -448,14 +447,6 @@ impl NativePlatformIngressOwner {
                         .record_key_edge_for_backend(backend_event_sequence, edge)?;
                 }
             }
-            winit::event::WindowEvent::ModifiersChanged(modifiers) => {
-                self.modifiers
-                    .insert(binding, native_scroll_modifiers(modifiers.state()));
-            }
-            winit::event::WindowEvent::Focused(false) => {
-                self.modifiers
-                    .insert(binding, NativeScrollModifiers::default());
-            }
             winit::event::WindowEvent::CursorEntered { .. } => {
                 self.hovered = NativeAuthority::known(NativeHoveredWindow::Viewport(binding));
             }
@@ -555,6 +546,7 @@ impl NativePlatformIngressOwner {
                 device_id,
                 delta,
                 phase,
+                modifiers,
                 position,
             } => {
                 self.record_winit_scroll_event(
@@ -567,6 +559,7 @@ impl NativePlatformIngressOwner {
                         device_id: *device_id,
                         delta: *delta,
                         phase: *phase,
+                        modifiers: *modifiers,
                         position: *position,
                         backend_event_sequence,
                     },
@@ -576,6 +569,7 @@ impl NativePlatformIngressOwner {
                 device_id,
                 delta,
                 phase,
+                modifiers,
                 position,
             } => {
                 self.record_winit_scroll_event(
@@ -593,6 +587,7 @@ impl NativePlatformIngressOwner {
                             ),
                         ),
                         phase: *phase,
+                        modifiers: *modifiers,
                         position: *position,
                         backend_event_sequence,
                     },
@@ -922,7 +917,7 @@ impl NativePlatformIngressOwner {
             identity.device_id(),
             sample.delta,
             sample.phase,
-            self.modifiers.get(&binding).copied(),
+            sample.modifiers.map(native_scroll_modifiers),
         )?;
         let position = sample.position.map_or_else(
             || NativeAuthority::unknown(NativeUnavailableReason::NotObserved),
@@ -1451,7 +1446,6 @@ impl NativePlatformIngressOwner {
             self.dispatched_effects
                 .retain(|(pending_binding, _), _| *pending_binding != binding);
             self.close_states.remove(&binding);
-            self.modifiers.remove(&binding);
             self.window_bindings.remove(&window_id);
             self.windows_by_viewport.remove(&binding.viewport_id());
         }
@@ -2395,6 +2389,11 @@ mod tests {
         assert_eq!(end.phase(), NativeScrollPhase::End);
         assert_eq!(begin.sequence(), update.sequence());
         assert_eq!(update.sequence(), end.sequence());
+        assert_eq!(begin.modifiers().value(), None);
+        assert_eq!(
+            begin.modifiers().unavailable_reason(),
+            Some(NativeUnavailableReason::NotObserved)
+        );
     }
 
     #[test]

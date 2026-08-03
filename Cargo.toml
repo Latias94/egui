@@ -390,4 +390,4 @@ self_named_module_files = "allow" # Disabled waiting on https://github.com/rust-
 significant_drop_tightening = "allow" # Too many false positives
 wildcard_imports = "allow" # `use crate::*` is useful to avoid merge conflicts when adding/removing imports
 [patch.crates-io]
-winit = { git = "https://github.com/Latias94/winit", rev = "bc2d69433d733d113f7b0b507fe060d62f30b7d1" }
+winit = { git = "https://github.com/Latias94/winit", rev = "ae4e6c5ee0af4b68c4ea1c2a2763b97e3ab7ae4c" }
