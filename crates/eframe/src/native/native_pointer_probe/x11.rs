@@ -223,7 +223,6 @@ pub(super) fn probe(windows: &[(NativeViewportBinding, Arc<Window>)]) -> NativeP
         return NativePointerRouteProbe {
             hovered: NativeAuthority::unknown(NativeUnavailableReason::NotObserved),
             capture: NativeAuthority::unknown(NativeUnavailableReason::Unsupported),
-            position: NativeAuthority::unknown(NativeUnavailableReason::NotObserved),
         };
     };
     NativePointerRouteProbe {
@@ -231,7 +230,6 @@ pub(super) fn probe(windows: &[(NativeViewportBinding, Arc<Window>)]) -> NativeP
         // X11 provides no query for another client's active pointer grab. The
         // edge-local native delivery binding remains exact and independent.
         capture: NativeAuthority::unknown(NativeUnavailableReason::Unsupported),
-        position: NativeAuthority::known(pointer.position),
     }
 }
 

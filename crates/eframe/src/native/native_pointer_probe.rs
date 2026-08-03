@@ -5,8 +5,8 @@ use std::sync::Arc;
 use winit::{event::WindowEvent, window::Window};
 
 use super::platform_provider::{
-    NativeAuthority, NativeCaptureOwner, NativeHoveredWindow, NativePhysicalPoint,
-    NativePointerDeliveryOwner, NativeUnavailableReason, NativeViewportBinding,
+    NativeAuthority, NativeCaptureOwner, NativeHoveredWindow, NativePointerDeliveryOwner,
+    NativeUnavailableReason, NativeViewportBinding,
 };
 
 #[cfg(target_os = "macos")]
@@ -37,7 +37,6 @@ mod platform;
 pub(super) struct NativePointerRouteProbe {
     pub(super) hovered: NativeAuthority<NativeHoveredWindow>,
     pub(super) capture: NativeAuthority<NativeCaptureOwner>,
-    pub(super) position: NativeAuthority<NativePhysicalPoint>,
 }
 
 pub(super) struct NativePointerEventRoute {
@@ -45,7 +44,6 @@ pub(super) struct NativePointerEventRoute {
     pub(super) hovered: NativeAuthority<NativeHoveredWindow>,
     pub(super) capture: NativeAuthority<NativeCaptureOwner>,
     pub(super) capture_after: NativeAuthority<NativeCaptureOwner>,
-    pub(super) position: NativeAuthority<NativePhysicalPoint>,
     pub(super) observed_pointer_event: bool,
 }
 
@@ -79,7 +77,6 @@ pub(super) fn probe_event(
         hovered: route.hovered,
         capture: route.capture.clone(),
         capture_after: route.capture,
-        position: route.position,
         observed_pointer_event: true,
     }
 }
@@ -99,7 +96,6 @@ fn unknown_probe(reason: NativeUnavailableReason) -> NativePointerRouteProbe {
     NativePointerRouteProbe {
         hovered: NativeAuthority::unknown(reason),
         capture: NativeAuthority::unknown(reason),
-        position: NativeAuthority::unknown(reason),
     }
 }
 
@@ -114,7 +110,6 @@ fn unknown_probe(reason: NativeUnavailableReason) -> NativePointerRouteProbe {
 ))]
 fn without_event_time_hit(mut route: NativePointerRouteProbe) -> NativePointerRouteProbe {
     route.hovered = NativeAuthority::unknown(NativeUnavailableReason::NotObserved);
-    route.position = NativeAuthority::unknown(NativeUnavailableReason::NotObserved);
     route
 }
 
@@ -127,7 +122,6 @@ fn unknown_event_route(
         hovered: NativeAuthority::unknown(reason),
         capture: NativeAuthority::unknown(reason),
         capture_after: NativeAuthority::unknown(reason),
-        position: NativeAuthority::unknown(reason),
         observed_pointer_event,
     }
 }
@@ -151,7 +145,6 @@ mod tests {
             hovered: NativeAuthority::known(NativeHoveredWindow::Viewport(b)),
             capture: NativeAuthority::unknown(NativeUnavailableReason::Unsupported),
             capture_after: NativeAuthority::unknown(NativeUnavailableReason::Unsupported),
-            position: NativeAuthority::known(NativePhysicalPoint::new(10, 20)),
             observed_pointer_event: true,
         };
 
@@ -193,6 +186,7 @@ mod tests {
             device_id: winit::event::DeviceId::dummy(),
             delta: winit::dpi::PhysicalPosition::new(1.0, -2.0),
             phase: winit::event::TouchPhase::Moved,
+            position: None,
         };
 
         assert!(is_pointer_event(&event));
@@ -208,15 +202,10 @@ mod tests {
         let route = without_event_time_hit(NativePointerRouteProbe {
             hovered: NativeAuthority::known(NativeHoveredWindow::Viewport(binding)),
             capture: capture.clone(),
-            position: NativeAuthority::known(NativePhysicalPoint::new(10, 20)),
         });
 
         assert_eq!(
             route.hovered.unavailable_reason(),
-            Some(NativeUnavailableReason::NotObserved)
-        );
-        assert_eq!(
-            route.position.unavailable_reason(),
             Some(NativeUnavailableReason::NotObserved)
         );
         assert_eq!(route.capture, capture);

@@ -92,11 +92,7 @@ pub(super) fn probe(windows: &[(NativeViewportBinding, Arc<Window>)]) -> NativeP
         }
     };
 
-    NativePointerRouteProbe {
-        hovered,
-        capture,
-        position,
-    }
+    NativePointerRouteProbe { hovered, capture }
 }
 
 pub(super) fn probe_event(

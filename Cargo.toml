@@ -389,3 +389,5 @@ map_unwrap_or = "allow" # so is this one
 self_named_module_files = "allow" # Disabled waiting on https://github.com/rust-lang/rust-clippy/issues/9602
 significant_drop_tightening = "allow" # Too many false positives
 wildcard_imports = "allow" # `use crate::*` is useful to avoid merge conflicts when adding/removing imports
+[patch.crates-io]
+winit = { git = "https://github.com/Latias94/winit", rev = "bc2d69433d733d113f7b0b507fe060d62f30b7d1" }

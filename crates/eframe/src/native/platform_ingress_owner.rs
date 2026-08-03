@@ -75,6 +75,7 @@ struct WinitScrollSample {
     device_id: winit::event::DeviceId,
     delta: winit::event::MouseScrollDelta,
     phase: winit::event::TouchPhase,
+    position: Option<winit::dpi::PhysicalPosition<f64>>,
     backend_event_sequence: egui::BackendEventSequence,
 }
 
@@ -555,9 +556,11 @@ impl NativePlatformIngressOwner {
                 device_id,
                 delta,
                 phase,
+                position,
             } => {
                 self.record_winit_scroll_event(
                     binding,
+                    window,
                     &bound_route_windows,
                     &pointer_route,
                     egui_ctx,
@@ -565,6 +568,7 @@ impl NativePlatformIngressOwner {
                         device_id: *device_id,
                         delta: *delta,
                         phase: *phase,
+                        position: *position,
                         backend_event_sequence,
                     },
                 )?;
@@ -573,9 +577,11 @@ impl NativePlatformIngressOwner {
                 device_id,
                 delta,
                 phase,
+                position,
             } => {
                 self.record_winit_scroll_event(
                     binding,
+                    window,
                     &bound_route_windows,
                     &pointer_route,
                     egui_ctx,
@@ -588,6 +594,7 @@ impl NativePlatformIngressOwner {
                             ),
                         ),
                         phase: *phase,
+                        position: *position,
                         backend_event_sequence,
                     },
                 )?;
@@ -912,6 +919,7 @@ impl NativePlatformIngressOwner {
     fn record_winit_scroll_event(
         &mut self,
         binding: NativeViewportBinding,
+        window: &Window,
         bound_route_windows: &[(NativeViewportBinding, Arc<Window>)],
         pointer_route: &super::native_pointer_probe::NativePointerEventRoute,
         egui_ctx: &egui::Context,
@@ -930,7 +938,10 @@ impl NativePlatformIngressOwner {
             sample.phase,
             self.modifiers.get(&binding).copied(),
         )?;
-        let position = pointer_route.position;
+        let position = sample.position.map_or_else(
+            || NativeAuthority::unknown(NativeUnavailableReason::NotObserved),
+            |position| desktop_pointer_position(window, position),
+        );
         let hovered_coordinates = pointer_coordinate_capture(
             bound_route_windows,
             &pointer_route.hovered,

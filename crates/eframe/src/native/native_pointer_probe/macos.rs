@@ -8,8 +8,8 @@ use raw_window_handle::{HasWindowHandle as _, RawWindowHandle};
 use winit::window::Window;
 
 use super::{
-    NativeAuthority, NativeHoveredWindow, NativePhysicalPoint, NativePointerRouteProbe,
-    NativeUnavailableReason, NativeViewportBinding, unknown_probe,
+    NativeAuthority, NativeHoveredWindow, NativePointerRouteProbe, NativeUnavailableReason,
+    NativeViewportBinding, unknown_probe,
 };
 
 #[expect(
@@ -90,7 +90,6 @@ pub(super) fn probe(windows: &[(NativeViewportBinding, Arc<Window>)]) -> NativeP
         // AppKit does not expose a persistent mouse-capture owner. Native
         // callbacks still provide exact edge-local delivery authority.
         capture: NativeAuthority::unknown(NativeUnavailableReason::Unsupported),
-        position: NativeAuthority::unknown(NativeUnavailableReason::NotObserved),
     }
 }
 
@@ -118,43 +117,5 @@ pub(super) fn probe_event(
     NativePointerRouteProbe {
         hovered: hovered(mtm, windows, screen_location),
         capture: NativeAuthority::unknown(NativeUnavailableReason::Unsupported),
-        position: event_physical_position(window, &native, location),
     }
-}
-
-fn event_physical_position(
-    window: &Window,
-    native: &NSWindow,
-    location: objc2_foundation::NSPoint,
-) -> NativeAuthority<NativePhysicalPoint> {
-    let Some(content) = native.contentView() else {
-        return NativeAuthority::unknown(NativeUnavailableReason::NotObserved);
-    };
-    let local = content.convertPoint_fromView(location, None);
-    let backing = content.convertPointToBacking(local);
-    let size = window.inner_size();
-    let y = if content.isFlipped() {
-        backing.y
-    } else {
-        f64::from(size.height) - backing.y
-    };
-    let (Some(x), Some(y), Ok(origin)) = (
-        exact_physical_component(backing.x),
-        exact_physical_component(y),
-        window.inner_position(),
-    ) else {
-        return NativeAuthority::unknown(NativeUnavailableReason::NotObserved);
-    };
-    let (Some(x), Some(y)) = (origin.x.checked_add(x), origin.y.checked_add(y)) else {
-        return NativeAuthority::unknown(NativeUnavailableReason::NotObserved);
-    };
-    NativeAuthority::known(NativePhysicalPoint::new(x, y))
-}
-
-fn exact_physical_component(value: f64) -> Option<i32> {
-    (value.is_finite()
-        && value.fract() == 0.0
-        && value >= f64::from(i32::MIN)
-        && value <= f64::from(i32::MAX))
-    .then_some(value as i32)
 }

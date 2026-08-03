@@ -1243,8 +1243,7 @@ checksum = "75b325c5dbd37f80359721ad39aca5a29fb04c89279657cffdda8736d0c0b9d2"
 [[package]]
 name = "dpi"
 version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f25c0e292a7ca6d6498557ff1df68f32c99850012b6ea401cf8daf771f22ff53"
+source = "git+https://github.com/Latias94/winit?rev=bc2d69433d733d113f7b0b507fe060d62f30b7d1#bc2d69433d733d113f7b0b507fe060d62f30b7d1"
 
 [[package]]
 name = "ecolor"
@@ -5885,8 +5884,7 @@ checksum = "271414315aff87387382ec3d271b52d7ae78726f5d44ac98b4f4030c91880486"
 [[package]]
 name = "winit"
 version = "0.30.13"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a6755fa58a9f8350bd1e472d4c3fcc25f824ec358933bba33306d0b63df5978d"
+source = "git+https://github.com/Latias94/winit?rev=bc2d69433d733d113f7b0b507fe060d62f30b7d1#bc2d69433d733d113f7b0b507fe060d62f30b7d1"
 dependencies = [
  "ahash",
  "android-activity",
