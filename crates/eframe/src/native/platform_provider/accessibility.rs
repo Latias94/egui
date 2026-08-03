@@ -13,6 +13,8 @@ pub enum NativeAccessibilityAction {
     Increment,
     /// Decrease an adjustable target by one semantic step.
     Decrement,
+    /// Reveal the target inside its owning scroll viewport.
+    ScrollIntoView,
 }
 
 /// One accessibility action delivered to an exact native viewport incarnation.
@@ -38,6 +40,7 @@ impl NativeAccessibilityEdge {
             egui::accesskit::Action::Focus => NativeAccessibilityAction::Focus,
             egui::accesskit::Action::Increment => NativeAccessibilityAction::Increment,
             egui::accesskit::Action::Decrement => NativeAccessibilityAction::Decrement,
+            egui::accesskit::Action::ScrollIntoView => NativeAccessibilityAction::ScrollIntoView,
             _ => return None,
         };
         Some(Self {
@@ -111,6 +114,10 @@ mod tests {
             (
                 egui::accesskit::Action::Decrement,
                 NativeAccessibilityAction::Decrement,
+            ),
+            (
+                egui::accesskit::Action::ScrollIntoView,
+                NativeAccessibilityAction::ScrollIntoView,
             ),
         ];
         for (action, expected) in cases {

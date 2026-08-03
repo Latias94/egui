@@ -123,6 +123,7 @@ impl EguiGlow {
             pointer_receiver_journal: _,
             pointer_hit_graph_candidate,
             viewport_output,
+            ..
         } = self.egui_ctx.run_ui(raw_input, run_ui);
 
         if let Some(superseded) = self.pending_pointer_hit_graph_candidate.take() {

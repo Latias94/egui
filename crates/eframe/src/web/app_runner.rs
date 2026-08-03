@@ -304,6 +304,7 @@ impl AppRunner {
             pointer_receiver_journal: _,
             pointer_hit_graph_candidate,
             viewport_output,
+            ..
         } = full_output;
 
         if let Some(superseded) = self.pending_pointer_hit_graph_candidate.take() {
@@ -407,6 +408,7 @@ impl AppRunner {
             accesskit_update: _,        // not currently implemented
             num_completed_passes: _,    // handled by `Context::run`
             request_discard_reasons: _, // handled by `Context::run`
+            ..
         } = platform_output;
 
         for command in commands {

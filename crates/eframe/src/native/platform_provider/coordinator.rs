@@ -23,8 +23,9 @@ use super::{
     },
     ingress::{
         NativeHostIngress, NativeIngressJournal, NativeIngressOrdinal, NativeIngressRecord,
-        NativeIngressRecordKind, derive_effect_results, derive_pointer_edges,
-        derive_presentation_results, derive_retirement_quiescences, derive_retirement_tombstones,
+        NativeIngressRecordKind, NativeNoScrollDerivativeReason, NativeScrollDerivativeDisposition,
+        derive_effect_results, derive_pointer_edges, derive_presentation_results,
+        derive_retirement_quiescences, derive_retirement_tombstones,
         derive_viewport_create_results, pointer_watermark,
     },
     keyboard::NativeKeyEdge,
@@ -428,6 +429,9 @@ impl NativePlatformCoordinator {
         });
         self.record_pointer_edge_inner(
             None,
+            NativeScrollDerivativeDisposition::ExplicitNoDerivative(
+                NativeNoScrollDerivativeReason::JournalOnly,
+            ),
             NativePointerEdgeFacts::new(
                 source,
                 delivery_owner,
@@ -440,12 +444,59 @@ impl NativePlatformCoordinator {
         )
     }
 
+    pub(crate) fn record_terminal_pointer_edge(
+        &mut self,
+        source: NativePointerSource,
+        identity: NativePointerIdentity,
+        kind: NativePointerEdgeKind,
+    ) -> Result<NativePointerSequence, NativePlatformError> {
+        let delivery_owner = NativeAuthority::known(match source {
+            NativePointerSource::Viewport(binding) => NativePointerDeliveryOwner::Viewport(binding),
+            NativePointerSource::Foreign => NativePointerDeliveryOwner::Foreign,
+            NativePointerSource::None => NativePointerDeliveryOwner::None,
+        });
+        self.record_pointer_edge_inner(
+            None,
+            NativeScrollDerivativeDisposition::ExplicitNoDerivative(
+                NativeNoScrollDerivativeReason::JournalOnly,
+            ),
+            NativePointerEdgeFacts::new(
+                source,
+                delivery_owner,
+                identity,
+                kind,
+                NativeAuthority::unknown(NativeUnavailableReason::Retired),
+                NativeAuthority::unknown(NativeUnavailableReason::Retired),
+                NativeAuthority::unknown(NativeUnavailableReason::Retired),
+            )
+            .ending_stream(),
+        )
+    }
+
     pub(crate) fn record_pointer_edge_for_backend(
         &mut self,
         backend_event_sequence: egui::BackendEventSequence,
         facts: NativePointerEdgeFacts,
     ) -> Result<NativePointerSequence, NativePlatformError> {
-        self.record_pointer_edge_inner(Some(backend_event_sequence), facts)
+        self.record_pointer_edge_inner(
+            Some(backend_event_sequence),
+            NativeScrollDerivativeDisposition::RequiredDerivative,
+            facts,
+        )
+    }
+
+    pub(crate) fn record_pointer_edge_without_derivative_for_backend(
+        &mut self,
+        backend_event_sequence: egui::BackendEventSequence,
+        facts: NativePointerEdgeFacts,
+    ) -> Result<NativePointerSequence, NativePlatformError> {
+        self.record_pointer_edge_inner(
+            Some(backend_event_sequence),
+            NativeScrollDerivativeDisposition::ExplicitNoDerivative(
+                NativeNoScrollDerivativeReason::JournalOnly,
+            ),
+            facts,
+        )
     }
 
     pub(crate) fn record_key_edge_for_backend(
@@ -481,6 +532,7 @@ impl NativePlatformCoordinator {
     fn record_pointer_edge_inner(
         &mut self,
         backend_event_sequence: Option<egui::BackendEventSequence>,
+        scroll_derivative: NativeScrollDerivativeDisposition,
         facts: NativePointerEdgeFacts,
     ) -> Result<NativePointerSequence, NativePlatformError> {
         self.validate_pointer_source(facts.source)?;
@@ -514,11 +566,15 @@ impl NativePlatformCoordinator {
             work_area: facts.work_area,
         };
         self.pointer_sequence = next_pointer_sequence;
-        self.commit_ingress_record(
-            ordinal,
-            backend_event_sequence,
-            NativeIngressRecordKind::PointerEdge(edge),
-        );
+        let kind = if matches!(edge.kind(), NativePointerEdgeKind::Scrolled(_)) {
+            NativeIngressRecordKind::ScrollEdge {
+                edge,
+                derivative: scroll_derivative,
+            }
+        } else {
+            NativeIngressRecordKind::PointerEdge(edge)
+        };
+        self.commit_ingress_record(ordinal, backend_event_sequence, kind);
         Ok(sequence)
     }
 
@@ -1160,6 +1216,25 @@ impl NativePlatformCoordinator {
         &mut self,
         key: NativeHostIngressSettlementKey,
     ) -> Result<(), NativePlatformError> {
+        let prepared = self.prepared_host_ingress_settlement(key)?;
+        self.snapshot_generation = prepared.snapshot_generation;
+        self.ingress_watermark = prepared.ingress_through;
+        self.pointer_watermark = prepared.pointer_through;
+        self.host_ingress_settlement = HostIngressSettlementState::Idle;
+        Ok(())
+    }
+
+    pub(crate) fn validate_host_ingress_settlement(
+        &self,
+        key: NativeHostIngressSettlementKey,
+    ) -> Result<(), NativePlatformError> {
+        self.prepared_host_ingress_settlement(key).map(drop)
+    }
+
+    fn prepared_host_ingress_settlement(
+        &self,
+        key: NativeHostIngressSettlementKey,
+    ) -> Result<PreparedHostIngressSettlement, NativePlatformError> {
         let prepared = match self.host_ingress_settlement {
             HostIngressSettlementState::Prepared(prepared) => prepared,
             HostIngressSettlementState::Poisoned => {
@@ -1172,11 +1247,7 @@ impl NativePlatformCoordinator {
         if prepared.key != key {
             return Err(NativePlatformError::HostIngressSettlementMismatch);
         }
-        self.snapshot_generation = prepared.snapshot_generation;
-        self.ingress_watermark = prepared.ingress_through;
-        self.pointer_watermark = prepared.pointer_through;
-        self.host_ingress_settlement = HostIngressSettlementState::Idle;
-        Ok(())
+        Ok(prepared)
     }
 
     pub(crate) fn abort_host_ingress(
@@ -2474,7 +2545,7 @@ mod tests {
     }
 
     #[test]
-    fn journal_only_scroll_proves_that_no_egui_derivative_exists() {
+    fn required_scroll_derivative_missing_from_raw_input_fails_closed() {
         let mut coordinator = NativePlatformCoordinator::default();
         let binding = coordinator
             .register_viewport(egui::ViewportId::ROOT)
@@ -2511,12 +2582,58 @@ mod tests {
         };
         let ingress = freeze_single_binding(&mut coordinator, binding);
         let cycle = crate::HostedViewportCycle::with_native_ingress([raw_input], ingress)
-            .expect("a journal-only scroll still forms one exact native cycle");
+            .expect("a required wheel derivative still forms one exact native cycle");
+
+        assert!(
+            !cycle.claim_native_scroll_derivative(binding, pointer_sequence),
+            "absence cannot prove that a required framework derivative never existed"
+        );
+    }
+
+    #[test]
+    fn explicit_journal_only_scroll_proves_no_derivative_affinely() {
+        let mut coordinator = NativePlatformCoordinator::default();
+        let binding = coordinator
+            .register_viewport(egui::ViewportId::ROOT)
+            .unwrap();
+        let backend_sequence = egui::BackendEventSequence::new(66);
+        let scroll = NativeScrollEdge::new(
+            NativePointerDeviceId::new(9),
+            None,
+            NativeScrollPhase::Discrete,
+            Some(NativeScrollDelta::Lines(
+                NativeFiniteScrollVector::new(0.0, 1.0).unwrap(),
+            )),
+            NativeAuthority::unknown(NativeUnavailableReason::NotObserved),
+            NativeAuthority::known(crate::NativeScrollModifiers::default()),
+        )
+        .unwrap();
+        let pointer_sequence = coordinator
+            .record_pointer_edge_without_derivative_for_backend(
+                backend_sequence,
+                NativePointerEdgeFacts::new(
+                    NativePointerSource::Viewport(binding),
+                    native_delivery(binding),
+                    pointer(9, 1),
+                    NativePointerEdgeKind::Scrolled(scroll),
+                    unknown_point(),
+                    unknown_hover(),
+                    unknown_capture(),
+                ),
+            )
+            .unwrap();
+        let raw_input = egui::RawInput {
+            viewport_id: egui::ViewportId::ROOT,
+            ..Default::default()
+        };
+        let ingress = freeze_single_binding(&mut coordinator, binding);
+        let cycle = crate::HostedViewportCycle::with_native_ingress([raw_input], ingress)
+            .expect("an explicitly journal-only scroll forms one exact native cycle");
 
         assert!(cycle.claim_native_scroll_derivative(binding, pointer_sequence));
         assert!(
             !cycle.claim_native_scroll_derivative(binding, pointer_sequence),
-            "proving the absence of a derivative is affine"
+            "the explicit absence proof is affine"
         );
     }
 

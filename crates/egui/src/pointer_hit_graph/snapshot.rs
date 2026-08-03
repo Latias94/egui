@@ -115,6 +115,14 @@ impl PointerHitGraphSnapshot {
         self.data.focused_receiver
     }
 
+    /// Iterates the exact scroll receiver roster frozen by this completed pass.
+    ///
+    /// Native integrations use this to validate a sequence-locked receiver
+    /// without spatially re-running wheel hit testing at a continuation point.
+    pub fn scroll_receivers(&self) -> impl ExactSizeIterator<Item = ScrollReceiver> + '_ {
+        self.data.scroll_receivers.iter().copied()
+    }
+
     /// Resolve an AccessKit node against this completed widget roster.
     ///
     /// Duplicate widget identifiers are ambiguous and therefore fail closed.
@@ -174,6 +182,33 @@ impl PointerHitGraphSnapshot {
             }
         };
 
+        self.probe_projected_scroll(position, normalized_delta)
+    }
+
+    /// Probes the frozen scroll roster with a policy-projected direction vector.
+    ///
+    /// The caller owns modifier and zoom policy. This method performs no event
+    /// normalization; it only proves which completed-pass receiver accepts the
+    /// supplied direction at `position`.
+    pub fn probe_projected_scroll(
+        &self,
+        position: Pos2,
+        projected_delta: crate::Vec2,
+    ) -> PointerReceiverAuthority<ScrollProbe> {
+        if !position.x.is_finite() || !position.y.is_finite() {
+            return PointerReceiverAuthority::Unknown(
+                PointerReceiverUnavailableReason::InvalidPosition,
+            );
+        }
+        if !projected_delta.x.is_finite() || !projected_delta.y.is_finite() {
+            return PointerReceiverAuthority::Unknown(
+                PointerReceiverUnavailableReason::InvalidScrollDelta,
+            );
+        }
+        if projected_delta == crate::Vec2::ZERO {
+            return PointerReceiverAuthority::Known(ScrollProbe::AwaitingDelta);
+        }
+
         let blocking_layer = self.blocking_layer_at(position);
         let mut lower_receiver = false;
         for receiver in self.data.scroll_receivers.iter().rev() {
@@ -184,12 +219,50 @@ impl PointerHitGraphSnapshot {
                 lower_receiver = true;
                 continue;
             }
-            if receiver.config().accepts(normalized_delta) {
-                return PointerReceiverAuthority::Known(ScrollProbe::Receiver {
-                    receiver: *receiver,
-                    normalized_delta,
-                });
+            return PointerReceiverAuthority::Known(
+                if receiver.config().accepts(projected_delta) {
+                    ScrollProbe::Receiver {
+                        receiver: *receiver,
+                        normalized_delta: projected_delta,
+                    }
+                } else {
+                    ScrollProbe::NoReceiver
+                },
+            );
+        }
+        PointerReceiverAuthority::Known(if lower_receiver {
+            ScrollProbe::Blocked
+        } else {
+            ScrollProbe::NoReceiver
+        })
+    }
+
+    /// Probes the unique frontmost scroll receiver without requiring a direction.
+    ///
+    /// Smooth-scroll `Begin` uses this to freeze ownership before the provider
+    /// emits its first directional delta. A frontmost receiver that later
+    /// rejects a direction still prevents fallthrough to receivers beneath it.
+    pub fn probe_scroll_owner(&self, position: Pos2) -> PointerReceiverAuthority<ScrollProbe> {
+        if !position.x.is_finite() || !position.y.is_finite() {
+            return PointerReceiverAuthority::Unknown(
+                PointerReceiverUnavailableReason::InvalidPosition,
+            );
+        }
+
+        let blocking_layer = self.blocking_layer_at(position);
+        let mut lower_receiver = false;
+        for receiver in self.data.scroll_receivers.iter().rev() {
+            if !receiver.enabled() || !self.receiver_contains(*receiver, position) {
+                continue;
             }
+            if blocking_layer.is_some_and(|layer| receiver.layer_id() != layer) {
+                lower_receiver = true;
+                continue;
+            }
+            return PointerReceiverAuthority::Known(ScrollProbe::Receiver {
+                receiver: *receiver,
+                normalized_delta: crate::Vec2::ZERO,
+            });
         }
         PointerReceiverAuthority::Known(if lower_receiver {
             ScrollProbe::Blocked

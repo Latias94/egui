@@ -1414,6 +1414,7 @@ fn render_immediate_viewport(
         pointer_receiver_journal: _,
         pointer_hit_graph_candidate,
         viewport_output,
+        ..
     } = egui_ctx.run_ui(input, |ui| {
         viewport_ui_cb(ui);
     });

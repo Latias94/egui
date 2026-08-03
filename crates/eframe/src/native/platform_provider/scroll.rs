@@ -25,7 +25,9 @@ pub struct NativeFiniteScrollVector {
 }
 
 impl NativeFiniteScrollVector {
-    pub(crate) fn new(x: f64, y: f64) -> Option<Self> {
+    /// Create a native scroll vector when both components are finite.
+    #[must_use]
+    pub fn new(x: f64, y: f64) -> Option<Self> {
         if !x.is_finite() || !y.is_finite() {
             return None;
         }

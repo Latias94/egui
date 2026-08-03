@@ -70,6 +70,14 @@ struct WinitPointerAuthority {
     capture: NativeAuthority<NativeCaptureOwner>,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct WinitScrollSample {
+    device_id: winit::event::DeviceId,
+    delta: winit::event::MouseScrollDelta,
+    phase: winit::event::TouchPhase,
+    backend_event_sequence: egui::BackendEventSequence,
+}
+
 #[derive(Clone, Debug)]
 struct WinitWindowFacts {
     window_id: WindowId,
@@ -129,6 +137,16 @@ pub(super) struct NativeHostIngressSettlement {
     key: Option<NativeHostIngressSettlementKey>,
 }
 
+/// Prevalidated native-ingress watermark publication.
+///
+/// Dropping this value aborts the prepared ingress. Once application semantic
+/// state publishes, [`Self::commit`] cannot report another recoverable error.
+#[must_use = "a prepared native ingress commit must publish or abort"]
+pub(super) struct PreparedNativeHostIngressCommit {
+    coordinator: SharedNativePlatformCoordinator,
+    key: Option<NativeHostIngressSettlementKey>,
+}
+
 impl NativeHostIngressSettlement {
     fn new(
         coordinator: SharedNativePlatformCoordinator,
@@ -140,16 +158,22 @@ impl NativeHostIngressSettlement {
         }
     }
 
-    pub(super) fn commit(mut self) -> Result<(), NativePlatformIngressError> {
+    pub(super) fn prepare_commit(
+        mut self,
+    ) -> Result<PreparedNativeHostIngressCommit, NativePlatformIngressError> {
         let key = self
             .key
             .expect("an affine native ingress settlement is consumed once");
-        let result = self.coordinator.lock().commit_host_ingress(key);
+        self.coordinator
+            .lock()
+            .validate_host_ingress_settlement(key)?;
         self.key
             .take()
             .expect("an affine native ingress settlement is consumed once");
-        result?;
-        Ok(())
+        Ok(PreparedNativeHostIngressCommit {
+            coordinator: self.coordinator.clone(),
+            key: Some(key),
+        })
     }
 }
 
@@ -162,6 +186,32 @@ impl Drop for NativeHostIngressSettlement {
         debug_assert!(
             aborted.is_ok(),
             "an unsettled native ingress ticket must poison its prepared batch"
+        );
+    }
+}
+
+impl PreparedNativeHostIngressCommit {
+    pub(super) fn commit(mut self) {
+        let key = self
+            .key
+            .take()
+            .expect("a prepared native ingress commit is consumed once");
+        self.coordinator
+            .lock()
+            .commit_host_ingress(key)
+            .expect("a prevalidated affine native ingress commit remains current");
+    }
+}
+
+impl Drop for PreparedNativeHostIngressCommit {
+    fn drop(&mut self) {
+        let Some(key) = self.key.take() else {
+            return;
+        };
+        let aborted = self.coordinator.lock().abort_host_ingress(key);
+        debug_assert!(
+            aborted.is_ok(),
+            "an unpublished prevalidated native ingress commit must poison its batch"
         );
     }
 }
@@ -506,54 +556,41 @@ impl NativePlatformIngressOwner {
                 delta,
                 phase,
             } => {
-                let key = WinitPointerKey {
-                    device_id: *device_id,
-                    stream: WinitPointerStream::Mouse,
-                };
-                let source = NativePointerSource::Viewport(binding);
-                let identity = self.pointer_identity(key)?;
-                let scroll = self.native_scroll_edge(
-                    key,
-                    identity.device_id(),
-                    *delta,
-                    *phase,
-                    self.modifiers.get(&binding).copied(),
-                )?;
-                let position = self.retained_pointer_position(key, source);
-                let hovered_coordinates = pointer_coordinate_capture(
+                self.record_winit_scroll_event(
+                    binding,
                     &bound_route_windows,
-                    &pointer_route.hovered,
-                    &position,
+                    &pointer_route,
                     egui_ctx,
-                );
-                let delivery_coordinates = pointer_delivery_coordinate_capture(
-                    &bound_route_windows,
-                    &pointer_route.delivery_owner,
-                    &position,
-                    egui_ctx,
-                );
-                let work_area = self.event_work_area(&pointer_route.hovered, &position);
-                self.record_pointer_facts(
-                    source,
-                    NativePointerEdgeKind::Scrolled(scroll),
-                    false,
-                    position.clone(),
-                    WinitPointerAuthority {
-                        delivery_owner: pointer_route.delivery_owner.clone(),
-                        hovered: pointer_route.hovered.clone(),
-                        hovered_coordinates,
-                        delivery_coordinates,
-                        work_area,
-                        capture: pointer_route.capture.clone(),
+                    WinitScrollSample {
+                        device_id: *device_id,
+                        delta: *delta,
+                        phase: *phase,
+                        backend_event_sequence,
                     },
-                    identity,
-                    backend_event_sequence,
                 )?;
-                self.pointer_states.entry(key).or_insert(WinitPointerState {
-                    identity,
-                    source,
-                    position,
-                });
+            }
+            winit::event::WindowEvent::PanGesture {
+                device_id,
+                delta,
+                phase,
+            } => {
+                self.record_winit_scroll_event(
+                    binding,
+                    &bound_route_windows,
+                    &pointer_route,
+                    egui_ctx,
+                    WinitScrollSample {
+                        device_id: *device_id,
+                        delta: winit::event::MouseScrollDelta::PixelDelta(
+                            winit::dpi::PhysicalPosition::new(
+                                f64::from(delta.x),
+                                f64::from(delta.y),
+                            ),
+                        ),
+                        phase: *phase,
+                        backend_event_sequence,
+                    },
+                )?;
             }
             winit::event::WindowEvent::Touch(touch) => {
                 let key = WinitPointerKey {
@@ -834,27 +871,34 @@ impl NativePlatformIngressOwner {
                 )
             },
         );
-        self.record_pointer_facts(
+        let authority = WinitPointerAuthority {
+            delivery_coordinates: pointer_delivery_coordinate_capture(
+                &bound_route_windows,
+                &delivery_owner,
+                &position,
+                egui_ctx,
+            ),
+            delivery_owner,
+            hovered,
+            hovered_coordinates,
+            work_area,
+            capture: capture_authority_after,
+        };
+        let facts = NativePointerEdgeFacts::new(
             source,
-            kind,
-            false,
-            position,
-            WinitPointerAuthority {
-                delivery_coordinates: pointer_delivery_coordinate_capture(
-                    &bound_route_windows,
-                    &delivery_owner,
-                    &position,
-                    egui_ctx,
-                ),
-                delivery_owner,
-                hovered: hovered.clone(),
-                hovered_coordinates,
-                work_area,
-                capture: capture_authority_after,
-            },
+            authority.delivery_owner,
             state.identity,
-            backend_event_sequence,
-        )?;
+            kind,
+            position,
+            authority.hovered,
+            authority.capture,
+        )
+        .with_hovered_coordinates(authority.hovered_coordinates)
+        .with_delivery_coordinates(authority.delivery_coordinates)
+        .with_work_area(authority.work_area);
+        self.coordinator
+            .lock()
+            .record_pointer_edge_without_derivative_for_backend(backend_event_sequence, facts)?;
 
         state.capture_owner = capture_after;
         self.test_pointer_state = Some(state);
@@ -863,6 +907,65 @@ impl NativePlatformIngressOwner {
             capture_after.map_or(NativeCaptureOwner::None, NativeCaptureOwner::Viewport),
         );
         Ok(repaint_viewport)
+    }
+
+    fn record_winit_scroll_event(
+        &mut self,
+        binding: NativeViewportBinding,
+        bound_route_windows: &[(NativeViewportBinding, Arc<Window>)],
+        pointer_route: &super::native_pointer_probe::NativePointerEventRoute,
+        egui_ctx: &egui::Context,
+        sample: WinitScrollSample,
+    ) -> Result<(), NativePlatformIngressError> {
+        let key = WinitPointerKey {
+            device_id: sample.device_id,
+            stream: WinitPointerStream::Mouse,
+        };
+        let source = NativePointerSource::Viewport(binding);
+        let identity = self.pointer_identity(key)?;
+        let scroll = self.native_scroll_edge(
+            key,
+            identity.device_id(),
+            sample.delta,
+            sample.phase,
+            self.modifiers.get(&binding).copied(),
+        )?;
+        let position = pointer_route.position;
+        let hovered_coordinates = pointer_coordinate_capture(
+            bound_route_windows,
+            &pointer_route.hovered,
+            &position,
+            egui_ctx,
+        );
+        let delivery_coordinates = pointer_delivery_coordinate_capture(
+            bound_route_windows,
+            &pointer_route.delivery_owner,
+            &position,
+            egui_ctx,
+        );
+        let work_area = self.event_work_area(&pointer_route.hovered, &position);
+        self.record_pointer_facts(
+            source,
+            NativePointerEdgeKind::Scrolled(scroll),
+            false,
+            position,
+            WinitPointerAuthority {
+                delivery_owner: pointer_route.delivery_owner,
+                hovered: pointer_route.hovered,
+                hovered_coordinates,
+                delivery_coordinates,
+                work_area,
+                capture: pointer_route.capture,
+            },
+            identity,
+            sample.backend_event_sequence,
+        )?;
+        self.pointer_states.entry(key).or_insert(WinitPointerState {
+            identity,
+            source,
+            position,
+        });
+        Ok(())
     }
 
     fn retained_pointer_position(
@@ -992,7 +1095,7 @@ impl NativePlatformIngressOwner {
             authority.delivery_owner,
             identity,
             kind,
-            position.clone(),
+            position,
             authority.hovered,
             authority.capture,
         )
@@ -1337,6 +1440,7 @@ impl NativePlatformIngressOwner {
             })
             .collect::<Vec<_>>();
         for (window_id, binding) in retired {
+            self.retire_pointer_state(binding)?;
             let lifecycle = self
                 .dispatched_effects
                 .get(&(binding, NativeEffectProperty::Lifecycle));
@@ -1351,7 +1455,6 @@ impl NativePlatformIngressOwner {
                 .retain(|(pending_binding, _), _| *pending_binding != binding);
             self.close_states.remove(&binding);
             self.modifiers.remove(&binding);
-            self.retire_pointer_state(binding);
             self.window_bindings.remove(&window_id);
             self.windows_by_viewport.remove(&binding.viewport_id());
         }
@@ -1375,7 +1478,10 @@ impl NativePlatformIngressOwner {
         Ok(())
     }
 
-    fn retire_pointer_state(&mut self, binding: NativeViewportBinding) {
+    fn retire_pointer_state(
+        &mut self,
+        binding: NativeViewportBinding,
+    ) -> Result<(), NativePlatformIngressError> {
         let retired_keys = self
             .pointer_states
             .iter()
@@ -1384,6 +1490,26 @@ impl NativePlatformIngressOwner {
             })
             .collect::<Vec<_>>();
         for key in retired_keys {
+            let state = self
+                .pointer_states
+                .get(&key)
+                .expect("the retired key was derived from the same pointer-state map");
+            if let Some(token) = self.scroll_sequences.get(&key).copied() {
+                let scroll = NativeScrollEdge::new(
+                    state.identity.device_id(),
+                    Some(token),
+                    NativeScrollPhase::Cancel(NativeScrollCancelReason::DeviceRemoved),
+                    None,
+                    NativeAuthority::unknown(NativeUnavailableReason::Retired),
+                    NativeAuthority::unknown(NativeUnavailableReason::Retired),
+                )
+                .expect("a provider-owned scroll cancellation has a legal terminal shape");
+                self.coordinator.lock().record_terminal_pointer_edge(
+                    state.source,
+                    state.identity,
+                    NativePointerEdgeKind::Scrolled(scroll),
+                )?;
+            }
             self.pointer_states.remove(&key);
             self.scroll_sequences.remove(&key);
         }
@@ -1401,6 +1527,7 @@ impl NativePlatformIngressOwner {
         if self.capture.value() == Some(&NativeCaptureOwner::Viewport(binding)) {
             self.capture = NativeAuthority::unknown(NativeUnavailableReason::Retired);
         }
+        Ok(())
     }
 
     fn binding_for(
@@ -2103,14 +2230,35 @@ mod tests {
         let prepared = owner.prepare_facts(&[]).unwrap();
         let (_, key) = prepared.into_parts();
         NativeHostIngressSettlement::new(owner.coordinator(), key)
-            .commit()
-            .unwrap();
+            .prepare_commit()
+            .unwrap()
+            .commit();
 
         let successor = owner.prepare_facts(&[]).unwrap();
         let (_, successor_key) = successor.into_parts();
         NativeHostIngressSettlement::new(owner.coordinator(), successor_key)
-            .commit()
+            .prepare_commit()
+            .unwrap()
+            .commit();
+    }
+
+    #[test]
+    fn dropping_prevalidated_native_ingress_commit_poison_prevents_reuse() {
+        let mut owner = NativePlatformIngressOwner::default();
+        let prepared = owner.prepare_facts(&[]).unwrap();
+        let (_, key) = prepared.into_parts();
+        let commit = NativeHostIngressSettlement::new(owner.coordinator(), key)
+            .prepare_commit()
             .unwrap();
+
+        drop(commit);
+
+        assert!(matches!(
+            owner.prepare_facts(&[]),
+            Err(NativePlatformIngressError::Platform(
+                NativePlatformError::HostIngressPoisoned
+            ))
+        ));
     }
 
     #[test]
@@ -2152,7 +2300,39 @@ mod tests {
             .scroll_sequences
             .insert(unrelated_key, NativeScrollSequenceToken::new(12));
 
-        owner.freeze_facts(&[]).unwrap();
+        let ingress = owner.freeze_facts(&[]).unwrap();
+
+        let records = ingress.ordered().records();
+        let cancel = records
+            .iter()
+            .position(|record| {
+                matches!(
+                    record.event(),
+                    crate::NativeIngressEvent::PointerEdge(edge)
+                        if edge.ends_stream()
+                            && matches!(
+                                edge.kind(),
+                                NativePointerEdgeKind::Scrolled(scroll)
+                                    if scroll.sequence() == Some(NativeScrollSequenceToken::new(11))
+                                        && scroll.phase()
+                                            == NativeScrollPhase::Cancel(
+                                                NativeScrollCancelReason::DeviceRemoved,
+                                            )
+                            )
+                )
+            })
+            .expect("retirement emits one exact scroll terminal");
+        let retirement = records
+            .iter()
+            .position(|record| {
+                matches!(
+                    record.event(),
+                    crate::NativeIngressEvent::Retirement(tombstone)
+                        if tombstone.binding() == binding
+                )
+            })
+            .expect("the viewport retirement remains present");
+        assert!(cancel < retirement);
 
         assert!(!owner.pointer_states.contains_key(&retired_key));
         assert!(!owner.scroll_sequences.contains_key(&retired_key));
@@ -2168,7 +2348,7 @@ mod tests {
     }
 
     #[test]
-    fn wheel_reuses_only_the_exact_source_pointer_position() {
+    fn wheel_position_never_falls_back_to_retained_cursor_state() {
         let mut owner = NativePlatformIngressOwner::default();
         let viewport_id = viewport("wheel-position");
         let initial = facts(window_id(), viewport_id, false);
@@ -2197,11 +2377,12 @@ mod tests {
                 .value(),
             Some(&position)
         );
-        assert!(
-            owner
-                .retained_pointer_position(key, NativePointerSource::Foreign)
-                .value()
-                .is_none()
+        let event_probe =
+            NativeAuthority::<NativePhysicalPoint>::unknown(NativeUnavailableReason::NotObserved);
+        assert!(event_probe.value().is_none());
+        assert_eq!(
+            event_probe.unavailable_reason(),
+            Some(NativeUnavailableReason::NotObserved)
         );
     }
 

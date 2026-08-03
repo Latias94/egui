@@ -8,8 +8,8 @@ use raw_window_handle::{HasWindowHandle as _, RawWindowHandle};
 use winit::window::Window;
 
 use super::{
-    NativeAuthority, NativeHoveredWindow, NativePointerRouteProbe, NativeUnavailableReason,
-    NativeViewportBinding, unknown_probe,
+    NativeAuthority, NativeHoveredWindow, NativePhysicalPoint, NativePointerRouteProbe,
+    NativeUnavailableReason, NativeViewportBinding, unknown_probe,
 };
 
 #[expect(
@@ -49,11 +49,11 @@ fn point_is_inside(point: objc2_foundation::NSPoint, window: &NSWindow) -> bool 
 fn hovered(
     mtm: MainThreadMarker,
     windows: &[(NativeViewportBinding, Arc<Window>)],
+    point: objc2_foundation::NSPoint,
 ) -> NativeAuthority<NativeHoveredWindow> {
     let Some(roster) = exact_roster(windows) else {
         return NativeAuthority::unknown(NativeUnavailableReason::StaleSource);
     };
-    let point = NSEvent::mouseLocation();
     let platform_hit = NSWindow::windowNumberAtPoint_belowWindowWithWindowNumber(point, 0, mtm);
     let app = NSApplication::sharedApplication(mtm);
     let ordered_hit = app.orderedWindows().iter().find(|window| {
@@ -86,17 +86,75 @@ pub(super) fn probe(windows: &[(NativeViewportBinding, Arc<Window>)]) -> NativeP
         return unknown_probe(NativeUnavailableReason::NotObserved);
     };
     NativePointerRouteProbe {
-        hovered: hovered(mtm, windows),
+        hovered: hovered(mtm, windows, NSEvent::mouseLocation()),
         // AppKit does not expose a persistent mouse-capture owner. Native
         // callbacks still provide exact edge-local delivery authority.
         capture: NativeAuthority::unknown(NativeUnavailableReason::Unsupported),
+        position: NativeAuthority::unknown(NativeUnavailableReason::NotObserved),
     }
 }
 
 pub(super) fn probe_event(
     windows: &[(NativeViewportBinding, Arc<Window>)],
+    window: &Window,
 ) -> NativePointerRouteProbe {
-    // This executes synchronously inside the winit callback, so the hover fact
-    // is sampled at the edge rather than reconstructed at host-frame freeze.
-    probe(windows)
+    let Some(mtm) = MainThreadMarker::new() else {
+        return unknown_probe(NativeUnavailableReason::NotObserved);
+    };
+    let Some(native) = native_window(window) else {
+        return unknown_probe(NativeUnavailableReason::StaleSource);
+    };
+    let Some(event) = NSApplication::sharedApplication(mtm).currentEvent() else {
+        return unknown_probe(NativeUnavailableReason::NotObserved);
+    };
+    let Some(event_window) = event.window(mtm) else {
+        return unknown_probe(NativeUnavailableReason::NotObserved);
+    };
+    if !std::ptr::eq::<NSWindow>(&*native, &*event_window) {
+        return unknown_probe(NativeUnavailableReason::StaleSource);
+    }
+    let location = event.locationInWindow();
+    let screen_location = native.convertPointToScreen(location);
+    NativePointerRouteProbe {
+        hovered: hovered(mtm, windows, screen_location),
+        capture: NativeAuthority::unknown(NativeUnavailableReason::Unsupported),
+        position: event_physical_position(window, &native, location),
+    }
+}
+
+fn event_physical_position(
+    window: &Window,
+    native: &NSWindow,
+    location: objc2_foundation::NSPoint,
+) -> NativeAuthority<NativePhysicalPoint> {
+    let Some(content) = native.contentView() else {
+        return NativeAuthority::unknown(NativeUnavailableReason::NotObserved);
+    };
+    let local = content.convertPoint_fromView(location, None);
+    let backing = content.convertPointToBacking(local);
+    let size = window.inner_size();
+    let y = if content.isFlipped() {
+        backing.y
+    } else {
+        f64::from(size.height) - backing.y
+    };
+    let (Some(x), Some(y), Ok(origin)) = (
+        exact_physical_component(backing.x),
+        exact_physical_component(y),
+        window.inner_position(),
+    ) else {
+        return NativeAuthority::unknown(NativeUnavailableReason::NotObserved);
+    };
+    let (Some(x), Some(y)) = (origin.x.checked_add(x), origin.y.checked_add(y)) else {
+        return NativeAuthority::unknown(NativeUnavailableReason::NotObserved);
+    };
+    NativeAuthority::known(NativePhysicalPoint::new(x, y))
+}
+
+fn exact_physical_component(value: f64) -> Option<i32> {
+    (value.is_finite()
+        && value.fract() == 0.0
+        && value >= f64::from(i32::MIN)
+        && value <= f64::from(i32::MAX))
+    .then_some(value as i32)
 }

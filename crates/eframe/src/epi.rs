@@ -61,6 +61,42 @@ pub type HostedViewportAppError = Box<dyn std::error::Error + Send + Sync>;
 #[cfg(any(feature = "glow", feature = "wgpu_no_default_features"))]
 pub type HostedViewportAppResult<T> = Result<T, HostedViewportAppError>;
 
+/// Host-side work requested after an application hosted-cycle publication.
+///
+/// The directive is intentionally smaller than an egui context: an application
+/// commit hook can request another cycle without retaining a capability to
+/// create or mutate a native viewport after the output roster was sealed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[cfg(not(target_arch = "wasm32"))]
+#[cfg(any(feature = "glow", feature = "wgpu_no_default_features"))]
+pub struct HostedViewportCommitDirective {
+    repaint_root: bool,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[cfg(any(feature = "glow", feature = "wgpu_no_default_features"))]
+impl HostedViewportCommitDirective {
+    /// Returns a directive which schedules no follow-up cycle.
+    #[must_use]
+    pub const fn none() -> Self {
+        Self {
+            repaint_root: false,
+        }
+    }
+
+    /// Returns a directive which schedules another root cycle.
+    #[must_use]
+    pub const fn repaint_root() -> Self {
+        Self { repaint_root: true }
+    }
+
+    /// Returns whether the host should repaint the root viewport.
+    #[must_use]
+    pub const fn requests_root_repaint(self) -> bool {
+        self.repaint_root
+    }
+}
+
 /// Selects the native viewport execution contract used by an [`App`].
 ///
 /// Compatibility mode preserves ordinary egui immediate viewports. Transactional
@@ -472,24 +508,24 @@ pub trait App {
     /// [`Self::end_hosted_viewport_cycle`]. That hook only prepares an affine
     /// candidate; this hook is the first point at which the host transaction is
     /// known to have sealed successfully. The transactional immediate-viewport
-    /// guard remains active throughout this callback.
+    /// guard remains in its sealed embedded state throughout this callback. The
+    /// callback receives no egui context or frame capability, so it cannot
+    /// start another native viewport transaction after the host roster seals.
     ///
     /// # Errors
     ///
     /// Returning an error is a fail-closed application invariant violation. The
     /// implementation must complete all fallible validation before modifying
-    /// live state; after its first semantic publication it must return `Ok(())`.
+    /// live state; after its first semantic publication it must return `Ok(_)`.
     /// On error, the backend invokes [`Self::abort_hosted_viewport_cycle`] and
     /// suppresses rendering of the staged outputs.
     #[cfg(not(target_arch = "wasm32"))]
     #[cfg(any(feature = "glow", feature = "wgpu_no_default_features"))]
     fn commit_hosted_viewport_cycle(
         &mut self,
-        _ctx: &egui::Context,
         _outputs: &mut [crate::HostedViewportOutput<egui::FullOutput>],
-        _frame: &mut Frame,
-    ) -> HostedViewportAppResult<()> {
-        Ok(())
+    ) -> HostedViewportAppResult<HostedViewportCommitDirective> {
+        Ok(HostedViewportCommitDirective::none())
     }
 
     /// Aborts application-owned state after a hosted cycle began but did not

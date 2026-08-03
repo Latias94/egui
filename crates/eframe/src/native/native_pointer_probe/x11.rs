@@ -13,8 +13,9 @@ use raw_window_handle::{
 use winit::window::Window;
 
 use super::{
-    NativeAuthority, NativeCaptureOwner, NativeHoveredWindow, NativePointerRouteProbe,
-    NativeUnavailableReason, NativeViewportBinding, unknown_probe,
+    NativeAuthority, NativeCaptureOwner, NativeHoveredWindow, NativePhysicalPoint,
+    NativePointerRouteProbe, NativeUnavailableReason, NativeViewportBinding, unknown_probe,
+    without_event_time_hit,
 };
 
 const MAX_POINTER_DESCENT: usize = 32;
@@ -50,6 +51,11 @@ struct X11Roster {
     display: *mut c_void,
     root: c_ulong,
     bindings: BTreeMap<c_ulong, NativeViewportBinding>,
+}
+
+struct X11PointerObservation {
+    child: c_ulong,
+    position: NativePhysicalPoint,
 }
 
 #[expect(
@@ -95,7 +101,7 @@ fn exact_roster(windows: &[(NativeViewportBinding, Arc<Window>)]) -> Option<X11R
     unsafe_code,
     reason = "XQueryPointer is the X server's event-time pointer hierarchy authority"
 )]
-fn pointer_child(roster: &X11Roster, window: c_ulong) -> Option<c_ulong> {
+fn pointer_observation(roster: &X11Roster, window: c_ulong) -> Option<X11PointerObservation> {
     let mut root = 0;
     let mut child = 0;
     let mut root_x = 0;
@@ -116,7 +122,14 @@ fn pointer_child(roster: &X11Roster, window: c_ulong) -> Option<c_ulong> {
             &mut mask,
         )
     } != 0)
-        .then_some(child)
+        .then_some(X11PointerObservation {
+            child,
+            position: NativePhysicalPoint::new(root_x, root_y),
+        })
+}
+
+fn pointer_child(roster: &X11Roster, window: c_ulong) -> Option<c_ulong> {
+    pointer_observation(roster, window).map(|observation| observation.child)
 }
 
 #[expect(
@@ -177,10 +190,7 @@ fn descendant_binding(roster: &X11Roster, start: c_ulong) -> Option<Option<Nativ
     Some(None)
 }
 
-fn hovered(roster: &X11Roster) -> NativeAuthority<NativeHoveredWindow> {
-    let Some(mut window) = pointer_child(roster, roster.root) else {
-        return NativeAuthority::unknown(NativeUnavailableReason::NotObserved);
-    };
+fn hovered(roster: &X11Roster, mut window: c_ulong) -> NativeAuthority<NativeHoveredWindow> {
     if window == 0 {
         return NativeAuthority::known(NativeHoveredWindow::None);
     }
@@ -209,16 +219,28 @@ pub(super) fn probe(windows: &[(NativeViewportBinding, Arc<Window>)]) -> NativeP
     let Some(roster) = exact_roster(windows) else {
         return unknown_probe(NativeUnavailableReason::StaleSource);
     };
+    let Some(pointer) = pointer_observation(&roster, roster.root) else {
+        return NativePointerRouteProbe {
+            hovered: NativeAuthority::unknown(NativeUnavailableReason::NotObserved),
+            capture: NativeAuthority::unknown(NativeUnavailableReason::Unsupported),
+            position: NativeAuthority::unknown(NativeUnavailableReason::NotObserved),
+        };
+    };
     NativePointerRouteProbe {
-        hovered: hovered(&roster),
+        hovered: hovered(&roster, pointer.child),
         // X11 provides no query for another client's active pointer grab. The
         // edge-local native delivery binding remains exact and independent.
         capture: NativeAuthority::unknown(NativeUnavailableReason::Unsupported),
+        position: NativeAuthority::known(pointer.position),
     }
 }
 
 pub(super) fn probe_event(
     windows: &[(NativeViewportBinding, Arc<Window>)],
+    _window: &Window,
 ) -> NativePointerRouteProbe {
-    probe(windows)
+    // `XQueryPointer` observes callback-time state, not the coordinates and
+    // window from the X event which winit translated. Do not upgrade it into
+    // event-time receiver authority after queued pointer motion.
+    without_event_time_hit(probe(windows))
 }

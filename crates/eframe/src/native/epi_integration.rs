@@ -374,8 +374,8 @@ impl EpiIntegration {
         &mut self,
         app: &mut dyn epi::App,
         outputs: &mut [crate::HostedViewportOutput<egui::FullOutput>],
-    ) -> crate::HostedViewportAppResult<()> {
-        app.commit_hosted_viewport_cycle(&self.egui_ctx, outputs, &mut self.frame)
+    ) -> crate::HostedViewportAppResult<crate::HostedViewportCommitDirective> {
+        app.commit_hosted_viewport_cycle(outputs)
     }
 
     /// Notifies the application that its hosted-cycle transaction aborted.

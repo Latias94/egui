@@ -1021,6 +1021,9 @@ impl Context {
             viewport.repaint.cumulative_frame_nr += 1;
         });
 
+        #[cfg(egui_backend_event_envelope)]
+        output.seal_requested_provenance();
+
         output
     }
 
@@ -1754,6 +1757,16 @@ impl Context {
     /// the latest pass is returned.
     pub fn set_presentation_token(&self, token: Option<crate::UserData>) {
         self.output_mut(|output| output.presentation_token = token);
+    }
+
+    /// Requests an affine, content-bound proof for this pass's final [`crate::FullOutput`].
+    ///
+    /// This backend integration seam is independent of
+    /// [`Self::set_presentation_token`]. The returned output can consume the
+    /// proof once with [`crate::FullOutput::consume_output_provenance`].
+    #[cfg(egui_backend_event_envelope)]
+    pub fn request_output_provenance(&self, token: crate::UserData) {
+        self.output_mut(|output| output.output_provenance_request = Some(token));
     }
 
     /// Add a command to [`PlatformOutput::commands`],
@@ -2557,6 +2570,9 @@ impl Context {
         let plugins = self.read(|ctx| ctx.plugins.ordered_plugins());
         plugins.on_output(self, &mut output);
 
+        #[cfg(egui_backend_event_envelope)]
+        output.seal_requested_provenance();
+
         output
     }
 
@@ -2939,6 +2955,8 @@ impl ContextImpl {
             ),
             pointer_hit_graph_candidate,
             viewport_output,
+            #[cfg(egui_backend_event_envelope)]
+            output_provenance: None,
         }
     }
 }

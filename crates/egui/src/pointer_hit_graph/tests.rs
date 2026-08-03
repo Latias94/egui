@@ -468,7 +468,7 @@ fn scroll_area_publishes_first_pass_final_geometry_and_direction() {
 }
 
 #[test]
-fn scroll_probe_falls_back_to_same_layer_parent_at_child_boundary() {
+fn scroll_probe_does_not_fall_through_a_same_layer_child_at_its_boundary() {
     let context = Context::default();
     let output = run_pass(&context, vec![], |ui| {
         let outer = ui.reserve_scroll_receiver(Id::new(BACKGROUND));
@@ -496,13 +496,49 @@ fn scroll_probe_falls_back_to_same_layer_parent_at_child_boundary() {
     let graph = output
         .pointer_hit_graph_candidate
         .expect("completed pass must emit a hit graph candidate");
-    let PointerReceiverAuthority::Known(ScrollProbe::Receiver { receiver, .. }) = graph
-        .snapshot()
-        .probe_scroll(target_rect().center(), vec2(0.0, -1.0), Modifiers::NONE)
+    assert_eq!(
+        graph
+            .snapshot()
+            .probe_scroll(target_rect().center(), vec2(0.0, -1.0), Modifiers::NONE),
+        PointerReceiverAuthority::Known(ScrollProbe::NoReceiver),
+    );
+}
+
+#[test]
+fn directionless_probe_freezes_the_frontmost_scroll_receiver() {
+    let context = Context::default();
+    let output = run_pass(&context, vec![], |ui| {
+        let outer = ui.reserve_scroll_receiver(Id::new(BACKGROUND));
+        register_scroll(
+            ui,
+            OVERLAY,
+            target_rect().shrink(10.0),
+            scroll_config(
+                ScrollProjection::Independent,
+                ScrollAxisCapabilities::NONE,
+                ScrollAxisCapabilities::NONE,
+            ),
+        );
+        ui.finalize_scroll_receiver(
+            outer,
+            target_rect(),
+            scroll_config(
+                ScrollProjection::Independent,
+                ScrollAxisCapabilities::BOTH,
+                ScrollAxisCapabilities::BOTH,
+            ),
+        )
+        .expect("outer reservation must finalize after its child");
+    });
+    let graph = output
+        .pointer_hit_graph_candidate
+        .expect("completed pass must emit a hit graph candidate");
+    let PointerReceiverAuthority::Known(ScrollProbe::Receiver { receiver, .. }) =
+        graph.snapshot().probe_scroll_owner(target_rect().center())
     else {
-        panic!("parent must receive a direction rejected by its child");
+        panic!("directionless begin must select the frontmost receiver");
     };
-    assert_eq!(receiver.id(), Id::new(BACKGROUND));
+    assert_eq!(receiver.id(), Id::new(OVERLAY));
 }
 
 #[test]
@@ -563,6 +599,43 @@ fn scroll_probe_normalizes_shift_and_reserves_zoom_for_framework() {
             .snapshot()
             .probe_scroll(target_rect().center(), vec2(0.0, -1.0), Modifiers::COMMAND,),
         PointerReceiverAuthority::Known(ScrollProbe::FrameworkOwned),
+    );
+}
+
+#[test]
+fn projected_scroll_probe_uses_the_frozen_roster_without_modifier_policy() {
+    let context = Context::default();
+    let output = run_pass(&context, vec![], |ui| {
+        register_scroll(
+            ui,
+            BACKGROUND,
+            target_rect(),
+            scroll_config(
+                ScrollProjection::Independent,
+                ScrollAxisCapabilities::new(true, false),
+                ScrollAxisCapabilities::NONE,
+            ),
+        );
+    });
+    let graph = output
+        .pointer_hit_graph_candidate
+        .expect("completed pass must emit a hit graph candidate");
+    let snapshot = graph.snapshot();
+
+    assert_eq!(
+        snapshot
+            .scroll_receivers()
+            .map(|receiver| receiver.id())
+            .collect::<Vec<_>>(),
+        [Id::new(BACKGROUND)]
+    );
+    assert!(matches!(
+        snapshot.probe_projected_scroll(target_rect().center(), vec2(-1.0, 0.0)),
+        PointerReceiverAuthority::Known(ScrollProbe::Receiver { .. })
+    ));
+    assert_eq!(
+        snapshot.probe_projected_scroll(target_rect().center(), vec2(0.0, -1.0)),
+        PointerReceiverAuthority::Known(ScrollProbe::NoReceiver)
     );
 }
 

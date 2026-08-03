@@ -53,6 +53,28 @@ pub struct FullOutput {
     /// It is up to the integration to spawn a native window for each viewport,
     /// and to close any window that no longer has a viewport in this map.
     pub viewport_output: OrderedViewportIdMap<ViewportOutput>,
+
+    #[cfg(egui_backend_event_envelope)]
+    pub(crate) output_provenance: Option<FullOutputProvenance>,
+}
+
+#[cfg(egui_backend_event_envelope)]
+#[derive(Clone)]
+pub(crate) struct FullOutputProvenance {
+    token: crate::UserData,
+    consumed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    snapshot: std::sync::Arc<FullOutputSnapshot>,
+}
+
+#[cfg(egui_backend_event_envelope)]
+struct FullOutputSnapshot {
+    platform_output: PlatformOutput,
+    textures_delta: epaint::textures::TexturesDelta,
+    shapes: Vec<epaint::ClippedShape>,
+    pixels_per_point: f32,
+    pointer_receiver_journal: PointerReceiverJournal,
+    pointer_hit_graph: Option<crate::PointerHitGraphSnapshot>,
+    viewport_output: OrderedViewportIdMap<ViewportOutput>,
 }
 
 impl FullOutput {
@@ -68,6 +90,8 @@ impl FullOutput {
             pointer_receiver_journal,
             pointer_hit_graph_candidate,
             viewport_output,
+            #[cfg(egui_backend_event_envelope)]
+                output_provenance: _,
         } = newer;
 
         self.platform_output.append(platform_output);
@@ -82,6 +106,10 @@ impl FullOutput {
             ));
         }
         self.pointer_hit_graph_candidate = pointer_hit_graph_candidate;
+        #[cfg(egui_backend_event_envelope)]
+        {
+            self.output_provenance = None;
+        }
 
         for (id, new_viewport) in viewport_output {
             match self.viewport_output.entry(id) {
@@ -94,6 +122,108 @@ impl FullOutput {
             }
         }
     }
+
+    #[cfg(egui_backend_event_envelope)]
+    pub(crate) fn seal_requested_provenance(&mut self) {
+        let Some(token) = self.platform_output.output_provenance_request.clone() else {
+            self.output_provenance = None;
+            return;
+        };
+        self.output_provenance = Some(FullOutputProvenance {
+            token,
+            consumed: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            snapshot: std::sync::Arc::new(FullOutputSnapshot::capture(self)),
+        });
+    }
+
+    /// Consumes the exact, content-bound provenance requested during this output's latest pass.
+    ///
+    /// This is a backend integration seam. It does not use or modify
+    /// [`PlatformOutput::presentation_token`]. Cloned outputs share one affine
+    /// consumption guard, and changes to paint, texture, hit-test, or viewport
+    /// content invalidate the proof.
+    #[cfg(egui_backend_event_envelope)]
+    pub fn consume_output_provenance(&mut self, expected: &crate::UserData) -> bool {
+        let Some(provenance) = self.output_provenance.take() else {
+            return false;
+        };
+        if provenance
+            .consumed
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .is_err()
+        {
+            self.platform_output.output_provenance_request = None;
+            return false;
+        }
+        let accepted = provenance.token == *expected && provenance.snapshot.matches(self);
+        self.platform_output.output_provenance_request = None;
+        accepted
+    }
+}
+
+#[cfg(egui_backend_event_envelope)]
+impl FullOutputSnapshot {
+    fn capture(output: &FullOutput) -> Self {
+        Self {
+            platform_output: output.platform_output.clone(),
+            textures_delta: output.textures_delta.clone(),
+            shapes: output.shapes.clone(),
+            pixels_per_point: output.pixels_per_point,
+            pointer_receiver_journal: output.pointer_receiver_journal.clone(),
+            pointer_hit_graph: output
+                .pointer_hit_graph_candidate
+                .as_ref()
+                .map(|candidate| candidate.snapshot().clone()),
+            viewport_output: output.viewport_output.clone(),
+        }
+    }
+
+    fn matches(&self, output: &FullOutput) -> bool {
+        self.platform_output == output.platform_output
+            && self.textures_delta == output.textures_delta
+            && self.shapes == output.shapes
+            && self.pixels_per_point.to_bits() == output.pixels_per_point.to_bits()
+            && self.pointer_receiver_journal == output.pointer_receiver_journal
+            && self.pointer_hit_graph.as_ref()
+                == output
+                    .pointer_hit_graph_candidate
+                    .as_ref()
+                    .map(crate::PointerHitGraphCandidate::snapshot)
+            && viewport_outputs_match(&self.viewport_output, &output.viewport_output)
+    }
+}
+
+#[cfg(egui_backend_event_envelope)]
+fn viewport_outputs_match(
+    expected: &OrderedViewportIdMap<ViewportOutput>,
+    submitted: &OrderedViewportIdMap<ViewportOutput>,
+) -> bool {
+    expected.len() == submitted.len()
+        && expected.iter().all(|(viewport, expected)| {
+            submitted.get(viewport).is_some_and(|submitted| {
+                let callbacks_match = match (
+                    expected.viewport_ui_cb.as_ref(),
+                    submitted.viewport_ui_cb.as_ref(),
+                ) {
+                    (Some(expected), Some(submitted)) => {
+                        std::sync::Arc::ptr_eq(expected, submitted)
+                    }
+                    (None, None) => true,
+                    _ => false,
+                };
+                expected.parent == submitted.parent
+                    && expected.class == submitted.class
+                    && expected.builder == submitted.builder
+                    && callbacks_match
+                    && expected.commands == submitted.commands
+                    && expected.repaint_delay == submitted.repaint_delay
+            })
+        })
 }
 
 /// Information about text being edited.
@@ -166,6 +296,10 @@ pub struct PlatformOutput {
     /// This value is ephemeral and is never serialized.
     #[cfg_attr(feature = "serde", serde(skip))]
     pub presentation_token: Option<crate::UserData>,
+
+    #[cfg(egui_backend_event_envelope)]
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub(crate) output_provenance_request: Option<crate::UserData>,
 
     /// Events that may be useful to e.g. a screen reader.
     pub events: Vec<OutputEvent>,
@@ -369,6 +503,8 @@ impl PlatformOutput {
             cursor_icon,
             cursor_image,
             presentation_token,
+            #[cfg(egui_backend_event_envelope)]
+            output_provenance_request,
             mut events,
             mutable_text_under_cursor,
             ime,
@@ -381,6 +517,10 @@ impl PlatformOutput {
         self.cursor_icon = cursor_icon;
         self.cursor_image = cursor_image;
         self.presentation_token = presentation_token;
+        #[cfg(egui_backend_event_envelope)]
+        {
+            self.output_provenance_request = output_provenance_request;
+        }
         self.events.append(&mut events);
         self.mutable_text_under_cursor = mutable_text_under_cursor;
         self.ime = ime.or(self.ime);

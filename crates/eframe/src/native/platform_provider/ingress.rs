@@ -33,6 +33,10 @@ impl NativeIngressOrdinal {
 #[derive(Debug, PartialEq)]
 pub(super) enum NativeIngressRecordKind {
     PointerEdge(NativePointerEdge),
+    ScrollEdge {
+        edge: NativePointerEdge,
+        derivative: NativeScrollDerivativeDisposition,
+    },
     KeyEdge(NativeKeyEdge),
     AccessibilityEdge(NativeAccessibilityEdge),
     CloseObservation(NativePropertyObservation<NativeCloseState>),
@@ -42,6 +46,22 @@ pub(super) enum NativeIngressRecordKind {
     RetirementQuiesced(NativeRetirementQuiesced),
     ViewportCreateResult(NativeViewportCreateResult),
     PlatformSnapshot(NativePlatformSnapshotGeneration),
+}
+
+/// Whether one scroll journal edge must have an egui wheel derivative in the hosted cycle.
+///
+/// Only the native provider can mint this fact. Consumers must not infer explicit absence by
+/// searching the derived framework input.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum NativeScrollDerivativeDisposition {
+    RequiredDerivative,
+    ExplicitNoDerivative(NativeNoScrollDerivativeReason),
+}
+
+/// Why one provider-owned scroll edge intentionally has no egui wheel derivative.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum NativeNoScrollDerivativeReason {
+    JournalOnly,
 }
 
 /// The typed fact carried by one ordered native ingress record.
@@ -142,6 +162,9 @@ impl NativeIngressRecord {
     pub const fn event(&self) -> NativeIngressEvent<'_> {
         match &self.kind {
             NativeIngressRecordKind::PointerEdge(edge) => NativeIngressEvent::PointerEdge(edge),
+            NativeIngressRecordKind::ScrollEdge { edge, .. } => {
+                NativeIngressEvent::PointerEdge(edge)
+            }
             NativeIngressRecordKind::KeyEdge(edge) => NativeIngressEvent::KeyEdge(edge),
             NativeIngressRecordKind::AccessibilityEdge(edge) => {
                 NativeIngressEvent::AccessibilityEdge(edge)
@@ -167,6 +190,15 @@ impl NativeIngressRecord {
             NativeIngressRecordKind::PlatformSnapshot(generation) => {
                 NativeIngressEvent::PlatformSnapshot(*generation)
             }
+        }
+    }
+
+    pub(crate) const fn scroll_derivative_disposition(
+        &self,
+    ) -> Option<NativeScrollDerivativeDisposition> {
+        match self.kind {
+            NativeIngressRecordKind::ScrollEdge { derivative, .. } => Some(derivative),
+            _ => None,
         }
     }
 }
@@ -316,7 +348,8 @@ pub(super) fn derive_pointer_edges(records: &[NativeIngressRecord]) -> Vec<Nativ
     records
         .iter()
         .filter_map(|record| match &record.kind {
-            NativeIngressRecordKind::PointerEdge(edge) => Some(edge.clone()),
+            NativeIngressRecordKind::PointerEdge(edge)
+            | NativeIngressRecordKind::ScrollEdge { edge, .. } => Some(edge.clone()),
             _ => None,
         })
         .collect()
@@ -387,7 +420,8 @@ pub(super) fn pointer_watermark(
     records
         .iter()
         .filter_map(|record| match &record.kind {
-            NativeIngressRecordKind::PointerEdge(edge) => Some(edge.sequence()),
+            NativeIngressRecordKind::PointerEdge(edge)
+            | NativeIngressRecordKind::ScrollEdge { edge, .. } => Some(edge.sequence()),
             _ => None,
         })
         .next_back()

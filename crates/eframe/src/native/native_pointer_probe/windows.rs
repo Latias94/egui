@@ -13,8 +13,9 @@ use windows_sys::Win32::{
 use winit::window::Window;
 
 use super::{
-    NativeAuthority, NativeCaptureOwner, NativeHoveredWindow, NativePointerRouteProbe,
-    NativeUnavailableReason, NativeViewportBinding, unknown_probe,
+    NativeAuthority, NativeCaptureOwner, NativeHoveredWindow, NativePhysicalPoint,
+    NativePointerRouteProbe, NativeUnavailableReason, NativeViewportBinding, unknown_probe,
+    without_event_time_hit,
 };
 
 fn window_handle(window: &Window) -> Option<HWND> {
@@ -52,7 +53,12 @@ pub(super) fn probe(windows: &[(NativeViewportBinding, Arc<Window>)]) -> NativeP
     };
 
     let mut point = POINT { x: 0, y: 0 };
-    let hovered = if unsafe { GetCursorPos(&mut point) } == 0 {
+    let position = if unsafe { GetCursorPos(&mut point) } == 0 {
+        NativeAuthority::unknown(NativeUnavailableReason::NotObserved)
+    } else {
+        NativeAuthority::known(NativePhysicalPoint::new(point.x, point.y))
+    };
+    let hovered = if position.value().is_none() {
         NativeAuthority::unknown(NativeUnavailableReason::NotObserved)
     } else {
         let hovered = unsafe { WindowFromPoint(point) };
@@ -86,11 +92,20 @@ pub(super) fn probe(windows: &[(NativeViewportBinding, Arc<Window>)]) -> NativeP
         }
     };
 
-    NativePointerRouteProbe { hovered, capture }
+    NativePointerRouteProbe {
+        hovered,
+        capture,
+        position,
+    }
 }
 
 pub(super) fn probe_event(
     windows: &[(NativeViewportBinding, Arc<Window>)],
+    _window: &Window,
 ) -> NativePointerRouteProbe {
-    probe(windows)
+    // `GetCursorPos` and `WindowFromPoint` observe callback-time state, not the
+    // coordinates carried by the Win32 message which winit translated. They
+    // may qualify inventory diagnostics, but cannot authorize an event-time
+    // receiver.
+    without_event_time_hit(probe(windows))
 }

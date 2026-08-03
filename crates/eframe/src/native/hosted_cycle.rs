@@ -98,6 +98,24 @@ impl HostedViewportTransactionGuard {
             .map_or_else(Vec::new, |violations| violations.borrow().clone())
     }
 
+    /// Seals violation observation before the application publication hook.
+    ///
+    /// The immediate-viewport embedding scope remains active until this guard
+    /// is dropped. Only the violation log is detached, so the publication hook
+    /// cannot create a recursive native viewport and no new recoverable failure
+    /// can appear after application state has been published.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first violation observed before the seal. The caller must
+    /// abort the hosted cycle without invoking its publication hook.
+    pub fn seal_before_application_commit(
+        &mut self,
+    ) -> Result<(), HostedImmediateViewportViolation> {
+        let violations = self.take_violations();
+        violations.first().copied().map_or(Ok(()), Err)
+    }
+
     /// Unregisters the scope and returns all violations it observed.
     pub fn finish(mut self) -> Vec<HostedImmediateViewportViolation> {
         self.take_violations()
@@ -1373,12 +1391,11 @@ impl HostedViewportCycle {
 
     /// Affinely settles the egui wheel derivative of one exact native scroll edge.
     ///
-    /// A successful settlement either removes the one correlated derivative before the viewport
-    /// begins its egui pass or proves that this backend event produced no egui derivative. The
-    /// latter is required for native test and accessibility drivers that publish directly into
-    /// the native journal. Both outcomes prevent a native protocol consumer and egui's
-    /// `WheelState` from consuming the same physical sample. Unknown, ambiguous, foreign,
-    /// mismatched, and repeated settlements fail closed.
+    /// A successful settlement either removes the one required correlated derivative before the
+    /// viewport begins its egui pass or consumes a provider-minted explicit-absence proof. Merely
+    /// failing to find a wheel event is not evidence of absence. Both outcomes prevent a native
+    /// protocol consumer and egui's `WheelState` from consuming the same physical sample.
+    /// Unknown, ambiguous, foreign, mismatched, and repeated settlements fail closed.
     pub fn claim_native_scroll_derivative(
         &self,
         binding: crate::NativeViewportBinding,
@@ -1401,26 +1418,45 @@ impl HostedViewportCycle {
         if records.next().is_some() || !native_ingress_record_matches_binding(record, binding) {
             return false;
         }
-        let Some(backend_sequence) = record.backend_event_sequence() else {
+        let Some(disposition) = record.scroll_derivative_disposition() else {
             return false;
         };
         if !self.inputs.contains_key(&binding.viewport_id()) {
             return false;
         }
-        let mut derivatives = self.inputs.iter().flat_map(|(viewport_id, input)| {
-            input
-                .events
-                .iter()
-                .enumerate()
-                .filter_map(move |(index, envelope)| {
-                    (envelope.correlation().sequence() == Some(backend_sequence)
-                        && matches!(envelope.event(), egui::Event::MouseWheel { .. }))
-                    .then_some((*viewport_id, index))
-                })
-        });
+        let mut derivatives =
+            record
+                .backend_event_sequence()
+                .into_iter()
+                .flat_map(|backend_sequence| {
+                    self.inputs.iter().flat_map(move |(viewport_id, input)| {
+                        input
+                            .events
+                            .iter()
+                            .enumerate()
+                            .filter_map(move |(index, envelope)| {
+                                (envelope.correlation().sequence() == Some(backend_sequence)
+                                    && matches!(envelope.event(), egui::Event::MouseWheel { .. }))
+                                .then_some((*viewport_id, index))
+                            })
+                    })
+                });
         let derivative = derivatives.next();
         if derivatives.next().is_some() {
             return false;
+        }
+        match disposition {
+            crate::native::platform_provider::NativeScrollDerivativeDisposition::RequiredDerivative
+                if derivative.is_none() || record.backend_event_sequence().is_none() =>
+            {
+                return false;
+            }
+            crate::native::platform_provider::NativeScrollDerivativeDisposition::ExplicitNoDerivative(
+                _,
+            ) if derivative.is_some() => {
+                return false;
+            }
+            _ => {}
         }
         let scroll_key = (binding, pointer_sequence);
         let mut settled_scroll_edges = self.settled_native_scroll_edges.lock();
@@ -1428,7 +1464,12 @@ impl HostedViewportCycle {
             return false;
         }
         let Some((derivative_viewport, raw_event_index)) = derivative else {
-            return true;
+            return matches!(
+                disposition,
+                crate::native::platform_provider::NativeScrollDerivativeDisposition::ExplicitNoDerivative(
+                    _,
+                )
+            );
         };
         if derivative_viewport != binding.viewport_id() {
             settled_scroll_edges.remove(&scroll_key);
@@ -2772,6 +2813,37 @@ mod tests {
             [HostedImmediateViewportViolation::new(attempted)],
         );
         assert_eq!(check_hosted_immediate_viewport(attempted), Ok(()));
+    }
+
+    #[test]
+    fn application_commit_seal_rejects_preexisting_violation() {
+        let attempted = ViewportId::from_hash_of("pre-commit-immediate");
+        let mut guard =
+            HostedViewportTransactionGuard::enter(crate::HostedViewportMode::Transactional);
+        assert_eq!(
+            check_hosted_immediate_viewport(attempted),
+            Err(HostedImmediateViewportViolation::new(attempted))
+        );
+
+        assert_eq!(
+            guard.seal_before_application_commit(),
+            Err(HostedImmediateViewportViolation::new(attempted))
+        );
+        assert_eq!(check_hosted_immediate_viewport(attempted), Ok(()));
+        assert!(guard.finish().is_empty());
+    }
+
+    #[test]
+    fn clean_application_commit_seal_closes_the_failure_log() {
+        let attempted = ViewportId::from_hash_of("sealed-commit-immediate");
+        let mut guard =
+            HostedViewportTransactionGuard::enter(crate::HostedViewportMode::Transactional);
+
+        guard
+            .seal_before_application_commit()
+            .expect("a clean staged cycle can enter publication");
+        assert_eq!(check_hosted_immediate_viewport(attempted), Ok(()));
+        assert!(guard.finish().is_empty());
     }
 
     #[test]

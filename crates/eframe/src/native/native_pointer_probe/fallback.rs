@@ -16,6 +16,7 @@ pub(super) fn probe(_windows: &[(NativeViewportBinding, Arc<Window>)]) -> Native
 
 pub(super) fn probe_event(
     windows: &[(NativeViewportBinding, Arc<Window>)],
+    _window: &Window,
 ) -> NativePointerRouteProbe {
     probe(windows)
 }

@@ -334,7 +334,7 @@ fn stage_and_seal(
             ));
         }
     };
-    let (mut outputs, transaction_guard) = completed.into_parts();
+    let (mut outputs, mut transaction_guard) = completed.into_parts();
 
     let viewport_outputs = outputs
         .iter()
@@ -379,7 +379,26 @@ fn stage_and_seal(
             ));
         }
     };
-    if let Some(violation) = transaction_guard.violations().first().copied() {
+    let native_ingress_commit = match native_ingress_settlement.prepare_commit() {
+        Ok(commit) => commit,
+        Err(error) => {
+            retained_effect_sink.close_and_cancel();
+            for schedule in viewport_create_schedules {
+                schedule.cancel(&retained_viewport_create_sink);
+            }
+            return Err(abort_completed_cycle(
+                HostedViewportCycleError::Runtime {
+                    source: Box::new(error),
+                },
+                outputs,
+                integration,
+                app,
+                painter,
+                presentation_results,
+            ));
+        }
+    };
+    if let Err(violation) = transaction_guard.seal_before_application_commit() {
         retained_effect_sink.close_and_cancel();
         for schedule in viewport_create_schedules {
             schedule.cancel(&retained_viewport_create_sink);
@@ -395,37 +414,29 @@ fn stage_and_seal(
             presentation_results,
         ));
     }
-    if let Err(source) = integration.commit_application_hosted_viewport_cycle(app, &mut outputs) {
-        retained_effect_sink.close_and_cancel();
-        for schedule in viewport_create_schedules {
-            schedule.cancel(&retained_viewport_create_sink);
-        }
-        return Err(abort_completed_cycle(
-            HostedViewportCycleError::CommitHook { source },
-            outputs,
-            integration,
-            app,
-            painter,
-            presentation_results,
-        ));
-    }
-    if let Err(error) = native_ingress_settlement.commit() {
-        retained_effect_sink.close_and_cancel();
-        for schedule in viewport_create_schedules {
-            schedule.cancel(&retained_viewport_create_sink);
-        }
-        return Err(abort_completed_cycle(
-            HostedViewportCycleError::Runtime {
-                source: Box::new(error),
-            },
-            outputs,
-            integration,
-            app,
-            painter,
-            presentation_results,
-        ));
-    }
+    let application_commit =
+        match integration.commit_application_hosted_viewport_cycle(app, &mut outputs) {
+            Ok(commit) => commit,
+            Err(source) => {
+                retained_effect_sink.close_and_cancel();
+                for schedule in viewport_create_schedules {
+                    schedule.cancel(&retained_viewport_create_sink);
+                }
+                return Err(abort_completed_cycle(
+                    HostedViewportCycleError::CommitHook { source },
+                    outputs,
+                    integration,
+                    app,
+                    painter,
+                    presentation_results,
+                ));
+            }
+        };
+    native_ingress_commit.commit();
     integration.commit_hosted_viewport_cycle(hosted_commit);
+    if application_commit.requests_root_repaint() {
+        integration.egui_ctx.request_repaint_of(ViewportId::ROOT);
+    }
 
     Ok(SealedGlowHostedCycle {
         outputs,
@@ -532,6 +543,7 @@ impl GlowHostedCommitter<'_> {
                 pointer_receiver_journal: _,
                 pointer_hit_graph_candidate: _,
                 viewport_output: _,
+                ..
             } = full_output;
 
             if !is_active_output_owner(&active_viewports, viewport_id) {

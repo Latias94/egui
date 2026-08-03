@@ -46,6 +46,7 @@ pub use effect::{
     NativeEffectAcknowledgement, NativeEffectCorrelation, NativeEffectDispatchOutcome,
     NativeEffectRequest, NativeEffectResult, NativePropertyObservation, NativeWindowEffect,
 };
+pub(crate) use ingress::NativeScrollDerivativeDisposition;
 pub use ingress::{
     NativeEventEnvelopeReceipt, NativeHostIngress, NativeIngressEvent, NativeIngressJournal,
     NativeIngressOrdinal, NativeIngressRecord,
