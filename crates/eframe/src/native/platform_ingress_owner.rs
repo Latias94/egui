@@ -47,10 +47,15 @@ struct WinitPointerState {
     position: NativeAuthority<NativePhysicalPoint>,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct WinitScrollSequenceState {
+    token: NativeScrollSequenceToken,
+    source: NativePointerSource,
+}
+
 #[derive(Debug)]
 struct RetiredPointerIngress {
     binding: NativeViewportBinding,
-    keys: Vec<WinitPointerKey>,
 }
 
 /// Affine proof that the Winit owner has removed every route for one retired binding.
@@ -286,7 +291,7 @@ pub(super) struct NativePlatformIngressOwner {
     windows_by_viewport: BTreeMap<ViewportId, WindowId>,
     pointer_devices: HashMap<winit::event::DeviceId, NativePointerDeviceId>,
     pointer_states: HashMap<WinitPointerKey, WinitPointerState>,
-    scroll_sequences: HashMap<WinitPointerKey, NativeScrollSequenceToken>,
+    scroll_sequences: HashMap<WinitPointerKey, WinitScrollSequenceState>,
     #[cfg(feature = "native-test-support")]
     test_pointer_state: Option<NativeTestPointerState>,
     dispatched_effects:
@@ -943,8 +948,9 @@ impl NativePlatformIngressOwner {
         };
         let source = NativePointerSource::Viewport(binding);
         let identity = self.pointer_identity(key)?;
-        let scroll = self.native_scroll_edge(
+        let (source, scroll) = self.native_scroll_edge(
             key,
+            source,
             identity.device_id(),
             sample.delta,
             sample.phase,
@@ -1137,13 +1143,14 @@ impl NativePlatformIngressOwner {
     fn native_scroll_edge(
         &mut self,
         key: WinitPointerKey,
+        source: NativePointerSource,
         device: NativePointerDeviceId,
         delta: winit::event::MouseScrollDelta,
         phase: winit::event::TouchPhase,
         modifiers: Option<NativeScrollModifiers>,
-    ) -> Result<NativeScrollEdge, NativePlatformIngressError> {
+    ) -> Result<(NativePointerSource, NativeScrollEdge), NativePlatformIngressError> {
         let delta = native_scroll_delta(delta)?;
-        let (sequence, phase) = match phase {
+        let (source, sequence, phase) = match phase {
             winit::event::TouchPhase::Started => {
                 if self.scroll_sequences.contains_key(&key) {
                     return Err(NativePlatformIngressError::ScrollSequenceOutOfOrder(phase));
@@ -1153,35 +1160,50 @@ impl NativePlatformIngressOwner {
                     .checked_add(1)
                     .ok_or(NativePlatformError::CounterExhausted)?;
                 let sequence = NativeScrollSequenceToken::new(self.next_scroll_sequence);
-                self.scroll_sequences.insert(key, sequence);
-                (Some(sequence), NativeScrollPhase::Begin)
+                self.scroll_sequences.insert(
+                    key,
+                    WinitScrollSequenceState {
+                        token: sequence,
+                        source,
+                    },
+                );
+                (source, Some(sequence), NativeScrollPhase::Begin)
             }
-            winit::event::TouchPhase::Moved => self
-                .scroll_sequences
-                .get(&key)
-                .copied()
-                .map_or((None, NativeScrollPhase::Discrete), |sequence| {
-                    (Some(sequence), NativeScrollPhase::Update)
-                }),
-            winit::event::TouchPhase::Ended => (
-                Some(
-                    self.scroll_sequences
-                        .remove(&key)
-                        .ok_or(NativePlatformIngressError::ScrollSequenceOutOfOrder(phase))?,
-                ),
-                NativeScrollPhase::End,
+            winit::event::TouchPhase::Moved => self.scroll_sequences.get(&key).copied().map_or(
+                (source, None, NativeScrollPhase::Discrete),
+                |sequence| {
+                    (
+                        sequence.source,
+                        Some(sequence.token),
+                        NativeScrollPhase::Update,
+                    )
+                },
             ),
-            winit::event::TouchPhase::Cancelled => (
-                Some(
-                    self.scroll_sequences
-                        .remove(&key)
-                        .ok_or(NativePlatformIngressError::ScrollSequenceOutOfOrder(phase))?,
-                ),
-                NativeScrollPhase::Cancel(NativeScrollCancelReason::PlatformCancelled),
-            ),
+            winit::event::TouchPhase::Ended => {
+                let sequence = self
+                    .scroll_sequences
+                    .remove(&key)
+                    .ok_or(NativePlatformIngressError::ScrollSequenceOutOfOrder(phase))?;
+                (
+                    sequence.source,
+                    Some(sequence.token),
+                    NativeScrollPhase::End,
+                )
+            }
+            winit::event::TouchPhase::Cancelled => {
+                let sequence = self
+                    .scroll_sequences
+                    .remove(&key)
+                    .ok_or(NativePlatformIngressError::ScrollSequenceOutOfOrder(phase))?;
+                (
+                    sequence.source,
+                    Some(sequence.token),
+                    NativeScrollPhase::Cancel(NativeScrollCancelReason::PlatformCancelled),
+                )
+            }
         };
         let delta = (!matches!(phase, NativeScrollPhase::Cancel(_))).then_some(delta);
-        NativeScrollEdge::new(
+        let edge = NativeScrollEdge::new(
             device,
             sequence,
             phase,
@@ -1192,7 +1214,8 @@ impl NativePlatformIngressOwner {
                 NativeAuthority::known,
             ),
         )
-        .ok_or(NativePlatformIngressError::InvalidScrollEdge)
+        .ok_or(NativePlatformIngressError::InvalidScrollEdge)?;
+        Ok((source, edge))
     }
 
     #[cfg(feature = "native-test-support")]
@@ -1508,22 +1531,38 @@ impl NativePlatformIngressOwner {
         &mut self,
         binding: NativeViewportBinding,
     ) -> Result<RetiredPointerIngress, NativePlatformIngressError> {
-        let retired_keys = self
+        let source = NativePointerSource::Viewport(binding);
+        let mut retired_keys = Vec::new();
+        let mut seen_keys = HashSet::new();
+        for key in self
             .pointer_states
             .iter()
-            .filter_map(|(key, state)| {
-                (state.source == NativePointerSource::Viewport(binding)).then_some(*key)
-            })
-            .collect::<Vec<_>>();
+            .filter_map(|(key, state)| (state.source == source).then_some(*key))
+            .chain(
+                self.scroll_sequences
+                    .iter()
+                    .filter_map(|(key, state)| (state.source == source).then_some(*key)),
+            )
+        {
+            if seen_keys.insert(key) {
+                retired_keys.push(key);
+            }
+        }
         for key in &retired_keys {
             let state = self
                 .pointer_states
                 .get(key)
-                .expect("the retired key was derived from the same pointer-state map");
-            if let Some(token) = self.scroll_sequences.get(key).copied() {
+                .cloned()
+                .ok_or(NativePlatformIngressError::IncompleteRoster)?;
+            if let Some(scroll) = self
+                .scroll_sequences
+                .get(key)
+                .copied()
+                .filter(|scroll| scroll.source == source)
+            {
                 let scroll = NativeScrollEdge::new(
                     state.identity.device_id(),
-                    Some(token),
+                    Some(scroll.token),
                     NativeScrollPhase::Cancel(NativeScrollCancelReason::DeviceRemoved),
                     None,
                     NativeAuthority::unknown(NativeUnavailableReason::Retired),
@@ -1531,13 +1570,25 @@ impl NativePlatformIngressOwner {
                 )
                 .expect("a provider-owned scroll cancellation has a legal terminal shape");
                 self.coordinator.lock().record_terminal_pointer_edge(
-                    state.source,
+                    source,
                     state.identity,
                     NativePointerEdgeKind::Scrolled(scroll),
                 )?;
+                self.scroll_sequences.remove(key);
             }
-            self.pointer_states.remove(key);
-            self.scroll_sequences.remove(key);
+            if state.source == source {
+                if let Some(scroll) = self.scroll_sequences.get(key).copied() {
+                    self.pointer_states.insert(
+                        *key,
+                        WinitPointerState {
+                            source: scroll.source,
+                            ..state
+                        },
+                    );
+                } else {
+                    self.pointer_states.remove(key);
+                }
+            }
         }
         #[cfg(feature = "native-test-support")]
         if self
@@ -1553,24 +1604,23 @@ impl NativePlatformIngressOwner {
         if self.capture.value() == Some(&NativeCaptureOwner::Viewport(binding)) {
             self.capture = NativeAuthority::unknown(NativeUnavailableReason::Retired);
         }
-        Ok(RetiredPointerIngress {
-            binding,
-            keys: retired_keys,
-        })
+        Ok(RetiredPointerIngress { binding })
     }
 
     fn validate_binding_ingress_quiescence(
         &self,
         retired_pointer_ingress: RetiredPointerIngress,
     ) -> Result<NativeBindingIngressOwnerQuiescence, NativePlatformIngressError> {
-        let RetiredPointerIngress { binding, keys } = retired_pointer_ingress;
+        let RetiredPointerIngress { binding } = retired_pointer_ingress;
+        let source = NativePointerSource::Viewport(binding);
         let pointer_routes_clear = self
             .pointer_states
             .values()
-            .all(|state| state.source != NativePointerSource::Viewport(binding))
-            && keys.iter().all(|key| {
-                !self.pointer_states.contains_key(key) && !self.scroll_sequences.contains_key(key)
-            })
+            .all(|state| state.source != source)
+            && self
+                .scroll_sequences
+                .values()
+                .all(|state| state.source != source)
             && self
                 .scroll_sequences
                 .keys()
@@ -2362,12 +2412,20 @@ mod tests {
                 position: NativeAuthority::unknown(NativeUnavailableReason::NotObserved),
             },
         );
-        owner
-            .scroll_sequences
-            .insert(retired_key, NativeScrollSequenceToken::new(11));
-        owner
-            .scroll_sequences
-            .insert(unrelated_key, NativeScrollSequenceToken::new(12));
+        owner.scroll_sequences.insert(
+            retired_key,
+            WinitScrollSequenceState {
+                token: NativeScrollSequenceToken::new(11),
+                source: NativePointerSource::Viewport(binding),
+            },
+        );
+        owner.scroll_sequences.insert(
+            unrelated_key,
+            WinitScrollSequenceState {
+                token: NativeScrollSequenceToken::new(12),
+                source: NativePointerSource::Foreign,
+            },
+        );
 
         let ingress = owner.freeze_facts(&[]).unwrap();
 
@@ -2428,6 +2486,76 @@ mod tests {
     }
 
     #[test]
+    fn scroll_sequence_keeps_its_exact_source_when_pointer_state_moves_elsewhere() {
+        let mut owner = NativePlatformIngressOwner::default();
+        let viewport_id = viewport("retired-scroll-owner");
+        let initial = facts(window_id(), viewport_id, false);
+        let binding = owner
+            .freeze_facts(std::slice::from_ref(&initial))
+            .unwrap()
+            .platform()
+            .inventory()[0];
+        let key = mouse_pointer_key();
+        let identity =
+            NativePointerIdentity::new(NativePointerDeviceId::new(9), NativePointerId::new(1));
+        owner.pointer_states.insert(
+            key,
+            WinitPointerState {
+                identity,
+                source: NativePointerSource::Foreign,
+                position: NativeAuthority::unknown(NativeUnavailableReason::NotObserved),
+            },
+        );
+        owner.scroll_sequences.insert(
+            key,
+            WinitScrollSequenceState {
+                token: NativeScrollSequenceToken::new(11),
+                source: NativePointerSource::Viewport(binding),
+            },
+        );
+
+        let ingress = owner.freeze_facts(&[]).unwrap();
+        let records = ingress.ordered().records();
+        let cancel = records
+            .iter()
+            .position(|record| {
+                matches!(
+                    record.event(),
+                    crate::NativeIngressEvent::PointerEdge(edge)
+                        if edge.source() == NativePointerSource::Viewport(binding)
+                            && matches!(
+                                edge.kind(),
+                                NativePointerEdgeKind::Scrolled(scroll)
+                                    if scroll.sequence() == Some(NativeScrollSequenceToken::new(11))
+                                        && scroll.phase()
+                                            == NativeScrollPhase::Cancel(
+                                                NativeScrollCancelReason::DeviceRemoved,
+                                            )
+                            )
+                )
+            })
+            .expect("retiring the frozen owner emits its exact scroll terminal");
+        let quiesced = records
+            .iter()
+            .position(|record| {
+                matches!(
+                    record.event(),
+                    crate::NativeIngressEvent::BindingIngressQuiesced(proof)
+                        if proof.binding() == binding
+                )
+            })
+            .expect("scroll terminal precedes full binding quiescence");
+
+        assert!(cancel < quiesced);
+        assert!(!owner.scroll_sequences.contains_key(&key));
+        assert_eq!(
+            owner.pointer_states.get(&key).map(|state| state.source),
+            Some(NativePointerSource::Foreign),
+            "the current non-retired pointer route remains live",
+        );
+    }
+
+    #[test]
     fn wheel_position_never_falls_back_to_retained_cursor_state() {
         let mut owner = NativePlatformIngressOwner::default();
         let viewport_id = viewport("wheel-position");
@@ -2472,17 +2600,43 @@ mod tests {
         let key = mouse_pointer_key();
         let device = NativePointerDeviceId::new(7);
         let delta = winit::event::MouseScrollDelta::LineDelta(1.0, -2.0);
+        let source = NativePointerSource::Foreign;
 
-        let begin = owner
-            .native_scroll_edge(key, device, delta, winit::event::TouchPhase::Started, None)
+        let (begin_source, begin) = owner
+            .native_scroll_edge(
+                key,
+                source,
+                device,
+                delta,
+                winit::event::TouchPhase::Started,
+                None,
+            )
             .unwrap();
-        let update = owner
-            .native_scroll_edge(key, device, delta, winit::event::TouchPhase::Moved, None)
+        let (update_source, update) = owner
+            .native_scroll_edge(
+                key,
+                source,
+                device,
+                delta,
+                winit::event::TouchPhase::Moved,
+                None,
+            )
             .unwrap();
-        let end = owner
-            .native_scroll_edge(key, device, delta, winit::event::TouchPhase::Ended, None)
+        let (end_source, end) = owner
+            .native_scroll_edge(
+                key,
+                source,
+                device,
+                delta,
+                winit::event::TouchPhase::Ended,
+                None,
+            )
             .unwrap();
 
+        assert_eq!(
+            (begin_source, update_source, end_source),
+            (source, source, source)
+        );
         assert_eq!(begin.phase(), NativeScrollPhase::Begin);
         assert_eq!(update.phase(), NativeScrollPhase::Update);
         assert_eq!(end.phase(), NativeScrollPhase::End);
@@ -2498,9 +2652,10 @@ mod tests {
     #[test]
     fn moved_wheel_without_a_session_start_is_discrete() {
         let mut owner = NativePlatformIngressOwner::default();
-        let scroll = owner
+        let (_, scroll) = owner
             .native_scroll_edge(
                 mouse_pointer_key(),
+                NativePointerSource::Foreign,
                 NativePointerDeviceId::new(9),
                 winit::event::MouseScrollDelta::PixelDelta(winit::dpi::PhysicalPosition::new(
                     3.0, -4.0,
@@ -2528,6 +2683,7 @@ mod tests {
         let error = owner
             .native_scroll_edge(
                 mouse_pointer_key(),
+                NativePointerSource::Foreign,
                 NativePointerDeviceId::new(11),
                 winit::event::MouseScrollDelta::LineDelta(0.0, 1.0),
                 winit::event::TouchPhase::Ended,
