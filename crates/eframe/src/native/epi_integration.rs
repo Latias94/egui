@@ -213,7 +213,6 @@ pub struct EpiIntegration {
     pub beginning: Instant,
     is_first_frame: bool,
     pub egui_ctx: egui::Context,
-    pending_full_output: egui::FullOutput,
     aborted_full_outputs: Vec<crate::HostedViewportOutput<egui::FullOutput>>,
 
     root_close: RootCloseLifecycle,
@@ -272,7 +271,6 @@ impl EpiIntegration {
         Self {
             frame,
             last_auto_save: Instant::now(),
-            pending_full_output: Default::default(),
             aborted_full_outputs: Vec::new(),
             root_close: RootCloseLifecycle::default(),
             can_drag_window: false,
@@ -453,8 +451,7 @@ impl EpiIntegration {
             self.root_close.request();
         }
 
-        self.pending_full_output.append(full_output);
-        Ok(std::mem::take(&mut self.pending_full_output))
+        Ok(full_output)
     }
 
     pub fn report_frame_time(&mut self, seconds: f32) {
@@ -619,7 +616,6 @@ mod hosted_viewport_ui_tests {
             beginning: Instant::now(),
             is_first_frame: false,
             egui_ctx: egui::Context::default(),
-            pending_full_output: egui::FullOutput::default(),
             aborted_full_outputs: Vec::new(),
             root_close: RootCloseLifecycle::default(),
             can_drag_window: false,
@@ -630,6 +626,39 @@ mod hosted_viewport_ui_tests {
                 None,
             ),
         }
+    }
+
+    #[cfg(egui_backend_event_envelope)]
+    #[test]
+    fn prepared_update_preserves_the_exact_full_output_provenance() {
+        struct OutputProofApp {
+            proof: egui::UserData,
+        }
+
+        impl epi::App for OutputProofApp {
+            fn ui(&mut self, _ui: &mut egui::Ui, _frame: &mut epi::Frame) {}
+
+            fn hosted_viewport_ui(
+                &mut self,
+                _viewport_id: ViewportId,
+                ui: &mut egui::Ui,
+                _frame: &mut epi::Frame,
+            ) -> crate::HostedViewportAppResult<crate::HostedViewportUiDisposition> {
+                ui.ctx().request_output_provenance(self.proof.clone());
+                Ok(crate::HostedViewportUiDisposition::Handled)
+            }
+        }
+
+        let proof = egui::UserData::new("prepared-update-output-proof");
+        let mut app = OutputProofApp {
+            proof: proof.clone(),
+        };
+        let mut integration = test_integration();
+        let mut output = integration
+            .update_prepared(&mut app, None, egui::RawInput::default())
+            .expect("the prepared hosted update succeeds");
+
+        assert!(output.consume_output_provenance(&proof));
     }
 
     #[test]
