@@ -47,6 +47,37 @@ struct WinitPointerState {
     position: NativeAuthority<NativePhysicalPoint>,
 }
 
+#[derive(Debug)]
+struct RetiredPointerIngress {
+    binding: NativeViewportBinding,
+    keys: Vec<WinitPointerKey>,
+}
+
+/// Affine proof that the Winit owner has removed every route for one retired binding.
+///
+/// The coordinator accepts this proof before it can publish a public binding-ingress
+/// quiescence fact. Its constructor remains private to this owner module so coordinator
+/// state alone cannot claim that Winit-owned routes are gone.
+#[derive(Debug)]
+pub(super) struct NativeBindingIngressOwnerQuiescence {
+    binding: NativeViewportBinding,
+}
+
+impl NativeBindingIngressOwnerQuiescence {
+    fn validated(binding: NativeViewportBinding) -> Self {
+        Self { binding }
+    }
+
+    pub(super) const fn into_binding(self) -> NativeViewportBinding {
+        self.binding
+    }
+
+    #[cfg(test)]
+    pub(super) fn for_coordinator_test(binding: NativeViewportBinding) -> Self {
+        Self::validated(binding)
+    }
+}
+
 /// One deliberately single-pointer test stream.
 ///
 /// The default-disabled test driver has no API for supplying a device, pointer, capture owner,
@@ -1432,7 +1463,7 @@ impl NativePlatformIngressOwner {
             })
             .collect::<Vec<_>>();
         for (window_id, binding) in retired {
-            self.retire_pointer_state(binding)?;
+            let retired_pointer_ingress = self.retire_pointer_state(binding)?;
             let lifecycle = self
                 .dispatched_effects
                 .get(&(binding, NativeEffectProperty::Lifecycle));
@@ -1448,6 +1479,10 @@ impl NativePlatformIngressOwner {
             self.close_states.remove(&binding);
             self.window_bindings.remove(&window_id);
             self.windows_by_viewport.remove(&binding.viewport_id());
+            let quiescence = self.validate_binding_ingress_quiescence(retired_pointer_ingress)?;
+            self.coordinator
+                .lock()
+                .confirm_binding_ingress_quiescence(quiescence)?;
         }
 
         for facts in facts {
@@ -1472,7 +1507,7 @@ impl NativePlatformIngressOwner {
     fn retire_pointer_state(
         &mut self,
         binding: NativeViewportBinding,
-    ) -> Result<(), NativePlatformIngressError> {
+    ) -> Result<RetiredPointerIngress, NativePlatformIngressError> {
         let retired_keys = self
             .pointer_states
             .iter()
@@ -1480,12 +1515,12 @@ impl NativePlatformIngressOwner {
                 (state.source == NativePointerSource::Viewport(binding)).then_some(*key)
             })
             .collect::<Vec<_>>();
-        for key in retired_keys {
+        for key in &retired_keys {
             let state = self
                 .pointer_states
-                .get(&key)
+                .get(key)
                 .expect("the retired key was derived from the same pointer-state map");
-            if let Some(token) = self.scroll_sequences.get(&key).copied() {
+            if let Some(token) = self.scroll_sequences.get(key).copied() {
                 let scroll = NativeScrollEdge::new(
                     state.identity.device_id(),
                     Some(token),
@@ -1501,8 +1536,8 @@ impl NativePlatformIngressOwner {
                     NativePointerEdgeKind::Scrolled(scroll),
                 )?;
             }
-            self.pointer_states.remove(&key);
-            self.scroll_sequences.remove(&key);
+            self.pointer_states.remove(key);
+            self.scroll_sequences.remove(key);
         }
         #[cfg(feature = "native-test-support")]
         if self
@@ -1518,7 +1553,60 @@ impl NativePlatformIngressOwner {
         if self.capture.value() == Some(&NativeCaptureOwner::Viewport(binding)) {
             self.capture = NativeAuthority::unknown(NativeUnavailableReason::Retired);
         }
-        Ok(())
+        Ok(RetiredPointerIngress {
+            binding,
+            keys: retired_keys,
+        })
+    }
+
+    fn validate_binding_ingress_quiescence(
+        &self,
+        retired_pointer_ingress: RetiredPointerIngress,
+    ) -> Result<NativeBindingIngressOwnerQuiescence, NativePlatformIngressError> {
+        let RetiredPointerIngress { binding, keys } = retired_pointer_ingress;
+        let pointer_routes_clear = self
+            .pointer_states
+            .values()
+            .all(|state| state.source != NativePointerSource::Viewport(binding))
+            && keys.iter().all(|key| {
+                !self.pointer_states.contains_key(key) && !self.scroll_sequences.contains_key(key)
+            })
+            && self
+                .scroll_sequences
+                .keys()
+                .all(|key| self.pointer_states.contains_key(key));
+        #[cfg(feature = "native-test-support")]
+        let pointer_routes_clear = pointer_routes_clear
+            && self
+                .test_pointer_state
+                .as_ref()
+                .is_none_or(|state| state.capture_owner != Some(binding));
+        let global_routes_clear = self.hovered.value()
+            != Some(&NativeHoveredWindow::Viewport(binding))
+            && self.capture.value() != Some(&NativeCaptureOwner::Viewport(binding));
+        let effects_clear = self
+            .dispatched_effects
+            .keys()
+            .all(|(pending_binding, _)| *pending_binding != binding);
+        let close_clear = !self.close_states.contains_key(&binding);
+        let window_routes_clear = self
+            .window_bindings
+            .values()
+            .all(|routed_binding| *routed_binding != binding)
+            && !self
+                .windows_by_viewport
+                .contains_key(&binding.viewport_id());
+
+        if pointer_routes_clear
+            && global_routes_clear
+            && effects_clear
+            && close_clear
+            && window_routes_clear
+        {
+            Ok(NativeBindingIngressOwnerQuiescence::validated(binding))
+        } else {
+            Err(NativePlatformIngressError::IncompleteRoster)
+        }
     }
 
     fn binding_for(
@@ -2313,7 +2401,18 @@ mod tests {
                 )
             })
             .expect("the viewport retirement remains present");
+        let binding_quiesced = records
+            .iter()
+            .position(|record| {
+                matches!(
+                    record.event(),
+                    crate::NativeIngressEvent::BindingIngressQuiesced(quiesced)
+                        if quiesced.binding() == binding
+                )
+            })
+            .expect("full owner cleanup publishes exact binding ingress quiescence");
         assert!(cancel < retirement);
+        assert!(retirement < binding_quiesced);
 
         assert!(!owner.pointer_states.contains_key(&retired_key));
         assert!(!owner.scroll_sequences.contains_key(&retired_key));
@@ -2529,6 +2628,28 @@ mod tests {
         assert_ne!(first_binding, second_binding);
         assert_eq!(retired.retirement_tombstones().len(), 1);
         assert_eq!(retired.retirement_tombstones()[0].binding(), first_binding);
+        assert_eq!(retired.binding_ingress_quiescences().len(), 1);
+        assert_eq!(
+            retired.binding_ingress_quiescences()[0].binding(),
+            first_binding
+        );
+        assert!(
+            owner
+                .window_bindings
+                .values()
+                .all(|binding| *binding != first_binding)
+        );
+        assert!(
+            owner
+                .dispatched_effects
+                .keys()
+                .all(|(binding, _)| *binding != first_binding)
+        );
+        assert!(!owner.close_states.contains_key(&first_binding));
+        assert!(matches!(
+            owner.coordinator.lock().begin_presentation(first_binding),
+            Err(NativePlatformError::UnknownBinding)
+        ));
     }
 
     #[test]
@@ -2793,6 +2914,8 @@ mod tests {
                 .and_then(|value| value.user_data().downcast_ref::<&str>()),
             Some(&"destroy-window")
         );
+        assert_eq!(retired.binding_ingress_quiescences().len(), 1);
+        assert_eq!(retired.binding_ingress_quiescences()[0].binding(), binding);
         assert!(owner.dispatched_effects.is_empty());
     }
 

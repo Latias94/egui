@@ -7,7 +7,9 @@ use super::{
     effect::{NativeEffectResult, NativePropertyObservation},
     keyboard::NativeKeyEdge,
     pointer::{NativePointerEdge, NativePointerJournal},
-    presentation::{NativePresentationResult, NativeRetirementQuiesced, NativeRetirementTombstone},
+    presentation::{
+        NativeBindingIngressQuiesced, NativePresentationResult, NativeRetirementTombstone,
+    },
     snapshot::{NativePlatformSnapshot, NativePlatformSnapshotGeneration},
 };
 
@@ -43,7 +45,7 @@ pub(super) enum NativeIngressRecordKind {
     EffectResult(NativeEffectResult),
     PresentationResult(NativePresentationResult),
     Retirement(NativeRetirementTombstone),
-    RetirementQuiesced(NativeRetirementQuiesced),
+    BindingIngressQuiesced(NativeBindingIngressQuiesced),
     ViewportCreateResult(NativeViewportCreateResult),
     PlatformSnapshot(NativePlatformSnapshotGeneration),
 }
@@ -81,8 +83,8 @@ pub enum NativeIngressEvent<'a> {
     PresentationResult(&'a NativePresentationResult),
     /// An exact native viewport retirement.
     Retirement(&'a NativeRetirementTombstone),
-    /// Proof that a retired viewport's presentation queue is empty.
-    RetirementQuiesced(&'a NativeRetirementQuiesced),
+    /// Proof that every ingress route for a retired viewport is quiescent.
+    BindingIngressQuiesced(&'a NativeBindingIngressQuiesced),
     /// The scheduling result for a logical viewport without a binding.
     ViewportCreateResult(&'a NativeViewportCreateResult),
     /// The complete platform snapshot frozen after all preceding records.
@@ -181,8 +183,8 @@ impl NativeIngressRecord {
             NativeIngressRecordKind::Retirement(tombstone) => {
                 NativeIngressEvent::Retirement(tombstone)
             }
-            NativeIngressRecordKind::RetirementQuiesced(quiesced) => {
-                NativeIngressEvent::RetirementQuiesced(quiesced)
+            NativeIngressRecordKind::BindingIngressQuiesced(quiesced) => {
+                NativeIngressEvent::BindingIngressQuiesced(quiesced)
             }
             NativeIngressRecordKind::ViewportCreateResult(result) => {
                 NativeIngressEvent::ViewportCreateResult(result)
@@ -253,7 +255,7 @@ pub struct NativeHostIngress {
     pub(super) effect_results: Vec<NativeEffectResult>,
     pub(super) presentation_results: Vec<NativePresentationResult>,
     pub(super) retirement_tombstones: Vec<NativeRetirementTombstone>,
-    pub(super) retirement_quiescences: Vec<NativeRetirementQuiesced>,
+    pub(super) binding_ingress_quiescences: Vec<NativeBindingIngressQuiesced>,
     pub(super) viewport_create_results: Vec<NativeViewportCreateResult>,
 }
 
@@ -329,11 +331,11 @@ impl NativeHostIngress {
         &self.retirement_tombstones
     }
 
-    /// Return presentation-queue quiescence proofs recorded during this cycle.
+    /// Return exact binding-ingress quiescence proofs recorded during this cycle.
     ///
     /// This compatibility view is derived from [`Self::ordered`].
-    pub fn retirement_quiescences(&self) -> &[NativeRetirementQuiesced] {
-        &self.retirement_quiescences
+    pub fn binding_ingress_quiescences(&self) -> &[NativeBindingIngressQuiesced] {
+        &self.binding_ingress_quiescences
     }
 
     /// Return native viewport scheduling results recorded during this cycle.
@@ -389,13 +391,13 @@ pub(super) fn derive_retirement_tombstones(
         .collect()
 }
 
-pub(super) fn derive_retirement_quiescences(
+pub(super) fn derive_binding_ingress_quiescences(
     records: &[NativeIngressRecord],
-) -> Vec<NativeRetirementQuiesced> {
+) -> Vec<NativeBindingIngressQuiesced> {
     records
         .iter()
         .filter_map(|record| match &record.kind {
-            NativeIngressRecordKind::RetirementQuiesced(quiesced) => Some(*quiesced),
+            NativeIngressRecordKind::BindingIngressQuiesced(quiesced) => Some(*quiesced),
             _ => None,
         })
         .collect()

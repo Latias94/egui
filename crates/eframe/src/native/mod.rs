@@ -212,6 +212,7 @@ mod tests {
     use super::{
         PendingPresentation, PresentationResults,
         hosted_cycle::pointer_hit_graph_candidate_for_hosted_output,
+        platform_ingress_owner::NativeBindingIngressOwnerQuiescence,
         platform_provider::NativePlatformCoordinator,
     };
 
@@ -476,6 +477,12 @@ mod tests {
             Some(egui::UserData::new("retired-drop")),
         );
         coordinator.lock().retire_viewport(binding).unwrap();
+        coordinator
+            .lock()
+            .confirm_binding_ingress_quiescence(
+                NativeBindingIngressOwnerQuiescence::for_coordinator_test(binding),
+            )
+            .unwrap();
 
         drop(pending);
 
@@ -489,8 +496,8 @@ mod tests {
             .unwrap();
         let ingress = coordinator.freeze_host_ingress().unwrap();
         assert_eq!(ingress.presentation_results().len(), 1);
-        assert_eq!(ingress.retirement_quiescences().len(), 1);
-        assert_eq!(ingress.retirement_quiescences()[0].binding(), binding);
+        assert_eq!(ingress.binding_ingress_quiescences().len(), 1);
+        assert_eq!(ingress.binding_ingress_quiescences()[0].binding(), binding);
     }
 
     #[test]

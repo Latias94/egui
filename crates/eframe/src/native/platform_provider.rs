@@ -58,7 +58,7 @@ pub use pointer::{
 };
 pub(crate) use presentation::NativePresentationTicket;
 pub use presentation::{
-    NativePresentationResult, NativePresentationSerial, NativeRetirementQuiesced,
+    NativeBindingIngressQuiesced, NativePresentationResult, NativePresentationSerial,
     NativeRetirementTombstone,
 };
 pub use scroll::{

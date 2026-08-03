@@ -74,20 +74,23 @@ impl NativePresentationResult {
     }
 }
 
-/// Proof that the presentation queue for one retired viewport is empty.
+/// Proof that every ingress route for one retired viewport is quiescent.
 ///
 /// This fact does not retire the native viewport. [`NativeRetirementTombstone`]
-/// does that. It only proves that every presentation ticket minted for the
-/// exact retired binding has reached a terminal renderer result or drop path.
+/// does that. It proves that the Winit owner no longer retains pointer, scroll,
+/// effect, close, or window routes for the exact binding, and that every
+/// coordinator-owned effect and presentation lane is terminal. The provider
+/// may therefore reclaim the binding's retained ABA guards after the host
+/// commits the enclosing ingress batch.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct NativeRetirementQuiesced {
+pub struct NativeBindingIngressQuiesced {
     pub(super) binding: NativeViewportBinding,
     pub(super) retirement_generation: NativePlatformGeneration,
     pub(super) last_started_presentation: Option<NativePresentationSerial>,
 }
 
-impl NativeRetirementQuiesced {
-    /// Return the exact retired viewport lifetime whose queue is empty.
+impl NativeBindingIngressQuiesced {
+    /// Return the exact retired viewport lifetime whose ingress is quiescent.
     pub const fn binding(self) -> NativeViewportBinding {
         self.binding
     }

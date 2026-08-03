@@ -315,6 +315,10 @@ pub enum NativePlatformError {
     HostIngressPoisoned,
     /// A host-ingress settlement ticket does not name the prepared batch.
     HostIngressSettlementMismatch,
+    /// The binding still has coordinator-owned ingress authority.
+    BindingIngressNotQuiescent,
+    /// The binding's owner-quiescence proof was already consumed.
+    BindingIngressAlreadyQuiesced,
     /// A monotonically increasing identity was exhausted.
     CounterExhausted,
 }
@@ -354,6 +358,12 @@ impl std::fmt::Display for NativePlatformError {
             Self::HostIngressPoisoned => "a fatal hosted-cycle abort poisoned native host ingress",
             Self::HostIngressSettlementMismatch => {
                 "native host-ingress settlement does not match the prepared batch"
+            }
+            Self::BindingIngressNotQuiescent => {
+                "native binding still has live coordinator-owned ingress authority"
+            }
+            Self::BindingIngressAlreadyQuiesced => {
+                "native binding ingress quiescence was already confirmed"
             }
             Self::CounterExhausted => "native platform monotonic counter was exhausted",
         })

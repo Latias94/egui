@@ -1184,7 +1184,7 @@ fn native_ingress_record_matches_binding(
         crate::NativeIngressEvent::EffectResult(_)
         | crate::NativeIngressEvent::PresentationResult(_)
         | crate::NativeIngressEvent::Retirement(_)
-        | crate::NativeIngressEvent::RetirementQuiesced(_)
+        | crate::NativeIngressEvent::BindingIngressQuiesced(_)
         | crate::NativeIngressEvent::ViewportCreateResult(_)
         | crate::NativeIngressEvent::PlatformSnapshot(_) => false,
     }

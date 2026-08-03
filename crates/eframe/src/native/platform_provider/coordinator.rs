@@ -2,6 +2,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use crate::native::platform_ingress_owner::NativeBindingIngressOwnerQuiescence;
+
 use super::{
     accessibility::NativeAccessibilityEdge,
     authority::{
@@ -24,9 +26,9 @@ use super::{
     ingress::{
         NativeHostIngress, NativeIngressJournal, NativeIngressOrdinal, NativeIngressRecord,
         NativeIngressRecordKind, NativeNoScrollDerivativeReason, NativeScrollDerivativeDisposition,
-        derive_effect_results, derive_pointer_edges, derive_presentation_results,
-        derive_retirement_quiescences, derive_retirement_tombstones,
-        derive_viewport_create_results, pointer_watermark,
+        derive_binding_ingress_quiescences, derive_effect_results, derive_pointer_edges,
+        derive_presentation_results, derive_retirement_tombstones, derive_viewport_create_results,
+        pointer_watermark,
     },
     keyboard::NativeKeyEdge,
     pointer::{
@@ -34,7 +36,7 @@ use super::{
         NativePointerIdentity, NativePointerJournal, NativePointerSource,
     },
     presentation::{
-        NativePresentationSerial, NativePresentationTicket, NativeRetirementQuiesced,
+        NativeBindingIngressQuiesced, NativePresentationSerial, NativePresentationTicket,
         NativeRetirementTombstone,
     },
     snapshot::{
@@ -51,6 +53,7 @@ pub(crate) struct NativePlatformCoordinator {
     active: BTreeMap<egui::ViewportId, NativeViewportBinding>,
     minted: BTreeSet<NativeViewportBinding>,
     tombstones: BTreeMap<NativeViewportBinding, NativeRetirementTombstone>,
+    retired_binding_ingress: BTreeMap<NativeViewportBinding, RetiredBindingIngressState>,
     inventory_generation: u64,
     snapshot_generation: u64,
     next_incarnation: u64,
@@ -72,7 +75,7 @@ pub(crate) struct NativePlatformCoordinator {
     pending_global_facts: Option<PendingGlobalFacts>,
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Debug, Default)]
 enum HostIngressSettlementState {
     #[default]
     Idle,
@@ -80,12 +83,13 @@ enum HostIngressSettlementState {
     Poisoned,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 struct PreparedHostIngressSettlement {
     key: NativeHostIngressSettlementKey,
     snapshot_generation: u64,
     ingress_through: u64,
     pointer_through: u64,
+    quiesced_bindings: BTreeSet<NativeViewportBinding>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -108,6 +112,13 @@ struct NativePresentationLane {
     outstanding: BTreeSet<NativePresentationSerial>,
     last_started: Option<NativePresentationSerial>,
     retired: bool,
+}
+
+#[derive(Debug)]
+struct RetiredBindingIngressState {
+    retirement_generation: NativePlatformGeneration,
+    last_started_presentation: Option<NativePresentationSerial>,
+    owner_quiesced: bool,
 }
 
 pub(crate) type SharedNativePlatformCoordinator =
@@ -273,15 +284,6 @@ impl NativePlatformCoordinator {
             .map(|lane| lane.outstanding.is_empty())
             .unwrap_or(true);
         let last_started_presentation = presentation_lane.and_then(|lane| lane.last_started);
-        let quiescence_ordinal = presentation_is_quiescent
-            .then(|| {
-                ordinal
-                    .get()
-                    .checked_add(1)
-                    .map(NativeIngressOrdinal::new)
-                    .ok_or(NativePlatformError::CounterExhausted)
-            })
-            .transpose()?;
         let acknowledgement = match acknowledgement {
             ObservationAcknowledgement::Baseline => NativeEffectAcknowledgement::baseline(),
             ObservationAcknowledgement::Unknown(reason) => {
@@ -300,6 +302,14 @@ impl NativePlatformCoordinator {
             acknowledgement,
         };
         self.tombstones.insert(binding, tombstone.clone());
+        self.retired_binding_ingress.insert(
+            binding,
+            RetiredBindingIngressState {
+                retirement_generation: generation,
+                last_started_presentation,
+                owner_quiesced: false,
+            },
+        );
         if presentation_is_quiescent {
             self.presentation_lanes.remove(&binding);
         } else {
@@ -310,21 +320,61 @@ impl NativePlatformCoordinator {
             backend_event_sequence,
             NativeIngressRecordKind::Retirement(tombstone.clone()),
         );
-        if let Some(quiescence_ordinal) = quiescence_ordinal {
-            self.commit_ingress_record(
-                quiescence_ordinal,
-                None,
-                NativeIngressRecordKind::RetirementQuiesced(NativeRetirementQuiesced {
-                    binding,
-                    retirement_generation: generation,
-                    last_started_presentation,
-                }),
-            );
-        }
         self.pending_effects
             .retain(|(pending_binding, _), _| *pending_binding != binding);
         self.invalidate_staged_platform_snapshot();
         Ok(tombstone)
+    }
+
+    pub(in crate::native) fn confirm_binding_ingress_quiescence(
+        &mut self,
+        proof: NativeBindingIngressOwnerQuiescence,
+    ) -> Result<(), NativePlatformError> {
+        let binding = proof.into_binding();
+        if self.active.values().any(|active| *active == binding)
+            || self
+                .pending_effects
+                .keys()
+                .any(|(pending_binding, _)| *pending_binding == binding)
+            || self.pending_window_snapshots.contains_key(&binding)
+        {
+            return Err(NativePlatformError::BindingIngressNotQuiescent);
+        }
+        let presentation_lane = self.presentation_lanes.get(&binding);
+        if presentation_lane.is_some_and(|lane| !lane.retired) {
+            return Err(NativePlatformError::BindingIngressNotQuiescent);
+        }
+        let presentation_is_quiescent =
+            presentation_lane.is_none_or(|lane| lane.outstanding.is_empty());
+        let quiescence_ordinal = presentation_is_quiescent
+            .then(|| self.next_ingress_ordinal())
+            .transpose()?;
+        let state = self
+            .retired_binding_ingress
+            .get_mut(&binding)
+            .ok_or(NativePlatformError::BindingIngressAlreadyQuiesced)?;
+        if state.owner_quiesced {
+            return Err(NativePlatformError::BindingIngressAlreadyQuiesced);
+        }
+        state.owner_quiesced = true;
+
+        if let Some(ordinal) = quiescence_ordinal {
+            let state = self
+                .retired_binding_ingress
+                .remove(&binding)
+                .ok_or(NativePlatformError::BindingIngressAlreadyQuiesced)?;
+            self.presentation_lanes.remove(&binding);
+            self.commit_ingress_record(
+                ordinal,
+                None,
+                NativeIngressRecordKind::BindingIngressQuiesced(NativeBindingIngressQuiesced {
+                    binding,
+                    retirement_generation: state.retirement_generation,
+                    last_started_presentation: state.last_started_presentation,
+                }),
+            );
+        }
+        Ok(())
     }
 
     pub(crate) fn active_binding(
@@ -1011,21 +1061,19 @@ impl NativePlatformCoordinator {
 
         let viewport_matches = result.viewport_id() == binding.viewport_id;
         let retires_queue = lane.retired && lane.outstanding.len() == 1;
-        let last_started_presentation = lane.last_started;
-        let retirement_generation = if retires_queue {
-            Some(
-                self.tombstones
-                    .get(&binding)
-                    .ok_or(NativePlatformError::RetiredBinding)?
-                    .generation,
-            )
+        let binding_ingress_quiescence = if retires_queue {
+            self.retired_binding_ingress
+                .get(&binding)
+                .filter(|state| state.owner_quiesced)
+                .map(|state| (state.retirement_generation, state.last_started_presentation))
         } else {
             None
         };
         let result_ordinal = viewport_matches
             .then(|| self.next_ingress_ordinal())
             .transpose()?;
-        let quiescence_ordinal = retires_queue
+        let quiescence_ordinal = binding_ingress_quiescence
+            .is_some()
             .then(|| {
                 result_ordinal
                     .map_or(self.ingress_ordinal, NativeIngressOrdinal::get)
@@ -1056,13 +1104,14 @@ impl NativePlatformCoordinator {
                 NativeIngressRecordKind::PresentationResult(result),
             );
         }
-        if let (Some(ordinal), Some(retirement_generation)) =
-            (quiescence_ordinal, retirement_generation)
+        if let (Some(ordinal), Some((retirement_generation, last_started_presentation))) =
+            (quiescence_ordinal, binding_ingress_quiescence)
         {
+            self.retired_binding_ingress.remove(&binding);
             self.commit_ingress_record(
                 ordinal,
                 None,
-                NativeIngressRecordKind::RetirementQuiesced(NativeRetirementQuiesced {
+                NativeIngressRecordKind::BindingIngressQuiesced(NativeBindingIngressQuiesced {
                     binding,
                     retirement_generation,
                     last_started_presentation,
@@ -1180,7 +1229,11 @@ impl NativePlatformCoordinator {
         let effect_results = derive_effect_results(&records);
         let presentation_results = derive_presentation_results(&records);
         let retirement_tombstones = derive_retirement_tombstones(&records);
-        let retirement_quiescences = derive_retirement_quiescences(&records);
+        let binding_ingress_quiescences = derive_binding_ingress_quiescences(&records);
+        let quiesced_bindings = binding_ingress_quiescences
+            .iter()
+            .map(|quiesced| quiesced.binding())
+            .collect();
         let viewport_create_results = derive_viewport_create_results(&records);
         let ordered = NativeIngressJournal::new(
             NativeIngressOrdinal::new(self.ingress_watermark),
@@ -1195,7 +1248,7 @@ impl NativePlatformCoordinator {
             effect_results,
             presentation_results,
             retirement_tombstones,
-            retirement_quiescences,
+            binding_ingress_quiescences,
             viewport_create_results,
         };
         let settlement = NativeHostIngressSettlementKey(ingress.ordered().through());
@@ -1205,6 +1258,7 @@ impl NativePlatformCoordinator {
                 snapshot_generation: snapshot_generation.get(),
                 ingress_through: ingress.ordered().through().get(),
                 pointer_through: through_pointer.get(),
+                quiesced_bindings,
             });
         Ok(PreparedNativeHostIngress {
             ingress,
@@ -1216,10 +1270,19 @@ impl NativePlatformCoordinator {
         &mut self,
         key: NativeHostIngressSettlementKey,
     ) -> Result<(), NativePlatformError> {
-        let prepared = self.prepared_host_ingress_settlement(key)?;
-        self.snapshot_generation = prepared.snapshot_generation;
-        self.ingress_watermark = prepared.ingress_through;
-        self.pointer_watermark = prepared.pointer_through;
+        let (snapshot_generation, ingress_through, pointer_through, quiesced_bindings) = {
+            let prepared = self.prepared_host_ingress_settlement(key)?;
+            (
+                prepared.snapshot_generation,
+                prepared.ingress_through,
+                prepared.pointer_through,
+                prepared.quiesced_bindings.clone(),
+            )
+        };
+        self.snapshot_generation = snapshot_generation;
+        self.ingress_watermark = ingress_through;
+        self.pointer_watermark = pointer_through;
+        self.compact_committed_binding_ingress(&quiesced_bindings);
         self.host_ingress_settlement = HostIngressSettlementState::Idle;
         Ok(())
     }
@@ -1228,14 +1291,14 @@ impl NativePlatformCoordinator {
         &self,
         key: NativeHostIngressSettlementKey,
     ) -> Result<(), NativePlatformError> {
-        self.prepared_host_ingress_settlement(key).map(drop)
+        self.prepared_host_ingress_settlement(key).map(|_| ())
     }
 
     fn prepared_host_ingress_settlement(
         &self,
         key: NativeHostIngressSettlementKey,
-    ) -> Result<PreparedHostIngressSettlement, NativePlatformError> {
-        let prepared = match self.host_ingress_settlement {
+    ) -> Result<&PreparedHostIngressSettlement, NativePlatformError> {
+        let prepared = match &self.host_ingress_settlement {
             HostIngressSettlementState::Prepared(prepared) => prepared,
             HostIngressSettlementState::Poisoned => {
                 return Err(NativePlatformError::HostIngressPoisoned);
@@ -1247,6 +1310,7 @@ impl NativePlatformCoordinator {
         if prepared.key != key {
             return Err(NativePlatformError::HostIngressSettlementMismatch);
         }
+        self.validate_binding_ingress_compaction(&prepared.quiesced_bindings)?;
         Ok(prepared)
     }
 
@@ -1254,7 +1318,7 @@ impl NativePlatformCoordinator {
         &mut self,
         key: NativeHostIngressSettlementKey,
     ) -> Result<(), NativePlatformError> {
-        match self.host_ingress_settlement {
+        match &self.host_ingress_settlement {
             HostIngressSettlementState::Prepared(prepared) if prepared.key == key => {
                 self.host_ingress_settlement = HostIngressSettlementState::Poisoned;
                 Ok(())
@@ -1264,6 +1328,38 @@ impl NativePlatformCoordinator {
                 Err(NativePlatformError::HostIngressSettlementMismatch)
             }
         }
+    }
+
+    fn validate_binding_ingress_compaction(
+        &self,
+        bindings: &BTreeSet<NativeViewportBinding>,
+    ) -> Result<(), NativePlatformError> {
+        let valid = bindings.iter().all(|binding| {
+            !self.active.values().any(|active| active == binding)
+                && !self.presentation_lanes.contains_key(binding)
+                && !self
+                    .pending_effects
+                    .keys()
+                    .any(|(pending_binding, _)| pending_binding == binding)
+                && !self.pending_window_snapshots.contains_key(binding)
+                && !self.retired_binding_ingress.contains_key(binding)
+                && self.minted.contains(binding)
+                && self.tombstones.contains_key(binding)
+        });
+        if valid {
+            Ok(())
+        } else {
+            Err(NativePlatformError::BindingIngressNotQuiescent)
+        }
+    }
+
+    fn compact_committed_binding_ingress(&mut self, bindings: &BTreeSet<NativeViewportBinding>) {
+        for binding in bindings {
+            self.minted.remove(binding);
+            self.tombstones.remove(binding);
+        }
+        self.observation_generations
+            .retain(|(observed_binding, _), _| !bindings.contains(observed_binding));
     }
 
     #[cfg(test)]
@@ -1589,6 +1685,17 @@ mod tests {
     fn freeze_empty_roster(coordinator: &mut NativePlatformCoordinator) -> NativeHostIngress {
         record_unknown_platform_facts(coordinator);
         coordinator.freeze_host_ingress().unwrap()
+    }
+
+    fn confirm_binding_ingress_quiescence(
+        coordinator: &mut NativePlatformCoordinator,
+        binding: NativeViewportBinding,
+    ) {
+        coordinator
+            .confirm_binding_ingress_quiescence(
+                NativeBindingIngressOwnerQuiescence::for_coordinator_test(binding),
+            )
+            .unwrap();
     }
 
     #[test]
@@ -2347,6 +2454,7 @@ mod tests {
             )
             .unwrap();
         coordinator.retire_viewport(first).unwrap();
+        confirm_binding_ingress_quiescence(&mut coordinator, first);
         let second = coordinator.register_viewport(viewport_id).unwrap();
 
         assert_ne!(first, second);
@@ -2376,7 +2484,7 @@ mod tests {
         ));
         assert!(matches!(
             records[2].event(),
-            NativeIngressEvent::RetirementQuiesced(quiesced) if quiesced.binding() == first
+            NativeIngressEvent::BindingIngressQuiesced(quiesced) if quiesced.binding() == first
         ));
         assert!(matches!(
             records[3].event(),
@@ -3031,10 +3139,11 @@ mod tests {
         let ticket = coordinator.begin_presentation(binding).unwrap();
         let serial = ticket.serial;
         let tombstone = coordinator.retire_viewport(binding).unwrap();
+        confirm_binding_ingress_quiescence(&mut coordinator, binding);
 
         let retired = freeze_empty_roster(&mut coordinator);
         assert_eq!(retired.retirement_tombstones(), &[tombstone]);
-        assert!(retired.retirement_quiescences().is_empty());
+        assert!(retired.binding_ingress_quiescences().is_empty());
 
         coordinator
             .record_presentation_result(
@@ -3049,8 +3158,8 @@ mod tests {
             .unwrap();
         let settled = freeze_empty_roster(&mut coordinator);
         assert_eq!(settled.presentation_results()[0].serial(), serial);
-        assert_eq!(settled.retirement_quiescences().len(), 1);
-        let quiesced = settled.retirement_quiescences()[0];
+        assert_eq!(settled.binding_ingress_quiescences().len(), 1);
+        let quiesced = settled.binding_ingress_quiescences()[0];
         assert_eq!(quiesced.binding(), binding);
         assert_eq!(quiesced.last_started_presentation(), Some(serial));
         assert!(matches!(
@@ -3059,8 +3168,24 @@ mod tests {
         ));
         assert!(matches!(
             settled.ordered().records()[1].event(),
-            NativeIngressEvent::RetirementQuiesced(recorded) if *recorded == quiesced
+            NativeIngressEvent::BindingIngressQuiesced(recorded) if *recorded == quiesced
         ));
+    }
+
+    #[test]
+    fn retirement_alone_cannot_claim_owner_ingress_quiescence() {
+        let mut coordinator = NativePlatformCoordinator::default();
+        let binding = coordinator
+            .register_viewport(viewport("retirement-needs-owner-proof"))
+            .unwrap();
+        let tombstone = coordinator.retire_viewport(binding).unwrap();
+
+        let ingress = freeze_empty_roster(&mut coordinator);
+
+        assert_eq!(ingress.retirement_tombstones(), &[tombstone]);
+        assert!(ingress.binding_ingress_quiescences().is_empty());
+        assert!(coordinator.minted.contains(&binding));
+        assert!(coordinator.tombstones.contains_key(&binding));
     }
 
     #[test]
@@ -3072,6 +3197,7 @@ mod tests {
         let second = coordinator.begin_presentation(binding).unwrap();
         let final_serial = second.serial;
         coordinator.retire_viewport(binding).unwrap();
+        confirm_binding_ingress_quiescence(&mut coordinator, binding);
 
         coordinator
             .record_presentation_result(
@@ -3085,7 +3211,7 @@ mod tests {
             )
             .unwrap();
         let first_ingress = freeze_empty_roster(&mut coordinator);
-        assert!(first_ingress.retirement_quiescences().is_empty());
+        assert!(first_ingress.binding_ingress_quiescences().is_empty());
 
         coordinator
             .record_presentation_result(
@@ -3099,9 +3225,9 @@ mod tests {
             )
             .unwrap();
         let final_ingress = freeze_empty_roster(&mut coordinator);
-        assert_eq!(final_ingress.retirement_quiescences().len(), 1);
+        assert_eq!(final_ingress.binding_ingress_quiescences().len(), 1);
         assert_eq!(
-            final_ingress.retirement_quiescences()[0].last_started_presentation(),
+            final_ingress.binding_ingress_quiescences()[0].last_started_presentation(),
             Some(final_serial)
         );
     }
@@ -3125,9 +3251,10 @@ mod tests {
             )
             .unwrap();
         let tombstone = coordinator.retire_viewport(binding).unwrap();
+        confirm_binding_ingress_quiescence(&mut coordinator, binding);
 
         let ingress = freeze_empty_roster(&mut coordinator);
-        let quiesced = ingress.retirement_quiescences()[0];
+        let quiesced = ingress.binding_ingress_quiescences()[0];
         assert_eq!(quiesced.binding(), binding);
         assert_eq!(quiesced.retirement_generation(), tombstone.generation());
         assert_eq!(quiesced.last_started_presentation(), Some(serial));
@@ -3141,7 +3268,7 @@ mod tests {
         ));
         assert!(matches!(
             ingress.ordered().records()[2].event(),
-            NativeIngressEvent::RetirementQuiesced(recorded) if *recorded == quiesced
+            NativeIngressEvent::BindingIngressQuiesced(recorded) if *recorded == quiesced
         ));
     }
 
@@ -3152,6 +3279,7 @@ mod tests {
         let first = coordinator.register_viewport(viewport_id).unwrap();
         let first_ticket = coordinator.begin_presentation(first).unwrap();
         coordinator.retire_viewport(first).unwrap();
+        confirm_binding_ingress_quiescence(&mut coordinator, first);
         let second = coordinator.register_viewport(viewport_id).unwrap();
         let second_ticket = coordinator.begin_presentation(second).unwrap();
 
@@ -3167,10 +3295,14 @@ mod tests {
             )
             .unwrap();
         let first_ingress = freeze_single_binding(&mut coordinator, second);
-        assert_eq!(first_ingress.retirement_quiescences().len(), 1);
-        assert_eq!(first_ingress.retirement_quiescences()[0].binding(), first);
+        assert_eq!(first_ingress.binding_ingress_quiescences().len(), 1);
+        assert_eq!(
+            first_ingress.binding_ingress_quiescences()[0].binding(),
+            first
+        );
 
         coordinator.retire_viewport(second).unwrap();
+        confirm_binding_ingress_quiescence(&mut coordinator, second);
         coordinator
             .record_presentation_result(
                 second_ticket,
@@ -3183,8 +3315,11 @@ mod tests {
             )
             .unwrap();
         let second_ingress = freeze_empty_roster(&mut coordinator);
-        assert_eq!(second_ingress.retirement_quiescences().len(), 1);
-        assert_eq!(second_ingress.retirement_quiescences()[0].binding(), second);
+        assert_eq!(second_ingress.binding_ingress_quiescences().len(), 1);
+        assert_eq!(
+            second_ingress.binding_ingress_quiescences()[0].binding(),
+            second
+        );
     }
 
     #[test]
@@ -3198,6 +3333,7 @@ mod tests {
             serial: ticket.serial,
         };
         coordinator.retire_viewport(binding).unwrap();
+        confirm_binding_ingress_quiescence(&mut coordinator, binding);
         coordinator
             .record_presentation_result(
                 ticket,
@@ -3224,7 +3360,7 @@ mod tests {
 
         let ingress = freeze_empty_roster(&mut coordinator);
         assert_eq!(ingress.presentation_results().len(), 1);
-        assert_eq!(ingress.retirement_quiescences().len(), 1);
+        assert_eq!(ingress.binding_ingress_quiescences().len(), 1);
     }
 
     #[test]
@@ -3234,9 +3370,10 @@ mod tests {
             .register_viewport(viewport("immediate-presentation-quiescence"))
             .unwrap();
         let tombstone = coordinator.retire_viewport(binding).unwrap();
+        confirm_binding_ingress_quiescence(&mut coordinator, binding);
 
         let ingress = freeze_empty_roster(&mut coordinator);
-        let quiesced = ingress.retirement_quiescences()[0];
+        let quiesced = ingress.binding_ingress_quiescences()[0];
         assert_eq!(quiesced.binding(), binding);
         assert_eq!(quiesced.retirement_generation(), tombstone.generation());
         assert_eq!(quiesced.last_started_presentation(), None);
@@ -3246,8 +3383,104 @@ mod tests {
         ));
         assert!(matches!(
             ingress.ordered().records()[1].event(),
-            NativeIngressEvent::RetirementQuiesced(recorded) if *recorded == quiesced
+            NativeIngressEvent::BindingIngressQuiesced(recorded) if *recorded == quiesced
         ));
+    }
+
+    #[test]
+    fn aborted_binding_quiescence_batch_retains_every_aba_guard() {
+        let mut coordinator = NativePlatformCoordinator::default();
+        let binding = coordinator
+            .register_viewport(viewport("aborted-binding-quiescence"))
+            .unwrap();
+        coordinator
+            .observe_property(
+                binding,
+                NativeEffectProperty::Focus,
+                NativeAuthority::known(false),
+                ObservationAcknowledgement::Baseline,
+            )
+            .unwrap();
+        coordinator.retire_viewport(binding).unwrap();
+        confirm_binding_ingress_quiescence(&mut coordinator, binding);
+        record_unknown_platform_facts(&mut coordinator);
+        let prepared = coordinator.prepare_host_ingress().unwrap();
+        let (ingress, settlement) = prepared.into_parts();
+
+        assert_eq!(ingress.binding_ingress_quiescences().len(), 1);
+        assert!(coordinator.minted.contains(&binding));
+        assert!(coordinator.tombstones.contains_key(&binding));
+        assert!(
+            coordinator
+                .observation_generations
+                .keys()
+                .any(|(observed_binding, _)| *observed_binding == binding)
+        );
+
+        let wrong_settlement = NativeHostIngressSettlementKey(NativeIngressOrdinal::new(
+            settlement.0.get().checked_add(1).unwrap(),
+        ));
+        assert_eq!(
+            coordinator.commit_host_ingress(wrong_settlement),
+            Err(NativePlatformError::HostIngressSettlementMismatch)
+        );
+        assert!(coordinator.minted.contains(&binding));
+        assert!(coordinator.tombstones.contains_key(&binding));
+
+        coordinator.abort_host_ingress(settlement).unwrap();
+
+        assert!(coordinator.minted.contains(&binding));
+        assert!(coordinator.tombstones.contains_key(&binding));
+        assert!(
+            coordinator
+                .observation_generations
+                .keys()
+                .any(|(observed_binding, _)| *observed_binding == binding)
+        );
+    }
+
+    #[test]
+    fn committed_binding_quiescence_bounds_same_provider_retention() {
+        let mut coordinator = NativePlatformCoordinator::default();
+        let viewport_id = viewport("bounded-binding-retention");
+        let mut last_binding = None;
+
+        for _ in 0..10_000 {
+            let binding = coordinator.register_viewport(viewport_id).unwrap();
+            coordinator
+                .observe_property(
+                    binding,
+                    NativeEffectProperty::Focus,
+                    NativeAuthority::known(false),
+                    ObservationAcknowledgement::Baseline,
+                )
+                .unwrap();
+            coordinator.retire_viewport(binding).unwrap();
+            confirm_binding_ingress_quiescence(&mut coordinator, binding);
+            record_unknown_platform_facts(&mut coordinator);
+            let prepared = coordinator.prepare_host_ingress().unwrap();
+            let (ingress, settlement) = prepared.into_parts();
+
+            assert_eq!(ingress.binding_ingress_quiescences().len(), 1);
+            assert_eq!(ingress.binding_ingress_quiescences()[0].binding(), binding);
+            assert_eq!(coordinator.minted.len(), 1);
+            assert_eq!(coordinator.tombstones.len(), 1);
+            assert_eq!(coordinator.observation_generations.len(), 1);
+
+            coordinator.commit_host_ingress(settlement).unwrap();
+
+            assert!(coordinator.minted.is_empty());
+            assert!(coordinator.tombstones.is_empty());
+            assert!(coordinator.observation_generations.is_empty());
+            last_binding = Some(binding);
+        }
+
+        let last_binding = last_binding.expect("the churn loop produces a binding");
+        assert!(matches!(
+            coordinator.begin_presentation(last_binding),
+            Err(NativePlatformError::UnknownBinding)
+        ));
+        assert_eq!(coordinator.retirement_tombstone(last_binding), None);
     }
 
     #[test]
