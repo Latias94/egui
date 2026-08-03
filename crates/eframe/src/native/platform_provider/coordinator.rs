@@ -217,6 +217,19 @@ impl NativePlatformCoordinator {
             .as_ref()
             .map(|_| self.next_ingress_ordinal())
             .transpose()?;
+        let quiescence_parent = materialized.as_ref().and_then(|pending| {
+            self.binding_ingress_can_quiesce_after_create(pending.parent, viewport_id)
+                .then_some(pending.parent)
+        });
+        let quiescence_ordinal = quiescence_parent
+            .map(|_| {
+                materialized_ordinal
+                    .map_or(self.ingress_ordinal, NativeIngressOrdinal::get)
+                    .checked_add(1)
+                    .map(NativeIngressOrdinal::new)
+                    .ok_or(NativePlatformError::CounterExhausted)
+            })
+            .transpose()?;
 
         self.next_incarnation = incarnation.get();
         self.inventory_generation = inventory_generation.get();
@@ -237,6 +250,9 @@ impl NativePlatformCoordinator {
                     correlation: pending.correlation,
                 }),
             );
+        }
+        if let (Some(parent), Some(ordinal)) = (quiescence_parent, quiescence_ordinal) {
+            self.commit_binding_ingress_quiescence(parent, ordinal);
         }
         Ok(binding)
     }
@@ -346,7 +362,8 @@ impl NativePlatformCoordinator {
         }
         let presentation_is_quiescent =
             presentation_lane.is_none_or(|lane| lane.outstanding.is_empty());
-        let quiescence_ordinal = presentation_is_quiescent
+        let create_lane_is_quiescent = !self.binding_has_pending_viewport_create(binding, None);
+        let quiescence_ordinal = (presentation_is_quiescent && create_lane_is_quiescent)
             .then(|| self.next_ingress_ordinal())
             .transpose()?;
         let state = self
@@ -359,22 +376,55 @@ impl NativePlatformCoordinator {
         state.owner_quiesced = true;
 
         if let Some(ordinal) = quiescence_ordinal {
-            let state = self
-                .retired_binding_ingress
-                .remove(&binding)
-                .ok_or(NativePlatformError::BindingIngressAlreadyQuiesced)?;
-            self.presentation_lanes.remove(&binding);
-            self.commit_ingress_record(
-                ordinal,
-                None,
-                NativeIngressRecordKind::BindingIngressQuiesced(NativeBindingIngressQuiesced {
-                    binding,
-                    retirement_generation: state.retirement_generation,
-                    last_started_presentation: state.last_started_presentation,
-                }),
-            );
+            self.commit_binding_ingress_quiescence(binding, ordinal);
         }
         Ok(())
+    }
+
+    fn binding_has_pending_viewport_create(
+        &self,
+        binding: NativeViewportBinding,
+        completing_viewport: Option<egui::ViewportId>,
+    ) -> bool {
+        self.pending_viewport_creates
+            .iter()
+            .any(|(viewport, pending)| {
+                pending.parent == binding && Some(*viewport) != completing_viewport
+            })
+    }
+
+    fn binding_ingress_can_quiesce_after_create(
+        &self,
+        binding: NativeViewportBinding,
+        completing_viewport: egui::ViewportId,
+    ) -> bool {
+        self.retired_binding_ingress
+            .get(&binding)
+            .is_some_and(|state| state.owner_quiesced)
+            && !self.presentation_lanes.contains_key(&binding)
+            && !self.binding_has_pending_viewport_create(binding, Some(completing_viewport))
+    }
+
+    fn commit_binding_ingress_quiescence(
+        &mut self,
+        binding: NativeViewportBinding,
+        ordinal: NativeIngressOrdinal,
+    ) {
+        let state = self
+            .retired_binding_ingress
+            .remove(&binding)
+            .expect("validated retired binding ingress state must remain present");
+        debug_assert!(state.owner_quiesced);
+        self.presentation_lanes.remove(&binding);
+        self.commit_ingress_record(
+            ordinal,
+            None,
+            NativeIngressRecordKind::BindingIngressQuiesced(NativeBindingIngressQuiesced {
+                binding,
+                retirement_generation: state.retirement_generation,
+                last_started_presentation: state.last_started_presentation,
+            }),
+        );
     }
 
     pub(crate) fn active_binding(
@@ -870,7 +920,14 @@ impl NativePlatformCoordinator {
         if pending.scheduled {
             return Err(NativePlatformError::ViewportCreateRequestMismatch);
         }
+        let quiescence_ordinal = self
+            .binding_ingress_can_quiesce_after_create(request.parent, request.viewport_id)
+            .then(|| self.next_ingress_ordinal())
+            .transpose()?;
         self.pending_viewport_creates.remove(&request.viewport_id);
+        if let Some(ordinal) = quiescence_ordinal {
+            self.commit_binding_ingress_quiescence(request.parent, ordinal);
+        }
         Ok(())
     }
 
@@ -891,6 +948,16 @@ impl NativePlatformCoordinator {
             return Err(NativePlatformError::ViewportCreateRequestMismatch);
         }
         let ordinal = self.next_ingress_ordinal()?;
+        let quiescence_ordinal = self
+            .binding_ingress_can_quiesce_after_create(request.parent, request.viewport_id)
+            .then(|| {
+                ordinal
+                    .get()
+                    .checked_add(1)
+                    .map(NativeIngressOrdinal::new)
+                    .ok_or(NativePlatformError::CounterExhausted)
+            })
+            .transpose()?;
         self.pending_viewport_creates.remove(&request.viewport_id);
         self.commit_ingress_record(
             ordinal,
@@ -903,6 +970,9 @@ impl NativePlatformCoordinator {
                 correlation: request.correlation.clone(),
             }),
         );
+        if let Some(quiescence_ordinal) = quiescence_ordinal {
+            self.commit_binding_ingress_quiescence(request.parent, quiescence_ordinal);
+        }
         Ok(())
     }
 
@@ -919,6 +989,16 @@ impl NativePlatformCoordinator {
             return Ok(false);
         };
         let ordinal = self.next_ingress_ordinal()?;
+        let quiescence_ordinal = self
+            .binding_ingress_can_quiesce_after_create(pending.parent, viewport_id)
+            .then(|| {
+                ordinal
+                    .get()
+                    .checked_add(1)
+                    .map(NativeIngressOrdinal::new)
+                    .ok_or(NativePlatformError::CounterExhausted)
+            })
+            .transpose()?;
         self.pending_viewport_creates.remove(&viewport_id);
         self.commit_ingress_record(
             ordinal,
@@ -931,6 +1011,9 @@ impl NativePlatformCoordinator {
                 correlation: pending.correlation,
             }),
         );
+        if let Some(quiescence_ordinal) = quiescence_ordinal {
+            self.commit_binding_ingress_quiescence(pending.parent, quiescence_ordinal);
+        }
         Ok(true)
     }
 
@@ -1064,7 +1147,9 @@ impl NativePlatformCoordinator {
         let binding_ingress_quiescence = if retires_queue {
             self.retired_binding_ingress
                 .get(&binding)
-                .filter(|state| state.owner_quiesced)
+                .filter(|state| {
+                    state.owner_quiesced && !self.binding_has_pending_viewport_create(binding, None)
+                })
                 .map(|state| (state.retirement_generation, state.last_started_presentation))
         } else {
             None
@@ -1107,16 +1192,13 @@ impl NativePlatformCoordinator {
         if let (Some(ordinal), Some((retirement_generation, last_started_presentation))) =
             (quiescence_ordinal, binding_ingress_quiescence)
         {
-            self.retired_binding_ingress.remove(&binding);
-            self.commit_ingress_record(
-                ordinal,
-                None,
-                NativeIngressRecordKind::BindingIngressQuiesced(NativeBindingIngressQuiesced {
-                    binding,
-                    retirement_generation,
-                    last_started_presentation,
-                }),
+            debug_assert_eq!(
+                self.retired_binding_ingress
+                    .get(&binding)
+                    .map(|state| (state.retirement_generation, state.last_started_presentation,)),
+                Some((retirement_generation, last_started_presentation)),
             );
+            self.commit_binding_ingress_quiescence(binding, ordinal);
         }
 
         if viewport_matches {
@@ -2889,6 +2971,11 @@ mod tests {
             correlation,
         };
         coordinator.retire_viewport(parent).unwrap();
+        confirm_binding_ingress_quiescence(&mut coordinator, parent);
+
+        let retired = freeze_empty_roster(&mut coordinator);
+        assert_eq!(retired.retirement_tombstones().len(), 1);
+        assert!(retired.binding_ingress_quiescences().is_empty());
 
         assert_eq!(
             coordinator.accept_viewport_create_schedule(&request),
@@ -2907,7 +2994,73 @@ mod tests {
             ingress.viewport_create_results()[0].outcome(),
             NativeViewportCreateDispatchOutcome::Rejected
         );
+        assert_eq!(ingress.binding_ingress_quiescences().len(), 1);
+        assert_eq!(ingress.binding_ingress_quiescences()[0].binding(), parent);
+        assert!(matches!(
+            ingress.ordered().records()[0].event(),
+            NativeIngressEvent::ViewportCreateResult(result)
+                if result.parent() == parent
+        ));
+        assert!(matches!(
+            ingress.ordered().records()[1].event(),
+            NativeIngressEvent::BindingIngressQuiesced(quiesced)
+                if quiesced.binding() == parent
+        ));
         assert_eq!(coordinator.active_binding(target), None);
+    }
+
+    #[test]
+    fn scheduled_create_delays_parent_quiescence_until_materialization() {
+        let mut coordinator = NativePlatformCoordinator::default();
+        let parent = coordinator
+            .register_viewport(viewport("materialized-retired-parent"))
+            .unwrap();
+        let target = viewport("materialized-after-parent-retirement");
+        let correlation =
+            NativeViewportCreateCorrelation::new(egui::UserData::new("materialized-late"));
+        let request_id = coordinator
+            .issue_viewport_create(parent, target, correlation.clone())
+            .unwrap();
+        let request = NativeViewportCreateRequest {
+            id: request_id,
+            parent,
+            viewport_id: target,
+            builder: egui::ViewportBuilder::default().with_visible(false),
+            viewport_ui_cb: std::sync::Arc::new(|_| {}),
+            correlation,
+        };
+        coordinator
+            .accept_viewport_create_schedule(&request)
+            .unwrap();
+        coordinator.retire_viewport(parent).unwrap();
+        confirm_binding_ingress_quiescence(&mut coordinator, parent);
+
+        let retired = freeze_empty_roster(&mut coordinator);
+        assert!(retired.binding_ingress_quiescences().is_empty());
+
+        let target_binding = coordinator.register_viewport(target).unwrap();
+        let materialized = freeze_single_binding(&mut coordinator, target_binding);
+
+        assert_eq!(materialized.viewport_create_results().len(), 1);
+        assert_eq!(
+            materialized.viewport_create_results()[0].outcome(),
+            NativeViewportCreateDispatchOutcome::Materialized
+        );
+        assert_eq!(materialized.binding_ingress_quiescences().len(), 1);
+        assert_eq!(
+            materialized.binding_ingress_quiescences()[0].binding(),
+            parent
+        );
+        assert!(matches!(
+            materialized.ordered().records()[0].event(),
+            NativeIngressEvent::ViewportCreateResult(result)
+                if result.parent() == parent
+        ));
+        assert!(matches!(
+            materialized.ordered().records()[1].event(),
+            NativeIngressEvent::BindingIngressQuiesced(quiesced)
+                if quiesced.binding() == parent
+        ));
     }
 
     #[test]

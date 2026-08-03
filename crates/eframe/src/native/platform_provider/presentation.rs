@@ -79,9 +79,9 @@ impl NativePresentationResult {
 /// This fact does not retire the native viewport. [`NativeRetirementTombstone`]
 /// does that. It proves that the Winit owner no longer retains pointer, scroll,
 /// effect, close, or window routes for the exact binding, and that every
-/// coordinator-owned effect and presentation lane is terminal. The provider
-/// may therefore reclaim the binding's retained ABA guards after the host
-/// commits the enclosing ingress batch.
+/// coordinator-owned effect, presentation, and parent-bound viewport-create
+/// lane is terminal. The provider may therefore reclaim the binding's retained
+/// ABA guards after the host commits the enclosing ingress batch.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct NativeBindingIngressQuiesced {
     pub(super) binding: NativeViewportBinding,
