@@ -19,7 +19,7 @@ mod test_support;
 #[cfg(feature = "native-test-support")]
 pub use test_support::{
     NativeTestDriver, NativeTestPointerAction, NativeTestPointerEvent, NativeTestPointerLocation,
-    NativeTestScrollDelta,
+    NativeTestScrollDelta, NativeTestWindowScroll,
 };
 
 #[cfg(target_os = "macos")]

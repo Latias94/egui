@@ -1,5 +1,7 @@
 //! Deterministic native ingress support used only by fork integration tests.
 
+use winit::dpi::PhysicalPosition;
+use winit::event::{DeviceId, MouseScrollDelta, TouchPhase, WindowEvent};
 use winit::event_loop::{EventLoopClosed, EventLoopProxy};
 
 use super::winit_integration::UserEvent;
@@ -8,7 +10,7 @@ use super::winit_integration::UserEvent;
 ///
 /// This test-only value carries no viewport binding, provider identity, or
 /// ingress position. The native event loop resolves those authoritative facts
-/// when it consumes the enclosing pointer event.
+/// when it consumes the enclosing window event.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum NativeTestScrollDelta {
     /// Platform-defined line units.
@@ -50,8 +52,6 @@ pub enum NativeTestPointerAction {
     PrimaryPressed,
     /// Release the synthetic primary pointer button.
     PrimaryReleased,
-    /// Deliver one independent wheel sample with exact default modifiers and no smooth sequence.
-    Scroll(NativeTestScrollDelta),
 }
 
 /// The destination of one deterministic native pointer edge.
@@ -146,6 +146,59 @@ impl NativeTestPointerEvent {
     }
 }
 
+/// One deterministic wheel event delivered through the production winit window-event path.
+///
+/// The caller names only an egui viewport, an event-time viewport-local physical position, and
+/// the platform delta. The event loop resolves the current native window and mints the backend
+/// sequence. Binding, presentation, receiver, derivative, and docking authority remain owned by
+/// the production provider pipeline.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct NativeTestWindowScroll {
+    viewport: egui::ViewportId,
+    position: [f64; 2],
+    delta: NativeTestScrollDelta,
+}
+
+impl NativeTestWindowScroll {
+    /// Creates a wheel event at one exact viewport-local physical position.
+    #[must_use]
+    pub const fn new(
+        viewport: egui::ViewportId,
+        position: [f64; 2],
+        delta: NativeTestScrollDelta,
+    ) -> Self {
+        Self {
+            viewport,
+            position,
+            delta,
+        }
+    }
+
+    /// Returns the viewport whose current native window must receive the event.
+    #[must_use]
+    pub const fn viewport(self) -> egui::ViewportId {
+        self.viewport
+    }
+
+    pub(crate) fn into_window_event(self) -> WindowEvent {
+        let delta = match self.delta {
+            NativeTestScrollDelta::Lines { x, y } => MouseScrollDelta::LineDelta(x, y),
+            NativeTestScrollDelta::PhysicalPixels { x, y } => {
+                MouseScrollDelta::PixelDelta(PhysicalPosition::new(x, y))
+            }
+        };
+        // Winit reserves this identity for tests. It is only a stable device key for the normal
+        // eframe input pipeline and is never passed to an operating-system API.
+        let device_id = DeviceId::dummy();
+        WindowEvent::MouseWheel {
+            device_id,
+            delta,
+            phase: TouchPhase::Moved,
+            position: Some(PhysicalPosition::new(self.position[0], self.position[1])),
+        }
+    }
+}
+
 /// Event-loop proxy for deterministic native ingress tests.
 ///
 /// This type exists only with the default-disabled `native-test-support`
@@ -173,6 +226,15 @@ impl NativeTestDriver {
         self.event_loop
             .send_event(UserEvent::NativeTestPointer(event))
     }
+
+    /// Enqueues one wheel event through the production winit window-event path.
+    pub fn send_window_scroll(
+        &self,
+        event: NativeTestWindowScroll,
+    ) -> Result<(), EventLoopClosed<UserEvent>> {
+        self.event_loop
+            .send_event(UserEvent::NativeTestWindowScroll(event))
+    }
 }
 
 impl std::fmt::Debug for NativeTestDriver {
@@ -180,5 +242,52 @@ impl std::fmt::Debug for NativeTestDriver {
         formatter
             .debug_struct("NativeTestDriver")
             .finish_non_exhaustive()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn window_scroll_preserves_event_position_and_physical_delta() {
+        let event = NativeTestWindowScroll::new(
+            egui::ViewportId::ROOT,
+            [31.0, 47.0],
+            NativeTestScrollDelta::physical_pixels(-3.5, 4.75),
+        )
+        .into_window_event();
+
+        let WindowEvent::MouseWheel {
+            delta: MouseScrollDelta::PixelDelta(delta),
+            phase,
+            position: Some(position),
+            ..
+        } = event
+        else {
+            panic!("test scroll must become one positioned pixel wheel event");
+        };
+        assert_eq!(delta, PhysicalPosition::new(-3.5, 4.75));
+        assert_eq!(phase, TouchPhase::Moved);
+        assert_eq!(position, PhysicalPosition::new(31.0, 47.0));
+    }
+
+    #[test]
+    fn window_scroll_preserves_line_delta() {
+        let event = NativeTestWindowScroll::new(
+            egui::ViewportId::ROOT,
+            [1.0, 2.0],
+            NativeTestScrollDelta::lines(1.25, -2.5),
+        )
+        .into_window_event();
+
+        assert!(matches!(
+            event,
+            WindowEvent::MouseWheel {
+                delta: MouseScrollDelta::LineDelta(1.25, -2.5),
+                position: Some(position),
+                ..
+            } if position == PhysicalPosition::new(1.0, 2.0)
+        ));
     }
 }

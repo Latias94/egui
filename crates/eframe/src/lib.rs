@@ -219,7 +219,7 @@ pub use native::{
 #[cfg(feature = "native-test-support")]
 pub use native::{
     NativeTestDriver, NativeTestPointerAction, NativeTestPointerEvent, NativeTestPointerLocation,
-    NativeTestScrollDelta,
+    NativeTestScrollDelta, NativeTestWindowScroll,
 };
 
 #[cfg(not(target_arch = "wasm32"))]

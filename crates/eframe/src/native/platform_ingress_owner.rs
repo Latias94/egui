@@ -26,7 +26,6 @@ use super::platform_provider::{
 #[cfg(feature = "native-test-support")]
 use super::test_support::{
     NativeTestPointerAction, NativeTestPointerEvent, NativeTestPointerLocation,
-    NativeTestScrollDelta,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -847,19 +846,6 @@ impl NativePlatformIngressOwner {
                 NativePointerEdgeKind::ButtonReleased(NativePointerButton::Primary),
                 None,
             ),
-            NativeTestPointerAction::Scroll(delta) => {
-                let delta = native_scroll_delta(native_test_scroll_delta(delta))?;
-                let scroll = NativeScrollEdge::new(
-                    state.identity.device_id(),
-                    None,
-                    NativeScrollPhase::Discrete,
-                    Some(delta),
-                    NativeAuthority::unknown(NativeUnavailableReason::NotObserved),
-                    NativeAuthority::known(NativeScrollModifiers::default()),
-                )
-                .ok_or(NativePlatformIngressError::InvalidScrollEdge)?;
-                (NativePointerEdgeKind::Scrolled(scroll), state.capture_owner)
-            }
             _ => {
                 return Err(
                     NativePlatformIngressError::NativeTestPointerActionOutOfOrder(event.action()),
@@ -1839,16 +1825,6 @@ fn native_scroll_delta(
     })
 }
 
-#[cfg(feature = "native-test-support")]
-fn native_test_scroll_delta(delta: NativeTestScrollDelta) -> winit::event::MouseScrollDelta {
-    match delta {
-        NativeTestScrollDelta::Lines { x, y } => winit::event::MouseScrollDelta::LineDelta(x, y),
-        NativeTestScrollDelta::PhysicalPixels { x, y } => {
-            winit::event::MouseScrollDelta::PixelDelta(winit::dpi::PhysicalPosition::new(x, y))
-        }
-    }
-}
-
 fn native_scroll_modifiers(state: winit::keyboard::ModifiersState) -> NativeScrollModifiers {
     NativeScrollModifiers::new(
         state.shift_key(),
@@ -2446,30 +2422,6 @@ mod tests {
             scroll.modifiers().value(),
             Some(&NativeScrollModifiers::default())
         );
-    }
-
-    #[cfg(feature = "native-test-support")]
-    #[test]
-    fn native_test_scroll_delta_preserves_backend_units_and_components() {
-        let lines = native_scroll_delta(native_test_scroll_delta(NativeTestScrollDelta::lines(
-            1.25, -2.5,
-        )))
-        .expect("the finite line delta is valid");
-        let pixels = native_scroll_delta(native_test_scroll_delta(
-            NativeTestScrollDelta::physical_pixels(-3.5, 4.75),
-        ))
-        .expect("the finite physical delta is valid");
-
-        assert!(matches!(
-            lines,
-            NativeScrollDelta::Lines(vector)
-                if vector.x() == 1.25 && vector.y() == -2.5
-        ));
-        assert!(matches!(
-            pixels,
-            NativeScrollDelta::PhysicalPixels(vector)
-                if vector.x() == -3.5 && vector.y() == 4.75
-        ));
     }
 
     #[test]

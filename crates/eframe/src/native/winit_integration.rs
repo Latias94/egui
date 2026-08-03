@@ -6,7 +6,7 @@ use winit::{
 };
 
 #[cfg(feature = "native-test-support")]
-use super::test_support::NativeTestPointerEvent;
+use super::test_support::{NativeTestPointerEvent, NativeTestWindowScroll};
 use egui::ViewportId;
 #[cfg(feature = "accesskit")]
 use egui_winit::accesskit_winit;
@@ -71,6 +71,10 @@ pub enum UserEvent {
     /// A deterministic pointer action used only by the fork's native integration tests.
     #[cfg(feature = "native-test-support")]
     NativeTestPointer(NativeTestPointerEvent),
+
+    /// A deterministic wheel event routed through the production winit window-event path.
+    #[cfg(feature = "native-test-support")]
+    NativeTestWindowScroll(NativeTestWindowScroll),
 }
 
 #[cfg(feature = "accesskit")]

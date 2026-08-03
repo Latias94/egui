@@ -336,6 +336,8 @@ impl<T: WinitApp> ApplicationHandler<UserEvent> for WinitAppWrapper<T> {
             UserEvent::AccessKitActionRequest(_) => "UserEvent::AccessKitActionRequest",
             #[cfg(feature = "native-test-support")]
             UserEvent::NativeTestPointer(_) => "UserEvent::NativeTestPointer",
+            #[cfg(feature = "native-test-support")]
+            UserEvent::NativeTestWindowScroll(_) => "UserEvent::NativeTestWindowScroll",
         });
 
         event_loop_context::with_event_loop_context(event_loop, move || {
@@ -384,6 +386,20 @@ impl<T: WinitApp> ApplicationHandler<UserEvent> for WinitAppWrapper<T> {
                 UserEvent::NativeTestPointer(event) => {
                     let sequence = self.mint_backend_event_sequence();
                     self.winit_app.on_native_test_pointer_event(event, sequence)
+                }
+                #[cfg(feature = "native-test-support")]
+                UserEvent::NativeTestWindowScroll(event) => {
+                    let sequence = self.mint_backend_event_sequence();
+                    self.winit_app
+                        .window_id_from_viewport_id(event.viewport())
+                        .map_or(Ok(EventResult::Wait), |window_id| {
+                            self.winit_app.window_event(
+                                event_loop,
+                                window_id,
+                                event.into_window_event(),
+                                sequence,
+                            )
+                        })
                 }
             };
             self.handle_event_result(event_loop, event_result);
