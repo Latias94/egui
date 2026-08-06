@@ -17,10 +17,11 @@ use super::platform_provider::{
     NativeKeyEdge, NativePhysicalPoint, NativePhysicalRect, NativePlatformError,
     NativePointerButton, NativePointerCoordinateCapture, NativePointerDeliveryOwner,
     NativePointerDeviceId, NativePointerEdgeFacts, NativePointerEdgeKind, NativePointerId,
-    NativePointerIdentity, NativePointerInputState, NativePointerSource, NativePresentationState,
-    NativeScrollCancelReason, NativeScrollDelta, NativeScrollEdge, NativeScrollModifiers,
-    NativeScrollPhase, NativeScrollSequenceToken, NativeUnavailableReason, NativeViewportBinding,
-    NativeWindowEffect, NativeWorkAreaRoute, ObservationAcknowledgement, PreparedNativeHostIngress,
+    NativePointerIdentity, NativePointerInputState, NativePointerSource,
+    NativePointerStreamCancelReason, NativePresentationState, NativeScrollCancelReason,
+    NativeScrollDelta, NativeScrollEdge, NativeScrollModifiers, NativeScrollPhase,
+    NativeScrollSequenceToken, NativeUnavailableReason, NativeViewportBinding, NativeWindowEffect,
+    NativeWorkAreaRoute, ObservationAcknowledgement, PreparedNativeHostIngress,
     SharedNativePlatformCoordinator,
 };
 #[cfg(feature = "native-test-support")]
@@ -522,7 +523,6 @@ impl NativePlatformIngressOwner {
                     key,
                     NativePointerSource::Viewport(binding),
                     NativePointerEdgeKind::Moved,
-                    false,
                     position,
                     WinitPointerAuthority {
                         delivery_owner: pointer_route.delivery_owner.clone(),
@@ -572,7 +572,6 @@ impl NativePlatformIngressOwner {
                     key,
                     source,
                     kind,
-                    false,
                     position,
                     WinitPointerAuthority {
                         delivery_owner: pointer_route.delivery_owner.clone(),
@@ -641,16 +640,8 @@ impl NativePlatformIngressOwner {
                     device_id: touch.device_id,
                     stream: WinitPointerStream::Touch(touch.id),
                 };
-                let kind = match touch.phase {
-                    winit::event::TouchPhase::Started => {
-                        NativePointerEdgeKind::ButtonPressed(NativePointerButton::Primary)
-                    }
-                    winit::event::TouchPhase::Moved => NativePointerEdgeKind::Moved,
-                    winit::event::TouchPhase::Ended => {
-                        NativePointerEdgeKind::ButtonReleased(NativePointerButton::Primary)
-                    }
-                    winit::event::TouchPhase::Cancelled => NativePointerEdgeKind::Cancelled,
-                };
+                validate_touch_phase(self.pointer_states.contains_key(&key), touch.phase)?;
+                let kind = native_touch_edge_kind(touch.phase);
                 let position = desktop_pointer_position(window, touch.location);
                 let hovered_coordinates = pointer_coordinate_capture(
                     &bound_route_windows,
@@ -669,7 +660,6 @@ impl NativePlatformIngressOwner {
                     key,
                     NativePointerSource::Viewport(binding),
                     kind,
-                    touch.phase == winit::event::TouchPhase::Ended,
                     position,
                     WinitPointerAuthority {
                         delivery_owner: pointer_route.delivery_owner.clone(),
@@ -681,12 +671,6 @@ impl NativePlatformIngressOwner {
                     },
                     backend_event_sequence,
                 )?;
-                if matches!(
-                    touch.phase,
-                    winit::event::TouchPhase::Ended | winit::event::TouchPhase::Cancelled
-                ) {
-                    self.pointer_states.remove(&key);
-                }
             }
             winit::event::WindowEvent::CloseRequested
                 if binding.viewport_id() != ViewportId::ROOT =>
@@ -983,7 +967,6 @@ impl NativePlatformIngressOwner {
         self.record_pointer_facts(
             source,
             NativePointerEdgeKind::Scrolled(scroll),
-            false,
             position,
             WinitPointerAuthority {
                 delivery_owner: pointer_route.delivery_owner,
@@ -1097,7 +1080,9 @@ impl NativePlatformIngressOwner {
                     state.source,
                     NativeAuthority::known(NativePointerDeliveryOwner::None),
                     state.identity,
-                    NativePointerEdgeKind::Cancelled,
+                    NativePointerEdgeKind::StreamCancelled(
+                        NativePointerStreamCancelReason::DeviceRemoved,
+                    ),
                     state.position,
                     NativeAuthority::unknown(NativeUnavailableReason::Retired),
                     NativeAuthority::unknown(NativeUnavailableReason::Retired),
@@ -1117,29 +1102,39 @@ impl NativePlatformIngressOwner {
         key: WinitPointerKey,
         source: NativePointerSource,
         kind: NativePointerEdgeKind,
-        stream_terminal: bool,
         position: NativeAuthority<NativePhysicalPoint>,
         authority: WinitPointerAuthority,
         backend_event_sequence: egui::BackendEventSequence,
     ) -> Result<(), NativePlatformIngressError> {
-        let identity = self.pointer_identity(key)?;
+        let ends_stream = kind.ends_stream();
+        let identity = if ends_stream {
+            self.pointer_states
+                .get(&key)
+                .map(|state| state.identity)
+                .ok_or(NativePlatformIngressError::PointerTerminalWithoutActiveStream)?
+        } else {
+            self.pointer_identity(key)?
+        };
         self.record_pointer_facts(
             source,
             kind,
-            stream_terminal,
             position.clone(),
             authority,
             identity,
             backend_event_sequence,
         )?;
-        self.pointer_states.insert(
-            key,
-            WinitPointerState {
-                identity,
-                source,
-                position,
-            },
-        );
+        if ends_stream {
+            self.pointer_states.remove(&key);
+        } else {
+            self.pointer_states.insert(
+                key,
+                WinitPointerState {
+                    identity,
+                    source,
+                    position,
+                },
+            );
+        }
         Ok(())
     }
 
@@ -1147,13 +1142,12 @@ impl NativePlatformIngressOwner {
         &self,
         source: NativePointerSource,
         kind: NativePointerEdgeKind,
-        stream_terminal: bool,
         position: NativeAuthority<NativePhysicalPoint>,
         authority: WinitPointerAuthority,
         identity: NativePointerIdentity,
         backend_event_sequence: egui::BackendEventSequence,
     ) -> Result<(), NativePlatformIngressError> {
-        let mut facts = NativePointerEdgeFacts::new(
+        let facts = NativePointerEdgeFacts::new(
             source,
             authority.delivery_owner,
             identity,
@@ -1165,9 +1159,6 @@ impl NativePlatformIngressOwner {
         .with_hovered_coordinates(authority.hovered_coordinates)
         .with_delivery_coordinates(authority.delivery_coordinates)
         .with_work_area(authority.work_area);
-        if stream_terminal {
-            facts = facts.ending_stream();
-        }
         self.coordinator
             .lock()
             .record_pointer_edge_for_backend(backend_event_sequence, facts)?;
@@ -1645,16 +1636,26 @@ impl NativePlatformIngressOwner {
                             .contains_key(key)
                             .then_some(NativePointerSource::None)
                     });
-                if let Some(retained_source) = retained_source {
-                    self.pointer_states.insert(
-                        *key,
-                        WinitPointerState {
-                            source: retained_source,
-                            ..state
-                        },
-                    );
-                } else {
-                    self.pointer_states.remove(key);
+                match key.stream {
+                    WinitPointerStream::Mouse => {
+                        self.pointer_states.insert(
+                            *key,
+                            WinitPointerState {
+                                source: retained_source.unwrap_or(NativePointerSource::None),
+                                ..state
+                            },
+                        );
+                    }
+                    WinitPointerStream::Touch(_) => {
+                        if retained_source.is_some() {
+                            return Err(NativePlatformIngressError::IncompleteRoster);
+                        }
+                        self.coordinator.lock().record_synthetic_pointer_cancel(
+                            state.identity,
+                            NativePointerStreamCancelReason::BindingRetired,
+                        )?;
+                        self.pointer_states.remove(key);
+                    }
                 }
             }
         }
@@ -1881,6 +1882,8 @@ pub(super) enum NativePlatformIngressError {
     DuplicateWindow(WindowId),
     DuplicateViewport(ViewportId),
     IncompleteRoster,
+    PointerStreamOutOfOrder(winit::event::TouchPhase),
+    PointerTerminalWithoutActiveStream,
     InvalidScrollDelta,
     InvalidScrollEdge,
     ScrollSequenceOutOfOrder(winit::event::TouchPhase),
@@ -1907,6 +1910,15 @@ impl std::fmt::Display for NativePlatformIngressError {
                 write!(formatter, "native roster repeats viewport {viewport_id:?}")
             }
             Self::IncompleteRoster => formatter.write_str("native window roster is inconsistent"),
+            Self::PointerStreamOutOfOrder(phase) => {
+                write!(
+                    formatter,
+                    "native pointer stream is out of order at {phase:?}"
+                )
+            }
+            Self::PointerTerminalWithoutActiveStream => {
+                formatter.write_str("native pointer terminal has no active stream")
+            }
             Self::InvalidScrollDelta => {
                 formatter.write_str("native scroll delta contains a non-finite component")
             }
@@ -2012,6 +2024,31 @@ fn native_mouse_button(button: winit::event::MouseButton) -> NativePointerButton
         winit::event::MouseButton::Forward => NativePointerButton::Forward,
         winit::event::MouseButton::Other(button) => NativePointerButton::Other(button),
     }
+}
+
+fn native_touch_edge_kind(phase: winit::event::TouchPhase) -> NativePointerEdgeKind {
+    match phase {
+        winit::event::TouchPhase::Started => {
+            NativePointerEdgeKind::ButtonPressed(NativePointerButton::Primary)
+        }
+        winit::event::TouchPhase::Moved => NativePointerEdgeKind::Moved,
+        winit::event::TouchPhase::Ended => {
+            NativePointerEdgeKind::ContactEnded(NativePointerButton::Primary)
+        }
+        winit::event::TouchPhase::Cancelled => NativePointerEdgeKind::StreamCancelled(
+            NativePointerStreamCancelReason::PlatformCancelled,
+        ),
+    }
+}
+
+fn validate_touch_phase(
+    active: bool,
+    phase: winit::event::TouchPhase,
+) -> Result<(), NativePlatformIngressError> {
+    if matches!(phase, winit::event::TouchPhase::Started) == active {
+        return Err(NativePlatformIngressError::PointerStreamOutOfOrder(phase));
+    }
+    Ok(())
 }
 
 fn native_scroll_delta(
@@ -2399,6 +2436,229 @@ mod tests {
         }
     }
 
+    fn touch_pointer_key(id: u64) -> WinitPointerKey {
+        WinitPointerKey {
+            device_id: winit::event::DeviceId::dummy(),
+            stream: WinitPointerStream::Touch(id),
+        }
+    }
+
+    fn no_window_pointer_authority() -> WinitPointerAuthority {
+        WinitPointerAuthority {
+            delivery_owner: NativeAuthority::known(NativePointerDeliveryOwner::None),
+            hovered: NativeAuthority::known(NativeHoveredWindow::None),
+            hovered_coordinates: NativeAuthority::unknown(NativeUnavailableReason::NotObserved),
+            delivery_coordinates: NativeAuthority::unknown(NativeUnavailableReason::NotObserved),
+            work_area: NativeAuthority::unknown(NativeUnavailableReason::NotObserved),
+            capture: NativeAuthority::known(NativeCaptureOwner::None),
+        }
+    }
+
+    fn unknown_pointer_position() -> NativeAuthority<NativePhysicalPoint> {
+        NativeAuthority::unknown(NativeUnavailableReason::NotObserved)
+    }
+
+    #[test]
+    fn touch_phases_map_to_algebraic_pointer_terminals() {
+        assert_eq!(
+            native_touch_edge_kind(winit::event::TouchPhase::Started),
+            NativePointerEdgeKind::ButtonPressed(NativePointerButton::Primary)
+        );
+        assert_eq!(
+            native_touch_edge_kind(winit::event::TouchPhase::Moved),
+            NativePointerEdgeKind::Moved
+        );
+        assert_eq!(
+            native_touch_edge_kind(winit::event::TouchPhase::Ended),
+            NativePointerEdgeKind::ContactEnded(NativePointerButton::Primary)
+        );
+        assert_eq!(
+            native_touch_edge_kind(winit::event::TouchPhase::Cancelled),
+            NativePointerEdgeKind::StreamCancelled(
+                NativePointerStreamCancelReason::PlatformCancelled
+            )
+        );
+    }
+
+    #[test]
+    fn touch_move_without_start_and_duplicate_start_fail_closed() {
+        assert!(matches!(
+            validate_touch_phase(false, winit::event::TouchPhase::Moved),
+            Err(NativePlatformIngressError::PointerStreamOutOfOrder(
+                winit::event::TouchPhase::Moved
+            ))
+        ));
+        assert!(matches!(
+            validate_touch_phase(true, winit::event::TouchPhase::Started),
+            Err(NativePlatformIngressError::PointerStreamOutOfOrder(
+                winit::event::TouchPhase::Started
+            ))
+        ));
+        validate_touch_phase(false, winit::event::TouchPhase::Started).unwrap();
+        validate_touch_phase(true, winit::event::TouchPhase::Moved).unwrap();
+        validate_touch_phase(true, winit::event::TouchPhase::Ended).unwrap();
+        validate_touch_phase(true, winit::event::TouchPhase::Cancelled).unwrap();
+    }
+
+    #[test]
+    fn contact_end_retires_identity_before_same_touch_id_is_reused() {
+        let mut owner = NativePlatformIngressOwner::default();
+        let key = touch_pointer_key(7);
+
+        owner
+            .record_pointer_event(
+                key,
+                NativePointerSource::None,
+                NativePointerEdgeKind::ButtonPressed(NativePointerButton::Primary),
+                unknown_pointer_position(),
+                no_window_pointer_authority(),
+                egui::BackendEventSequence::new(1),
+            )
+            .unwrap();
+        let first = owner.pointer_states[&key].identity;
+        owner
+            .record_pointer_event(
+                key,
+                NativePointerSource::None,
+                NativePointerEdgeKind::ContactEnded(NativePointerButton::Primary),
+                unknown_pointer_position(),
+                no_window_pointer_authority(),
+                egui::BackendEventSequence::new(2),
+            )
+            .unwrap();
+        assert!(!owner.pointer_states.contains_key(&key));
+
+        owner
+            .record_pointer_event(
+                key,
+                NativePointerSource::None,
+                NativePointerEdgeKind::ButtonPressed(NativePointerButton::Primary),
+                unknown_pointer_position(),
+                no_window_pointer_authority(),
+                egui::BackendEventSequence::new(3),
+            )
+            .unwrap();
+        let successor = owner.pointer_states[&key].identity;
+        assert_ne!(first, successor);
+
+        let ingress = owner.freeze_facts(&[]).unwrap();
+        let edges = ingress.pointer_journal().edges();
+        assert_eq!(edges.len(), 3);
+        assert_eq!(edges[0].identity(), first);
+        assert_eq!(edges[1].identity(), first);
+        assert_eq!(edges[2].identity(), successor);
+        assert!(matches!(
+            edges[1].kind(),
+            NativePointerEdgeKind::ContactEnded(NativePointerButton::Primary)
+        ));
+        assert!(edges[1].ends_stream());
+    }
+
+    #[test]
+    fn platform_cancel_retires_the_active_touch_stream() {
+        let mut owner = NativePlatformIngressOwner::default();
+        let key = touch_pointer_key(8);
+
+        owner
+            .record_pointer_event(
+                key,
+                NativePointerSource::None,
+                NativePointerEdgeKind::ButtonPressed(NativePointerButton::Primary),
+                unknown_pointer_position(),
+                no_window_pointer_authority(),
+                egui::BackendEventSequence::new(1),
+            )
+            .unwrap();
+        let identity = owner.pointer_states[&key].identity;
+        owner
+            .record_pointer_event(
+                key,
+                NativePointerSource::None,
+                NativePointerEdgeKind::StreamCancelled(
+                    NativePointerStreamCancelReason::PlatformCancelled,
+                ),
+                unknown_pointer_position(),
+                no_window_pointer_authority(),
+                egui::BackendEventSequence::new(2),
+            )
+            .unwrap();
+
+        assert!(!owner.pointer_states.contains_key(&key));
+        let ingress = owner.freeze_facts(&[]).unwrap();
+        let cancel = &ingress.pointer_journal().edges()[1];
+        assert_eq!(cancel.identity(), identity);
+        assert_eq!(
+            cancel.kind(),
+            NativePointerEdgeKind::StreamCancelled(
+                NativePointerStreamCancelReason::PlatformCancelled
+            )
+        );
+        assert!(cancel.ends_stream());
+    }
+
+    #[test]
+    fn mouse_release_keeps_its_pointer_stream_live() {
+        let mut owner = NativePlatformIngressOwner::default();
+        let key = mouse_pointer_key();
+
+        for (sequence, kind) in [
+            NativePointerEdgeKind::ButtonPressed(NativePointerButton::Primary),
+            NativePointerEdgeKind::ButtonReleased(NativePointerButton::Primary),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            owner
+                .record_pointer_event(
+                    key,
+                    NativePointerSource::None,
+                    kind,
+                    unknown_pointer_position(),
+                    no_window_pointer_authority(),
+                    egui::BackendEventSequence::new(u128::try_from(sequence + 1).unwrap()),
+                )
+                .unwrap();
+        }
+
+        let identity = owner.pointer_states[&key].identity;
+        let ingress = owner.freeze_facts(&[]).unwrap();
+        let release = &ingress.pointer_journal().edges()[1];
+        assert_eq!(release.identity(), identity);
+        assert!(matches!(
+            release.kind(),
+            NativePointerEdgeKind::ButtonReleased(NativePointerButton::Primary)
+        ));
+        assert!(!release.ends_stream());
+    }
+
+    #[test]
+    fn terminal_without_an_active_pointer_stream_fails_closed() {
+        let mut owner = NativePlatformIngressOwner::default();
+        let error = owner
+            .record_pointer_event(
+                touch_pointer_key(9),
+                NativePointerSource::None,
+                NativePointerEdgeKind::ContactEnded(NativePointerButton::Primary),
+                unknown_pointer_position(),
+                no_window_pointer_authority(),
+                egui::BackendEventSequence::new(1),
+            )
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            NativePlatformIngressError::PointerTerminalWithoutActiveStream
+        ));
+        assert!(
+            owner
+                .freeze_facts(&[])
+                .unwrap()
+                .pointer_journal()
+                .edges()
+                .is_empty()
+        );
+    }
+
     #[test]
     fn dropping_unsettled_native_ingress_poison_prevents_reuse() {
         let mut owner = NativePlatformIngressOwner::default();
@@ -2571,6 +2831,71 @@ mod tests {
             )
             .expect("device removal must not replay a retired viewport binding");
         assert!(!owner.retired_scroll_tails.contains_key(&retired_key));
+    }
+
+    #[test]
+    fn roster_retirement_cancels_touch_but_keeps_mouse_identity_binding_neutral() {
+        let mut owner = NativePlatformIngressOwner::default();
+        let viewport_id = viewport("retired-pointer-contacts");
+        let initial = facts(window_id(), viewport_id, false);
+        let binding = owner
+            .freeze_facts(std::slice::from_ref(&initial))
+            .unwrap()
+            .platform()
+            .inventory()[0];
+        let mouse = mouse_pointer_key();
+        let touch = touch_pointer_key(31);
+        let device = NativePointerDeviceId::new(15);
+        let mouse_identity = NativePointerIdentity::new(device, NativePointerId::new(1));
+        let touch_identity = NativePointerIdentity::new(device, NativePointerId::new(2));
+        for (key, identity) in [(mouse, mouse_identity), (touch, touch_identity)] {
+            owner.pointer_states.insert(
+                key,
+                WinitPointerState {
+                    identity,
+                    source: NativePointerSource::Viewport(binding),
+                    position: NativeAuthority::unknown(NativeUnavailableReason::NotObserved),
+                },
+            );
+        }
+
+        let ingress = owner.freeze_facts(&[]).unwrap();
+        let records = ingress.ordered().records();
+        let contact_cancel = records
+            .iter()
+            .position(|record| {
+                matches!(
+                    record.event(),
+                    crate::NativeIngressEvent::PointerEdge(edge)
+                        if edge.identity() == touch_identity
+                            && edge.kind()
+                                == NativePointerEdgeKind::StreamCancelled(
+                                    NativePointerStreamCancelReason::BindingRetired,
+                                )
+                )
+            })
+            .expect("binding retirement must terminalize the exact touch contact");
+        let retirement = records
+            .iter()
+            .position(|record| {
+                matches!(
+                    record.event(),
+                    crate::NativeIngressEvent::Retirement(tombstone)
+                        if tombstone.binding() == binding
+                )
+            })
+            .expect("the viewport retirement must remain ordered after pointer cleanup");
+        assert!(contact_cancel < retirement);
+        assert!(!owner.pointer_states.contains_key(&touch));
+        assert_eq!(
+            owner.pointer_states.get(&mouse).map(|state| state.identity),
+            Some(mouse_identity),
+        );
+        assert_eq!(
+            owner.pointer_states.get(&mouse).map(|state| state.source),
+            Some(NativePointerSource::None),
+            "a window retirement is not a physical mouse-device terminal",
+        );
     }
 
     #[test]
@@ -2834,7 +3159,13 @@ mod tests {
                 matches!(
                     record.event(),
                     crate::NativeIngressEvent::PointerEdge(edge)
-                        if matches!(edge.kind(), NativePointerEdgeKind::Cancelled)
+                        if edge.ends_stream()
+                            && matches!(
+                            edge.kind(),
+                            NativePointerEdgeKind::StreamCancelled(
+                                NativePointerStreamCancelReason::DeviceRemoved
+                            )
+                        )
                 )
             })
             .expect("device removal still emits the physical pointer cancellation");

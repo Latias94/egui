@@ -114,6 +114,17 @@ pub enum NativePointerButton {
     Other(u16),
 }
 
+/// Why a native pointer stream ended abnormally.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum NativePointerStreamCancelReason {
+    /// The platform cancelled the active pointer contact.
+    PlatformCancelled,
+    /// The physical input device was removed.
+    DeviceRemoved,
+    /// The exact native delivery binding was retired before the contact ended.
+    BindingRetired,
+}
+
 /// The physical transition represented by a pointer journal entry.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NativePointerEdgeKind {
@@ -123,10 +134,14 @@ pub enum NativePointerEdgeKind {
     ButtonPressed(NativePointerButton),
     /// A button was released.
     ButtonReleased(NativePointerButton),
+    /// A contact was released and its pointer stream ended normally.
+    ContactEnded(NativePointerButton),
+    /// A buttonless pointer stream ended normally.
+    StreamEnded,
     /// Native capture ownership changed.
     CaptureChanged,
     /// The platform authoritatively cancelled the pointer stream.
-    Cancelled,
+    StreamCancelled(NativePointerStreamCancelReason),
     /// One lossless scroll sample before framework aggregation.
     Scrolled(NativeScrollEdge),
 }
@@ -139,7 +154,6 @@ pub struct NativePointerEdge {
     pub(super) delivery_owner: NativeAuthority<NativePointerDeliveryOwner>,
     pub(super) identity: NativePointerIdentity,
     pub(super) kind: NativePointerEdgeKind,
-    pub(super) stream_terminal: bool,
     pub(super) position: NativeAuthority<NativePhysicalPoint>,
     pub(super) hovered: NativeAuthority<NativeHoveredWindow>,
     pub(super) hovered_coordinates: NativeAuthority<NativePointerCoordinateCapture>,
@@ -182,9 +196,9 @@ impl NativePointerEdge {
         self.kind
     }
 
-    /// Return whether this edge normally terminates an ephemeral pointer stream.
+    /// Return whether this edge terminates its pointer stream.
     pub const fn ends_stream(&self) -> bool {
-        self.stream_terminal
+        self.kind.ends_stream()
     }
 
     /// Return desktop-global physical position authority.
@@ -215,6 +229,16 @@ impl NativePointerEdge {
     /// Return the event-time work-area selection for an explicit no-window route.
     pub const fn work_area(&self) -> &NativeAuthority<NativeWorkAreaRoute> {
         &self.work_area
+    }
+}
+
+impl NativePointerEdgeKind {
+    /// Return whether this edge terminates its pointer stream.
+    pub const fn ends_stream(self) -> bool {
+        matches!(
+            self,
+            Self::ContactEnded(_) | Self::StreamEnded | Self::StreamCancelled(_)
+        )
     }
 }
 

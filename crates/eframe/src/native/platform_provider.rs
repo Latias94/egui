@@ -55,6 +55,7 @@ pub use keyboard::{NativeKey, NativeKeyEdge, NativeKeyEdgeKind};
 pub use pointer::{
     NativePointerButton, NativePointerCoordinateCapture, NativePointerEdge, NativePointerEdgeKind,
     NativePointerIdentity, NativePointerJournal, NativePointerSource,
+    NativePointerStreamCancelReason,
 };
 pub(crate) use presentation::NativePresentationTicket;
 pub use presentation::{

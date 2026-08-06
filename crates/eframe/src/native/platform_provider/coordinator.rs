@@ -34,6 +34,7 @@ use super::{
     pointer::{
         NativePointerCoordinateCapture, NativePointerEdge, NativePointerEdgeKind,
         NativePointerIdentity, NativePointerJournal, NativePointerSource,
+        NativePointerStreamCancelReason,
     },
     presentation::{
         NativeBindingIngressQuiesced, NativePresentationSerial, NativePresentationTicket,
@@ -130,7 +131,6 @@ pub(crate) struct NativePointerEdgeFacts {
     delivery_owner: NativeAuthority<NativePointerDeliveryOwner>,
     identity: NativePointerIdentity,
     kind: NativePointerEdgeKind,
-    stream_terminal: bool,
     position: NativeAuthority<NativePhysicalPoint>,
     hovered: NativeAuthority<NativeHoveredWindow>,
     hovered_coordinates: NativeAuthority<NativePointerCoordinateCapture>,
@@ -154,7 +154,6 @@ impl NativePointerEdgeFacts {
             delivery_owner,
             identity,
             kind,
-            stream_terminal: false,
             position,
             hovered,
             hovered_coordinates: NativeAuthority::unknown(NativeUnavailableReason::NotObserved),
@@ -185,11 +184,6 @@ impl NativePointerEdgeFacts {
         work_area: NativeAuthority<NativeWorkAreaRoute>,
     ) -> Self {
         self.work_area = work_area;
-        self
-    }
-
-    pub(crate) fn ending_stream(mut self) -> Self {
-        self.stream_terminal = true;
         self
     }
 }
@@ -573,6 +567,28 @@ impl NativePlatformCoordinator {
         )
     }
 
+    pub(crate) fn record_synthetic_pointer_cancel(
+        &mut self,
+        identity: NativePointerIdentity,
+        reason: NativePointerStreamCancelReason,
+    ) -> Result<NativePointerSequence, NativePlatformError> {
+        self.record_pointer_edge_inner(
+            None,
+            NativeScrollDerivativeDisposition::ExplicitNoDerivative(
+                NativeNoScrollDerivativeReason::JournalOnly,
+            ),
+            NativePointerEdgeFacts::new(
+                NativePointerSource::None,
+                NativeAuthority::known(NativePointerDeliveryOwner::None),
+                identity,
+                NativePointerEdgeKind::StreamCancelled(reason),
+                NativeAuthority::unknown(NativeUnavailableReason::Retired),
+                NativeAuthority::unknown(NativeUnavailableReason::Retired),
+                NativeAuthority::unknown(NativeUnavailableReason::Retired),
+            ),
+        )
+    }
+
     pub(crate) fn record_pointer_edge_for_backend(
         &mut self,
         backend_event_sequence: egui::BackendEventSequence,
@@ -657,7 +673,6 @@ impl NativePlatformCoordinator {
             delivery_owner: facts.delivery_owner,
             identity: facts.identity,
             kind: facts.kind,
-            stream_terminal: facts.stream_terminal,
             position: facts.position,
             hovered: facts.hovered,
             hovered_coordinates: facts.hovered_coordinates,
@@ -1639,8 +1654,9 @@ mod tests {
     use crate::native::platform_provider::{
         NativeAccessibilityAction, NativeAccessibilityEdge, NativeBackendCapability,
         NativeFiniteScrollVector, NativeIngressEvent, NativeKey, NativeKeyEdgeKind,
-        NativePointerButton, NativePointerDeviceId, NativePointerId, NativeScrollDelta,
-        NativeScrollEdge, NativeScrollPhase, NativeUnavailableReason, NativeWorkAreaGeneration,
+        NativePointerButton, NativePointerDeviceId, NativePointerId,
+        NativePointerStreamCancelReason, NativeScrollDelta, NativeScrollEdge, NativeScrollPhase,
+        NativeUnavailableReason, NativeWorkAreaGeneration,
     };
 
     fn viewport(name: &str) -> egui::ViewportId {
@@ -2019,35 +2035,52 @@ mod tests {
     }
 
     #[test]
-    fn terminal_pointer_edge_survives_the_frozen_ingress_boundary() {
+    fn terminal_pointer_edges_survive_the_frozen_ingress_boundary() {
         let mut coordinator = NativePlatformCoordinator::default();
         let binding = coordinator
             .register_viewport(viewport("terminal-touch"))
             .unwrap();
 
-        coordinator
-            .record_pointer_edge_for_backend(
-                egui::BackendEventSequence::new(1),
-                NativePointerEdgeFacts::new(
-                    NativePointerSource::Viewport(binding),
-                    native_delivery(binding),
-                    pointer(4, 9),
-                    NativePointerEdgeKind::ButtonReleased(NativePointerButton::Primary),
-                    unknown_point(),
-                    unknown_hover(),
-                    unknown_capture(),
+        let terminal_kinds = [
+            NativePointerEdgeKind::ContactEnded(NativePointerButton::Primary),
+            NativePointerEdgeKind::StreamEnded,
+            NativePointerEdgeKind::StreamCancelled(NativePointerStreamCancelReason::DeviceRemoved),
+        ];
+        for (index, kind) in terminal_kinds.into_iter().enumerate() {
+            coordinator
+                .record_pointer_edge_for_backend(
+                    egui::BackendEventSequence::new(u128::try_from(index + 1).unwrap()),
+                    NativePointerEdgeFacts::new(
+                        NativePointerSource::Viewport(binding),
+                        native_delivery(binding),
+                        pointer(4, u64::try_from(index + 9).unwrap()),
+                        kind,
+                        unknown_point(),
+                        unknown_hover(),
+                        unknown_capture(),
+                    ),
                 )
-                .ending_stream(),
-            )
-            .unwrap();
+                .unwrap();
+        }
 
         let ingress = freeze_single_binding(&mut coordinator, binding);
-        let edge = &ingress.pointer_journal().edges()[0];
-        assert!(matches!(
-            edge.kind(),
-            NativePointerEdgeKind::ButtonReleased(NativePointerButton::Primary)
-        ));
-        assert!(edge.ends_stream());
+        assert!(
+            ingress
+                .pointer_journal()
+                .edges()
+                .iter()
+                .map(NativePointerEdge::kind)
+                .eq(terminal_kinds)
+        );
+        assert!(
+            ingress
+                .pointer_journal()
+                .edges()
+                .iter()
+                .all(NativePointerEdge::ends_stream)
+        );
+        assert!(!NativePointerEdgeKind::Moved.ends_stream());
+        assert!(!NativePointerEdgeKind::ButtonReleased(NativePointerButton::Primary).ends_stream());
     }
 
     #[test]
