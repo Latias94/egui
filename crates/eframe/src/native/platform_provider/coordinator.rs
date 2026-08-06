@@ -2,7 +2,10 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::native::platform_ingress_owner::NativeBindingIngressOwnerQuiescence;
+use crate::native::{
+    coordinator_wake::NativeCoordinatorWake,
+    platform_ingress_owner::NativeBindingIngressOwnerQuiescence,
+};
 
 use super::{
     accessibility::NativeAccessibilityEdge,
@@ -49,9 +52,13 @@ use super::{
     work_area::{NativeWorkAreaRosterObservation, NativeWorkAreaRoute},
 };
 
-/// Pure state owner for graph-agnostic native facts and causal ledgers.
+/// State owner for graph-agnostic native facts and causal ledgers.
+///
+/// `wake` is a non-authoritative liveness sidecar: it exposes only that a new
+/// record exists and never participates in validation, ordering, or snapshots.
 #[derive(Debug, Default)]
 pub(crate) struct NativePlatformCoordinator {
+    wake: NativeCoordinatorWake,
     active: BTreeMap<egui::ViewportId, NativeViewportBinding>,
     minted: BTreeSet<NativeViewportBinding>,
     tombstones: BTreeMap<NativeViewportBinding, NativeRetirementTombstone>,
@@ -189,6 +196,13 @@ impl NativePointerEdgeFacts {
 }
 
 impl NativePlatformCoordinator {
+    pub(in crate::native) fn with_wake(wake: NativeCoordinatorWake) -> Self {
+        Self {
+            wake,
+            ..Self::default()
+        }
+    }
+
     pub(crate) fn register_viewport(
         &mut self,
         viewport_id: egui::ViewportId,
@@ -1147,6 +1161,15 @@ impl NativePlatformCoordinator {
         ticket: NativePresentationTicket,
         result: egui::PresentationResult,
     ) -> Result<(), NativePlatformError> {
+        self.record_presentation_result_with_follow_up(ticket, result, false)
+    }
+
+    pub(crate) fn record_presentation_result_with_follow_up(
+        &mut self,
+        ticket: NativePresentationTicket,
+        result: egui::PresentationResult,
+        requires_follow_up: bool,
+    ) -> Result<(), NativePlatformError> {
         let binding = ticket.binding;
         let serial = ticket.serial;
         let lane = self
@@ -1203,6 +1226,9 @@ impl NativePlatformCoordinator {
                 None,
                 NativeIngressRecordKind::PresentationResult(result),
             );
+            if requires_follow_up {
+                self.wake.notify_record_available();
+            }
         }
         if let (Some(ordinal), Some((retirement_generation, last_started_presentation))) =
             (quiescence_ordinal, binding_ingress_quiescence)
@@ -1288,6 +1314,8 @@ impl NativePlatformCoordinator {
         }
         let snapshot_generation = self.next_snapshot_generation()?;
         let snapshot_ordinal = self.next_ingress_ordinal()?;
+
+        self.wake.begin_consume();
 
         let global = self
             .pending_global_facts
@@ -1631,11 +1659,19 @@ impl NativePlatformCoordinator {
             "native ingress records must commit the preflighted next ordinal"
         );
         self.ingress_ordinal = ordinal.get();
+        let should_wake = !matches!(
+            &kind,
+            NativeIngressRecordKind::PlatformSnapshot(_)
+                | NativeIngressRecordKind::PresentationResult(_)
+        );
         self.pending_ingress_records.push(NativeIngressRecord::new(
             ordinal,
             backend_event_sequence,
             kind,
         ));
+        if should_wake {
+            self.wake.notify_record_available();
+        }
     }
 
     fn next_snapshot_generation(
@@ -3315,6 +3351,44 @@ mod tests {
         assert_eq!(bound.binding(), first);
         assert_ne!(bound.binding(), second);
         assert_eq!(bound.result().viewport_id(), viewport_id);
+    }
+
+    #[test]
+    fn only_demanded_presentation_results_wake_the_next_hosted_cycle() {
+        let wake = NativeCoordinatorWake::default();
+        let mut coordinator = NativePlatformCoordinator::with_wake(wake.clone());
+        let binding = coordinator
+            .register_viewport(viewport("presentation-follow-up"))
+            .unwrap();
+
+        let ordinary = coordinator.begin_presentation(binding).unwrap();
+        coordinator
+            .record_presentation_result(
+                ordinary,
+                egui::PresentationResult::new(
+                    binding.viewport_id(),
+                    egui::UserData::new("ordinary"),
+                    egui::PaintOutcome::SubmittedToSwapchain,
+                    None,
+                ),
+            )
+            .unwrap();
+        assert!(!wake.is_pending());
+
+        let demanded = coordinator.begin_presentation(binding).unwrap();
+        coordinator
+            .record_presentation_result_with_follow_up(
+                demanded,
+                egui::PresentationResult::new(
+                    binding.viewport_id(),
+                    egui::UserData::new("demanded"),
+                    egui::PaintOutcome::SubmittedToSwapchain,
+                    None,
+                ),
+                true,
+            )
+            .unwrap();
+        assert!(wake.is_pending());
     }
 
     #[test]

@@ -14,14 +14,14 @@ use super::platform_provider::{
     NativeAccessibilityEdge, NativeAuthority, NativeBackendCapabilities, NativeCaptureOwner,
     NativeCloseState, NativeEffectDispatchOutcome, NativeEffectProperty, NativeEffectRequest,
     NativeFiniteScrollVector, NativeFocusedWindow, NativeHostIngress, NativeHoveredWindow,
-    NativeKeyEdge, NativePhysicalPoint, NativePhysicalRect, NativePlatformError,
-    NativePointerButton, NativePointerCoordinateCapture, NativePointerDeliveryOwner,
-    NativePointerDeviceId, NativePointerEdgeFacts, NativePointerEdgeKind, NativePointerId,
-    NativePointerIdentity, NativePointerInputState, NativePointerSource,
-    NativePointerStreamCancelReason, NativePresentationState, NativeScrollCancelReason,
-    NativeScrollDelta, NativeScrollEdge, NativeScrollModifiers, NativeScrollPhase,
-    NativeScrollSequenceToken, NativeUnavailableReason, NativeViewportBinding, NativeWindowEffect,
-    NativeWorkAreaRoute, ObservationAcknowledgement, PreparedNativeHostIngress,
+    NativeKeyEdge, NativePhysicalPoint, NativePhysicalRect, NativePlatformCoordinator,
+    NativePlatformError, NativePointerButton, NativePointerCoordinateCapture,
+    NativePointerDeliveryOwner, NativePointerDeviceId, NativePointerEdgeFacts,
+    NativePointerEdgeKind, NativePointerId, NativePointerIdentity, NativePointerInputState,
+    NativePointerSource, NativePointerStreamCancelReason, NativePresentationState,
+    NativeScrollCancelReason, NativeScrollDelta, NativeScrollEdge, NativeScrollModifiers,
+    NativeScrollPhase, NativeScrollSequenceToken, NativeUnavailableReason, NativeViewportBinding,
+    NativeWindowEffect, NativeWorkAreaRoute, ObservationAcknowledgement, PreparedNativeHostIngress,
     SharedNativePlatformCoordinator,
 };
 #[cfg(feature = "native-test-support")]
@@ -337,6 +337,16 @@ impl Default for NativePlatformIngressOwner {
 }
 
 impl NativePlatformIngressOwner {
+    pub(super) fn new(context: egui::Context) -> Self {
+        let mut owner = Self::default();
+        owner.coordinator = Arc::new(egui::mutex::Mutex::new(
+            NativePlatformCoordinator::with_wake(
+                crate::native::coordinator_wake::NativeCoordinatorWake::new(context),
+            ),
+        ));
+        owner
+    }
+
     pub(super) fn coordinator(&self) -> SharedNativePlatformCoordinator {
         Arc::clone(&self.coordinator)
     }

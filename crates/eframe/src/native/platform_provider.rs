@@ -30,11 +30,9 @@ pub use authority::{
     NativePointerSequence, NativePresentationState, NativeUnavailableReason, NativeViewportBinding,
     NativeViewportCreateRequestId, NativeViewportIncarnation,
 };
-#[cfg(test)]
-pub(crate) use coordinator::NativePlatformCoordinator;
 pub(crate) use coordinator::{
-    NativeHostIngressSettlementKey, NativePointerEdgeFacts, PreparedNativeHostIngress,
-    SharedNativePlatformCoordinator,
+    NativeHostIngressSettlementKey, NativePlatformCoordinator, NativePointerEdgeFacts,
+    PreparedNativeHostIngress, SharedNativePlatformCoordinator,
 };
 pub(crate) use create::NativeViewportCreateRequest;
 pub use create::{

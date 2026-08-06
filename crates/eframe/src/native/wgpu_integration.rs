@@ -361,7 +361,8 @@ impl<'app> WgpuWinitApp<'app> {
             },
         );
 
-        let platform_ingress = super::platform_ingress_owner::NativePlatformIngressOwner::default();
+        let platform_ingress =
+            super::platform_ingress_owner::NativePlatformIngressOwner::new(egui_ctx.clone());
         let presentation_results = super::PresentationResults::new(
             self.native_options.presentation_result_hook.clone(),
             platform_ingress.coordinator(),

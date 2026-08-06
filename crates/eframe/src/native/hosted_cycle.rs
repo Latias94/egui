@@ -257,6 +257,7 @@ pub struct HostedViewportOutput<T> {
     output: T,
     native_authority: Option<HostedNativeOutputAuthority>,
     native_staging_presentation: Option<HostedNativeOutputAuthority>,
+    presentation_result_follow_up: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -352,6 +353,29 @@ impl std::fmt::Display for HostedNativeStagingPresentationError {
 
 impl std::error::Error for HostedNativeStagingPresentationError {}
 
+/// Why a hosted output could not request a follow-up cycle after presentation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HostedPresentationFollowUpError {
+    /// The output has no opaque token from which a renderer result can be produced.
+    PresentationTokenMissing {
+        /// Output which omitted its presentation token.
+        viewport_id: ViewportId,
+    },
+}
+
+impl std::fmt::Display for HostedPresentationFollowUpError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::PresentationTokenMissing { viewport_id } => write!(
+                formatter,
+                "hosted output {viewport_id:?} cannot request a presentation follow-up without a token"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for HostedPresentationFollowUpError {}
+
 /// Drives one hosted viewport cycle through its ordered begin, viewport, and
 /// end phases.
 ///
@@ -410,6 +434,7 @@ impl<T> HostedViewportOutput<T> {
             output,
             native_authority: None,
             native_staging_presentation: None,
+            presentation_result_follow_up: false,
         }
     }
 
@@ -423,6 +448,7 @@ impl<T> HostedViewportOutput<T> {
             output,
             native_authority,
             native_staging_presentation: None,
+            presentation_result_follow_up: false,
         }
     }
 
@@ -445,6 +471,10 @@ impl<T> HostedViewportOutput<T> {
         self.native_staging_presentation.is_some()
     }
 
+    pub(super) const fn presentation_result_requires_follow_up(&self) -> bool {
+        self.presentation_result_follow_up
+    }
+
     /// Returns the exact native lifetime that authorized this hosted output.
     ///
     /// Transactional adapters use this fact before committing their semantic
@@ -464,6 +494,22 @@ impl<T> HostedViewportOutput<T> {
 }
 
 impl HostedViewportOutput<egui::FullOutput> {
+    /// Requests one root hosted cycle after this output reaches a terminal renderer result.
+    ///
+    /// This is intended for affine application protocols whose next state depends on the exact
+    /// presentation result. Ordinary continuously rendered outputs should leave it disabled.
+    pub fn require_presentation_result_follow_up(
+        &mut self,
+    ) -> Result<(), HostedPresentationFollowUpError> {
+        if self.output.platform_output.presentation_token.is_none() {
+            return Err(HostedPresentationFollowUpError::PresentationTokenMissing {
+                viewport_id: self.viewport_id,
+            });
+        }
+        self.presentation_result_follow_up = true;
+        Ok(())
+    }
+
     /// Validates a native staging authorization without consuming it.
     ///
     /// This is the prepare half of the hosted output transaction. The caller
@@ -918,6 +964,7 @@ pub(super) fn arm_hosted_presentations(
         .map(|output| {
             let native_staging_presentation = output.is_native_staging_presentation();
             let native_binding = output.native_binding();
+            let requires_follow_up = output.presentation_result_requires_follow_up();
             let (viewport_id, mut full_output) = output.into_parts();
             let pointer_hit_graph_candidate = pointer_hit_graph_candidate_for_hosted_output(
                 viewport_id,
@@ -930,6 +977,7 @@ pub(super) fn arm_hosted_presentations(
                 native_binding,
                 full_output.platform_output.presentation_token.take(),
             )
+            .with_follow_up_requirement(requires_follow_up)
             .with_pointer_hit_graph_candidate(pointer_hit_graph_candidate);
 
             ArmedHostedOutput {
@@ -2048,6 +2096,24 @@ mod tests {
             events: vec![derivation.envelope(event)],
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn presentation_follow_up_requires_and_preserves_an_exact_renderer_token() {
+        let mut output = HostedViewportOutput::new(ViewportId::ROOT, egui::FullOutput::default());
+        assert_eq!(
+            output.require_presentation_result_follow_up(),
+            Err(HostedPresentationFollowUpError::PresentationTokenMissing {
+                viewport_id: ViewportId::ROOT,
+            })
+        );
+
+        output.output_mut().platform_output.presentation_token =
+            Some(egui::UserData::new("follow-up"));
+        output
+            .require_presentation_result_follow_up()
+            .expect("an exact renderer token can request one follow-up cycle");
+        assert!(output.presentation_result_requires_follow_up());
     }
 
     #[test]

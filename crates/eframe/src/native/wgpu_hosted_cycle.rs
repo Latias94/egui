@@ -819,6 +819,7 @@ fn settle_aborted_outputs(
     for output in outputs {
         let viewport_id = output.viewport_id();
         let native_binding = output.native_binding();
+        let requires_follow_up = output.presentation_result_requires_follow_up();
         let full_output = output.output_mut();
         if let Some(render_state) = render_state {
             synchronize_texture_output(
@@ -833,6 +834,7 @@ fn settle_aborted_outputs(
             native_binding,
             full_output.platform_output.presentation_token.take(),
         )
+        .with_follow_up_requirement(requires_follow_up)
         .with_pointer_hit_graph_candidate(full_output.pointer_hit_graph_candidate.take())
         .complete(egui::PaintOutcome::Failed(
             egui::PaintFailure::CoordinatorAborted,

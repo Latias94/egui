@@ -1,4 +1,5 @@
 mod app_icon;
+mod coordinator_wake;
 mod epi_integration;
 mod event_loop_context;
 mod native_effect_sink;
@@ -63,11 +64,12 @@ impl PresentationResults {
         &self,
         ticket: platform_provider::NativePresentationTicket,
         result: egui::PresentationResult,
+        requires_follow_up: bool,
     ) {
         if let Err(error) = self
             .coordinator
             .lock()
-            .record_presentation_result(ticket, result.clone())
+            .record_presentation_result_with_follow_up(ticket, result.clone(), requires_follow_up)
         {
             log::error!("native presentation result rejected before hook dispatch: {error}");
             return;
@@ -104,6 +106,7 @@ pub(crate) struct PendingPresentation {
     token: Option<egui::UserData>,
     ticket: Option<platform_provider::NativePresentationTicket>,
     pointer_hit_graph_candidate: Option<egui::PointerHitGraphCandidate>,
+    requires_follow_up: bool,
 }
 
 #[cfg(any(feature = "glow", feature = "wgpu_no_default_features"))]
@@ -137,7 +140,13 @@ impl PendingPresentation {
             token,
             ticket,
             pointer_hit_graph_candidate: None,
+            requires_follow_up: false,
         }
+    }
+
+    pub(crate) fn with_follow_up_requirement(mut self, requires_follow_up: bool) -> Self {
+        self.requires_follow_up = requires_follow_up;
+        self
     }
 
     pub(crate) fn with_pointer_hit_graph_candidate(
@@ -180,6 +189,7 @@ impl PendingPresentation {
                 outcome,
                 self.pointer_hit_graph_candidate.take(),
             ),
+            self.requires_follow_up,
         );
     }
 }

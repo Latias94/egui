@@ -964,7 +964,8 @@ impl GlutinWindowContext {
         // help us start from scratch again if we fail context creation and go back to preferEgl or try with different config etc..
         // https://github.com/emilk/egui/pull/2541#issuecomment-1370767582
 
-        let platform_ingress = super::platform_ingress_owner::NativePlatformIngressOwner::default();
+        let platform_ingress =
+            super::platform_ingress_owner::NativePlatformIngressOwner::new(egui_ctx.clone());
         let presentation_results = super::PresentationResults::new(
             native_options.presentation_result_hook.clone(),
             platform_ingress.coordinator(),
