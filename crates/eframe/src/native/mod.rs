@@ -64,12 +64,12 @@ impl PresentationResults {
         &self,
         ticket: platform_provider::NativePresentationTicket,
         result: egui::PresentationResult,
-        requires_follow_up: bool,
+        follow_up: Option<hosted_cycle::HostedPresentationFollowUp>,
     ) {
         if let Err(error) = self
             .coordinator
             .lock()
-            .record_presentation_result_with_follow_up(ticket, result.clone(), requires_follow_up)
+            .record_presentation_result_with_follow_up(ticket, result.clone(), follow_up)
         {
             log::error!("native presentation result rejected before hook dispatch: {error}");
             return;
@@ -106,7 +106,7 @@ pub(crate) struct PendingPresentation {
     token: Option<egui::UserData>,
     ticket: Option<platform_provider::NativePresentationTicket>,
     pointer_hit_graph_candidate: Option<egui::PointerHitGraphCandidate>,
-    requires_follow_up: bool,
+    follow_up: Option<hosted_cycle::HostedPresentationFollowUp>,
 }
 
 #[cfg(any(feature = "glow", feature = "wgpu_no_default_features"))]
@@ -140,12 +140,15 @@ impl PendingPresentation {
             token,
             ticket,
             pointer_hit_graph_candidate: None,
-            requires_follow_up: false,
+            follow_up: None,
         }
     }
 
-    pub(crate) fn with_follow_up_requirement(mut self, requires_follow_up: bool) -> Self {
-        self.requires_follow_up = requires_follow_up;
+    pub(crate) fn with_follow_up_requirement(
+        mut self,
+        follow_up: Option<hosted_cycle::HostedPresentationFollowUp>,
+    ) -> Self {
+        self.follow_up = follow_up;
         self
     }
 
@@ -189,7 +192,7 @@ impl PendingPresentation {
                 outcome,
                 self.pointer_hit_graph_candidate.take(),
             ),
-            self.requires_follow_up,
+            self.follow_up,
         );
     }
 }
@@ -322,15 +325,16 @@ mod tests {
     }
 
     #[test]
-    fn demanded_renderer_result_wakes_once_while_ordinary_result_stays_idle() {
+    fn renderer_result_wakes_only_for_its_requested_terminal_class() {
         let context = egui::Context::default();
         let wake_count = Arc::new(AtomicUsize::new(0));
         let observed = Arc::clone(&wake_count);
         context.set_request_repaint_callback(move |_| {
             observed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         });
+        let wake = NativeCoordinatorWake::new(context);
         let coordinator = Arc::new(egui::mutex::Mutex::new(
-            NativePlatformCoordinator::with_wake(NativeCoordinatorWake::new(context)),
+            NativePlatformCoordinator::with_wake(wake.clone()),
         ));
         let binding = coordinator
             .lock()
@@ -348,13 +352,43 @@ mod tests {
         assert_eq!(wake_count.load(std::sync::atomic::Ordering::Relaxed), 0);
 
         PendingPresentation::new(
+            results.clone(),
+            egui::ViewportId::ROOT,
+            Some(binding),
+            Some(egui::UserData::new("skipped-success")),
+        )
+        .with_follow_up_requirement(Some(
+            crate::HostedPresentationFollowUp::SuccessfulSubmission,
+        ))
+        .complete(egui::PaintOutcome::Skipped(
+            egui::PaintSkipReason::SurfaceOccluded,
+        ));
+        assert_eq!(wake_count.load(std::sync::atomic::Ordering::Relaxed), 0);
+
+        PendingPresentation::new(
+            results.clone(),
+            egui::ViewportId::ROOT,
+            Some(binding),
+            Some(egui::UserData::new("successful")),
+        )
+        .with_follow_up_requirement(Some(
+            crate::HostedPresentationFollowUp::SuccessfulSubmission,
+        ))
+        .complete(egui::PaintOutcome::SubmittedToSwapchain);
+        assert_eq!(wake_count.load(std::sync::atomic::Ordering::Relaxed), 1);
+
+        wake.begin_consume();
+        PendingPresentation::new(
             results,
             egui::ViewportId::ROOT,
             Some(binding),
-            Some(egui::UserData::new("demanded")),
+            Some(egui::UserData::new("failed-terminal")),
         )
-        .with_follow_up_requirement(true)
-        .complete(egui::PaintOutcome::SubmittedToSwapchain);
+        .with_follow_up_requirement(Some(crate::HostedPresentationFollowUp::AnyResult))
+        .complete(egui::PaintOutcome::Failed(
+            egui::PaintFailure::CoordinatorAborted,
+        ));
+        assert!(wake.is_pending());
         assert_eq!(wake_count.load(std::sync::atomic::Ordering::Relaxed), 1);
     }
 

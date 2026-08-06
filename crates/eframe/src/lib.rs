@@ -201,10 +201,11 @@ pub use native::run::EframeWinitApplication;
 #[cfg(any(feature = "glow", feature = "wgpu_no_default_features"))]
 pub use native::hosted_cycle::{
     HostedImmediateViewportViolation, HostedNativeStagingPresentation,
-    HostedNativeStagingPresentationError, HostedPresentationFollowUpError, HostedViewportCycle,
-    HostedViewportCycleAbort, HostedViewportCycleAbortParts, HostedViewportCycleDriver,
-    HostedViewportCycleError, HostedViewportInput, HostedViewportOutput,
-    HostedViewportTransactionGuard, check_hosted_immediate_viewport,
+    HostedNativeStagingPresentationError, HostedPresentationFollowUp,
+    HostedPresentationFollowUpError, HostedViewportCycle, HostedViewportCycleAbort,
+    HostedViewportCycleAbortParts, HostedViewportCycleDriver, HostedViewportCycleError,
+    HostedViewportInput, HostedViewportOutput, HostedViewportTransactionGuard,
+    check_hosted_immediate_viewport,
 };
 
 #[cfg(not(target_arch = "wasm32"))]

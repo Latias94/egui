@@ -89,5 +89,9 @@ mod tests {
 
         wake.begin_consume();
         assert!(!wake.is_pending());
+
+        wake.notify_record_available();
+        assert!(wake.is_pending());
+        assert_eq!(wake_count.load(Ordering::Relaxed), 1);
     }
 }

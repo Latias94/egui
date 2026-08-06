@@ -1161,14 +1161,14 @@ impl NativePlatformCoordinator {
         ticket: NativePresentationTicket,
         result: egui::PresentationResult,
     ) -> Result<(), NativePlatformError> {
-        self.record_presentation_result_with_follow_up(ticket, result, false)
+        self.record_presentation_result_with_follow_up(ticket, result, None)
     }
 
     pub(crate) fn record_presentation_result_with_follow_up(
         &mut self,
         ticket: NativePresentationTicket,
         result: egui::PresentationResult,
-        requires_follow_up: bool,
+        follow_up: Option<crate::HostedPresentationFollowUp>,
     ) -> Result<(), NativePlatformError> {
         let binding = ticket.binding;
         let serial = ticket.serial;
@@ -1221,12 +1221,14 @@ impl NativePlatformCoordinator {
         }
 
         if let (Some(ordinal), Some(result)) = (result_ordinal, result) {
+            let should_wake =
+                follow_up.is_some_and(|follow_up| follow_up.matches(result.result().outcome()));
             self.commit_ingress_record(
                 ordinal,
                 None,
                 NativeIngressRecordKind::PresentationResult(result),
             );
-            if requires_follow_up {
+            if should_wake {
                 self.wake.notify_record_available();
             }
         }
@@ -3354,7 +3356,7 @@ mod tests {
     }
 
     #[test]
-    fn only_demanded_presentation_results_wake_the_next_hosted_cycle() {
+    fn presentation_follow_up_matches_the_requested_terminal_class() {
         let wake = NativeCoordinatorWake::default();
         let mut coordinator = NativePlatformCoordinator::with_wake(wake.clone());
         let binding = coordinator
@@ -3375,17 +3377,48 @@ mod tests {
             .unwrap();
         assert!(!wake.is_pending());
 
-        let demanded = coordinator.begin_presentation(binding).unwrap();
+        let skipped_success = coordinator.begin_presentation(binding).unwrap();
         coordinator
             .record_presentation_result_with_follow_up(
-                demanded,
+                skipped_success,
                 egui::PresentationResult::new(
                     binding.viewport_id(),
-                    egui::UserData::new("demanded"),
+                    egui::UserData::new("skipped-success"),
+                    egui::PaintOutcome::Skipped(egui::PaintSkipReason::SurfaceOccluded),
+                    None,
+                ),
+                Some(crate::HostedPresentationFollowUp::SuccessfulSubmission),
+            )
+            .unwrap();
+        assert!(!wake.is_pending());
+
+        let successful = coordinator.begin_presentation(binding).unwrap();
+        coordinator
+            .record_presentation_result_with_follow_up(
+                successful,
+                egui::PresentationResult::new(
+                    binding.viewport_id(),
+                    egui::UserData::new("successful"),
                     egui::PaintOutcome::SubmittedToSwapchain,
                     None,
                 ),
-                true,
+                Some(crate::HostedPresentationFollowUp::SuccessfulSubmission),
+            )
+            .unwrap();
+        assert!(wake.is_pending());
+
+        wake.begin_consume();
+        let failed_terminal = coordinator.begin_presentation(binding).unwrap();
+        coordinator
+            .record_presentation_result_with_follow_up(
+                failed_terminal,
+                egui::PresentationResult::new(
+                    binding.viewport_id(),
+                    egui::UserData::new("failed-terminal"),
+                    egui::PaintOutcome::Failed(egui::PaintFailure::CoordinatorAborted),
+                    None,
+                ),
+                Some(crate::HostedPresentationFollowUp::AnyResult),
             )
             .unwrap();
         assert!(wake.is_pending());

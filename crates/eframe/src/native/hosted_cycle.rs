@@ -257,7 +257,7 @@ pub struct HostedViewportOutput<T> {
     output: T,
     native_authority: Option<HostedNativeOutputAuthority>,
     native_staging_presentation: Option<HostedNativeOutputAuthority>,
-    presentation_result_follow_up: bool,
+    presentation_result_follow_up: Option<HostedPresentationFollowUp>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -376,6 +376,27 @@ impl std::fmt::Display for HostedPresentationFollowUpError {
 
 impl std::error::Error for HostedPresentationFollowUpError {}
 
+/// Which terminal renderer result must schedule another root hosted cycle.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HostedPresentationFollowUp {
+    /// Continue only after a successful native renderer submission.
+    SuccessfulSubmission,
+    /// Continue after any terminal renderer result, including skip or failure.
+    AnyResult,
+}
+
+impl HostedPresentationFollowUp {
+    pub(crate) const fn matches(self, outcome: &egui::PaintOutcome) -> bool {
+        match self {
+            Self::SuccessfulSubmission => matches!(
+                outcome,
+                egui::PaintOutcome::SubmittedToSwapchain | egui::PaintOutcome::Swapped
+            ),
+            Self::AnyResult => true,
+        }
+    }
+}
+
 /// Drives one hosted viewport cycle through its ordered begin, viewport, and
 /// end phases.
 ///
@@ -434,7 +455,7 @@ impl<T> HostedViewportOutput<T> {
             output,
             native_authority: None,
             native_staging_presentation: None,
-            presentation_result_follow_up: false,
+            presentation_result_follow_up: None,
         }
     }
 
@@ -448,7 +469,7 @@ impl<T> HostedViewportOutput<T> {
             output,
             native_authority,
             native_staging_presentation: None,
-            presentation_result_follow_up: false,
+            presentation_result_follow_up: None,
         }
     }
 
@@ -471,7 +492,7 @@ impl<T> HostedViewportOutput<T> {
         self.native_staging_presentation.is_some()
     }
 
-    pub(super) const fn presentation_result_requires_follow_up(&self) -> bool {
+    pub(super) const fn presentation_result_follow_up(&self) -> Option<HostedPresentationFollowUp> {
         self.presentation_result_follow_up
     }
 
@@ -500,13 +521,23 @@ impl HostedViewportOutput<egui::FullOutput> {
     /// presentation result. Ordinary continuously rendered outputs should leave it disabled.
     pub fn require_presentation_result_follow_up(
         &mut self,
+        follow_up: HostedPresentationFollowUp,
     ) -> Result<(), HostedPresentationFollowUpError> {
         if self.output.platform_output.presentation_token.is_none() {
             return Err(HostedPresentationFollowUpError::PresentationTokenMissing {
                 viewport_id: self.viewport_id,
             });
         }
-        self.presentation_result_follow_up = true;
+        self.presentation_result_follow_up = Some(match self.presentation_result_follow_up {
+            Some(HostedPresentationFollowUp::AnyResult) => HostedPresentationFollowUp::AnyResult,
+            Some(HostedPresentationFollowUp::SuccessfulSubmission)
+                if follow_up == HostedPresentationFollowUp::AnyResult =>
+            {
+                HostedPresentationFollowUp::AnyResult
+            }
+            Some(existing) => existing,
+            None => follow_up,
+        });
         Ok(())
     }
 
@@ -964,7 +995,7 @@ pub(super) fn arm_hosted_presentations(
         .map(|output| {
             let native_staging_presentation = output.is_native_staging_presentation();
             let native_binding = output.native_binding();
-            let requires_follow_up = output.presentation_result_requires_follow_up();
+            let follow_up = output.presentation_result_follow_up();
             let (viewport_id, mut full_output) = output.into_parts();
             let pointer_hit_graph_candidate = pointer_hit_graph_candidate_for_hosted_output(
                 viewport_id,
@@ -977,7 +1008,7 @@ pub(super) fn arm_hosted_presentations(
                 native_binding,
                 full_output.platform_output.presentation_token.take(),
             )
-            .with_follow_up_requirement(requires_follow_up)
+            .with_follow_up_requirement(follow_up)
             .with_pointer_hit_graph_candidate(pointer_hit_graph_candidate);
 
             ArmedHostedOutput {
@@ -2102,7 +2133,9 @@ mod tests {
     fn presentation_follow_up_requires_and_preserves_an_exact_renderer_token() {
         let mut output = HostedViewportOutput::new(ViewportId::ROOT, egui::FullOutput::default());
         assert_eq!(
-            output.require_presentation_result_follow_up(),
+            output.require_presentation_result_follow_up(
+                HostedPresentationFollowUp::SuccessfulSubmission,
+            ),
             Err(HostedPresentationFollowUpError::PresentationTokenMissing {
                 viewport_id: ViewportId::ROOT,
             })
@@ -2111,9 +2144,19 @@ mod tests {
         output.output_mut().platform_output.presentation_token =
             Some(egui::UserData::new("follow-up"));
         output
-            .require_presentation_result_follow_up()
+            .require_presentation_result_follow_up(HostedPresentationFollowUp::SuccessfulSubmission)
             .expect("an exact renderer token can request one follow-up cycle");
-        assert!(output.presentation_result_requires_follow_up());
+        assert_eq!(
+            output.presentation_result_follow_up(),
+            Some(HostedPresentationFollowUp::SuccessfulSubmission)
+        );
+        output
+            .require_presentation_result_follow_up(HostedPresentationFollowUp::AnyResult)
+            .expect("a terminal requirement can strengthen the same renderer token");
+        assert_eq!(
+            output.presentation_result_follow_up(),
+            Some(HostedPresentationFollowUp::AnyResult)
+        );
     }
 
     #[test]
