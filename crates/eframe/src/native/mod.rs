@@ -220,7 +220,7 @@ mod tests {
     use std::sync::{Arc, atomic::AtomicUsize};
 
     use super::{
-        PendingPresentation, PresentationResults,
+        PendingPresentation, PresentationResults, coordinator_wake::NativeCoordinatorWake,
         hosted_cycle::pointer_hit_graph_candidate_for_hosted_output,
         platform_ingress_owner::NativeBindingIngressOwnerQuiescence,
         platform_provider::NativePlatformCoordinator,
@@ -319,6 +319,43 @@ mod tests {
             &egui::PaintOutcome::SubmittedToSwapchain
         );
         assert_eq!(results[0].token().downcast_ref::<u64>(), Some(&7));
+    }
+
+    #[test]
+    fn demanded_renderer_result_wakes_once_while_ordinary_result_stays_idle() {
+        let context = egui::Context::default();
+        let wake_count = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&wake_count);
+        context.set_request_repaint_callback(move |_| {
+            observed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        });
+        let coordinator = Arc::new(egui::mutex::Mutex::new(
+            NativePlatformCoordinator::with_wake(NativeCoordinatorWake::new(context)),
+        ));
+        let binding = coordinator
+            .lock()
+            .register_viewport(egui::ViewportId::ROOT)
+            .unwrap();
+        let results = PresentationResults::new(None, coordinator);
+
+        PendingPresentation::new(
+            results.clone(),
+            egui::ViewportId::ROOT,
+            Some(binding),
+            Some(egui::UserData::new("ordinary")),
+        )
+        .complete(egui::PaintOutcome::SubmittedToSwapchain);
+        assert_eq!(wake_count.load(std::sync::atomic::Ordering::Relaxed), 0);
+
+        PendingPresentation::new(
+            results,
+            egui::ViewportId::ROOT,
+            Some(binding),
+            Some(egui::UserData::new("demanded")),
+        )
+        .with_follow_up_requirement(true)
+        .complete(egui::PaintOutcome::SubmittedToSwapchain);
+        assert_eq!(wake_count.load(std::sync::atomic::Ordering::Relaxed), 1);
     }
 
     #[test]
