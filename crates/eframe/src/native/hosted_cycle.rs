@@ -201,9 +201,7 @@ pub struct HostedViewportCycle {
     inputs: BTreeMap<ViewportId, RawInput>,
     native_ingress: Option<Arc<crate::NativeHostIngress>>,
     claimed_native_event_envelopes: Arc<egui::mutex::Mutex<BTreeSet<(ViewportId, usize)>>>,
-    settled_native_scroll_edges: Arc<
-        egui::mutex::Mutex<BTreeSet<(crate::NativeViewportBinding, crate::NativePointerSequence)>>,
-    >,
+    settled_native_scroll_edges: Arc<egui::mutex::Mutex<BTreeSet<crate::NativePointerSequence>>>,
     native_effect_sink: Option<crate::NativeEffectSink>,
     native_viewport_create_sink: Option<crate::NativeViewportCreateSink>,
     native_staging_presentations: Arc<BTreeSet<crate::NativeViewportBinding>>,
@@ -1472,15 +1470,14 @@ impl HostedViewportCycle {
     ///
     /// A successful settlement either removes the one required correlated derivative before the
     /// callback viewport begins its egui pass or consumes a provider-minted explicit-absence
-    /// proof. The semantic scroll owner may differ from that callback viewport after a phaseful
-    /// sequence crosses a native-window boundary; backend event correlation, not viewport
-    /// equality, binds the derivative to the physical sample. Merely failing to find a wheel event
-    /// is not evidence of absence. Both outcomes prevent a native protocol consumer and egui's
-    /// `WheelState` from consuming the same physical sample.
+    /// proof. The provider-owned pointer sequence identifies the ingress record even after its
+    /// semantic owner retires or a terminal edge becomes bindingless. Required derivatives remain
+    /// bound by backend event correlation across the complete callback roster. Merely failing to
+    /// find a wheel event is not evidence of absence. Both outcomes prevent a native protocol
+    /// consumer and egui's `WheelState` from consuming the same physical sample.
     /// Unknown, ambiguous, foreign, mismatched, and repeated settlements fail closed.
     pub fn claim_native_scroll_derivative(
         &self,
-        semantic_binding: crate::NativeViewportBinding,
         pointer_sequence: crate::NativePointerSequence,
     ) -> bool {
         let Some(ingress) = self.native_ingress.as_deref() else {
@@ -1497,17 +1494,12 @@ impl HostedViewportCycle {
         let Some(record) = records.next() else {
             return false;
         };
-        if records.next().is_some()
-            || !native_ingress_record_matches_binding(record, semantic_binding)
-        {
+        if records.next().is_some() {
             return false;
         }
         let Some(disposition) = record.scroll_derivative_disposition() else {
             return false;
         };
-        if !self.inputs.contains_key(&semantic_binding.viewport_id()) {
-            return false;
-        }
         let mut derivatives =
             record
                 .backend_event_sequence()
@@ -1542,9 +1534,8 @@ impl HostedViewportCycle {
             }
             _ => {}
         }
-        let scroll_key = (semantic_binding, pointer_sequence);
         let mut settled_scroll_edges = self.settled_native_scroll_edges.lock();
-        if !settled_scroll_edges.insert(scroll_key) {
+        if !settled_scroll_edges.insert(pointer_sequence) {
             return false;
         }
         let Some((derivative_viewport, raw_event_index)) = derivative else {
@@ -1562,7 +1553,7 @@ impl HostedViewportCycle {
         {
             true
         } else {
-            settled_scroll_edges.remove(&scroll_key);
+            settled_scroll_edges.remove(&pointer_sequence);
             false
         }
     }

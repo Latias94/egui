@@ -1693,8 +1693,9 @@ mod tests {
         NativeAccessibilityAction, NativeAccessibilityEdge, NativeBackendCapability,
         NativeFiniteScrollVector, NativeIngressEvent, NativeKey, NativeKeyEdgeKind,
         NativePointerButton, NativePointerDeviceId, NativePointerId,
-        NativePointerStreamCancelReason, NativeScrollDelta, NativeScrollEdge, NativeScrollPhase,
-        NativeScrollSequenceToken, NativeUnavailableReason, NativeWorkAreaGeneration,
+        NativePointerStreamCancelReason, NativeScrollCancelReason, NativeScrollDelta,
+        NativeScrollEdge, NativeScrollPhase, NativeScrollSequenceToken, NativeUnavailableReason,
+        NativeWorkAreaGeneration,
     };
 
     fn viewport(name: &str) -> egui::ViewportId {
@@ -2784,9 +2785,9 @@ mod tests {
         let cycle = crate::HostedViewportCycle::with_native_ingress([raw_input], ingress)
             .expect("the wheel derivative and native journal form one exact cycle");
 
-        assert!(cycle.claim_native_scroll_derivative(binding, pointer_sequence));
+        assert!(cycle.claim_native_scroll_derivative(pointer_sequence));
         assert!(
-            !cycle.claim_native_scroll_derivative(binding, pointer_sequence),
+            !cycle.claim_native_scroll_derivative(pointer_sequence),
             "the exact wheel derivative is affine"
         );
         cycle
@@ -2863,7 +2864,7 @@ mod tests {
         )
         .expect("both native callback inputs form one exact hosted cycle");
 
-        assert!(cycle.claim_native_scroll_derivative(source, pointer_sequence));
+        assert!(cycle.claim_native_scroll_derivative(pointer_sequence));
         cycle
             .run(
                 [source_viewport, callback_viewport],
@@ -2918,7 +2919,7 @@ mod tests {
             .expect("a required wheel derivative still forms one exact native cycle");
 
         assert!(
-            !cycle.claim_native_scroll_derivative(binding, pointer_sequence),
+            !cycle.claim_native_scroll_derivative(pointer_sequence),
             "absence cannot prove that a required framework derivative never existed"
         );
     }
@@ -2963,11 +2964,98 @@ mod tests {
         let cycle = crate::HostedViewportCycle::with_native_ingress([raw_input], ingress)
             .expect("an explicitly journal-only scroll forms one exact native cycle");
 
-        assert!(cycle.claim_native_scroll_derivative(binding, pointer_sequence));
+        assert!(cycle.claim_native_scroll_derivative(pointer_sequence));
         assert!(
-            !cycle.claim_native_scroll_derivative(binding, pointer_sequence),
+            !cycle.claim_native_scroll_derivative(pointer_sequence),
             "the explicit absence proof is affine"
         );
+    }
+
+    #[test]
+    fn terminal_scroll_derivative_does_not_require_source_raw_input() {
+        let mut coordinator = NativePlatformCoordinator::default();
+        let root = coordinator
+            .register_viewport(egui::ViewportId::ROOT)
+            .unwrap();
+        let source_viewport = viewport("retired-scroll-owner");
+        let source = coordinator.register_viewport(source_viewport).unwrap();
+        let backend_sequence = egui::BackendEventSequence::new(661);
+        let scroll = NativeScrollEdge::new(
+            NativePointerDeviceId::new(9),
+            Some(NativeScrollSequenceToken::new(1)),
+            NativeScrollPhase::Cancel(NativeScrollCancelReason::BindingRetired),
+            None,
+            NativeAuthority::unknown(NativeUnavailableReason::Retired),
+            NativeAuthority::unknown(NativeUnavailableReason::Retired),
+        )
+        .unwrap();
+        let pointer_sequence = coordinator
+            .record_pointer_edge_without_derivative_for_backend(
+                backend_sequence,
+                NativePointerEdgeFacts::new(
+                    NativePointerSource::Viewport(source),
+                    native_delivery(source),
+                    pointer(9, 1),
+                    NativePointerEdgeKind::Scrolled(scroll),
+                    unknown_point(),
+                    unknown_hover(),
+                    unknown_capture(),
+                ),
+            )
+            .unwrap();
+        let root_input = egui::RawInput {
+            viewport_id: egui::ViewportId::ROOT,
+            ..Default::default()
+        };
+        record_complete_window_snapshot(&mut coordinator, root);
+        record_complete_window_snapshot(&mut coordinator, source);
+        record_unknown_platform_facts(&mut coordinator);
+        let ingress = coordinator.freeze_host_ingress().unwrap();
+        let cycle = crate::HostedViewportCycle::with_native_ingress([root_input], ingress)
+            .expect("a retired source may be absent from the hosted RawInput roster");
+
+        assert!(cycle.claim_native_scroll_derivative(pointer_sequence));
+    }
+
+    #[test]
+    fn terminal_scroll_derivative_accepts_bindingless_device_removal() {
+        let mut coordinator = NativePlatformCoordinator::default();
+        let root = coordinator
+            .register_viewport(egui::ViewportId::ROOT)
+            .unwrap();
+        let backend_sequence = egui::BackendEventSequence::new(662);
+        let scroll = NativeScrollEdge::new(
+            NativePointerDeviceId::new(9),
+            Some(NativeScrollSequenceToken::new(1)),
+            NativeScrollPhase::Cancel(NativeScrollCancelReason::DeviceRemoved),
+            None,
+            NativeAuthority::unknown(NativeUnavailableReason::Retired),
+            NativeAuthority::unknown(NativeUnavailableReason::Retired),
+        )
+        .unwrap();
+        let pointer_sequence = coordinator
+            .record_pointer_edge_without_derivative_for_backend(
+                backend_sequence,
+                NativePointerEdgeFacts::new(
+                    NativePointerSource::None,
+                    NativeAuthority::unknown(NativeUnavailableReason::Retired),
+                    pointer(9, 1),
+                    NativePointerEdgeKind::Scrolled(scroll),
+                    unknown_point(),
+                    unknown_hover(),
+                    unknown_capture(),
+                ),
+            )
+            .unwrap();
+        let root_input = egui::RawInput {
+            viewport_id: egui::ViewportId::ROOT,
+            ..Default::default()
+        };
+        let ingress = freeze_single_binding(&mut coordinator, root);
+        let cycle = crate::HostedViewportCycle::with_native_ingress([root_input], ingress)
+            .expect("a bindingless device terminal still forms one exact cycle");
+
+        assert!(cycle.claim_native_scroll_derivative(pointer_sequence));
     }
 
     #[test]
