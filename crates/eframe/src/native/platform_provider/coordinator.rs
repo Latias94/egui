@@ -1694,7 +1694,7 @@ mod tests {
         NativeFiniteScrollVector, NativeIngressEvent, NativeKey, NativeKeyEdgeKind,
         NativePointerButton, NativePointerDeviceId, NativePointerId,
         NativePointerStreamCancelReason, NativeScrollDelta, NativeScrollEdge, NativeScrollPhase,
-        NativeUnavailableReason, NativeWorkAreaGeneration,
+        NativeScrollSequenceToken, NativeUnavailableReason, NativeWorkAreaGeneration,
     };
 
     fn viewport(name: &str) -> egui::ViewportId {
@@ -2803,6 +2803,78 @@ mod tests {
                 |_| Ok(()),
             )
             .expect("the filtered hosted cycle remains complete");
+    }
+
+    #[test]
+    fn phaseful_scroll_derivative_may_arrive_on_a_later_callback_viewport() {
+        let mut coordinator = NativePlatformCoordinator::default();
+        let source_viewport = egui::ViewportId::ROOT;
+        let callback_viewport = viewport("scroll-callback");
+        let source = coordinator.register_viewport(source_viewport).unwrap();
+        let callback = coordinator.register_viewport(callback_viewport).unwrap();
+        let backend_sequence = egui::BackendEventSequence::new(641);
+        let scroll = NativeScrollEdge::new(
+            NativePointerDeviceId::new(9),
+            Some(NativeScrollSequenceToken::new(1)),
+            NativeScrollPhase::Update,
+            Some(NativeScrollDelta::Lines(
+                NativeFiniteScrollVector::new(0.0, 1.0).unwrap(),
+            )),
+            NativeAuthority::unknown(NativeUnavailableReason::NotObserved),
+            NativeAuthority::unknown(NativeUnavailableReason::NotObserved),
+        )
+        .unwrap();
+        let pointer_sequence = coordinator
+            .record_pointer_edge_for_backend(
+                backend_sequence,
+                NativePointerEdgeFacts::new(
+                    NativePointerSource::Viewport(source),
+                    native_delivery(callback),
+                    pointer(9, 1),
+                    NativePointerEdgeKind::Scrolled(scroll),
+                    unknown_point(),
+                    unknown_hover(),
+                    unknown_capture(),
+                ),
+            )
+            .unwrap();
+        let source_input = egui::RawInput {
+            viewport_id: source_viewport,
+            ..Default::default()
+        };
+        let mut derivation = egui::BackendEventDerivation::known(backend_sequence);
+        let callback_input = egui::RawInput {
+            viewport_id: callback_viewport,
+            events: vec![derivation.envelope(egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Line,
+                delta: egui::vec2(0.0, 1.0),
+                phase: egui::TouchPhase::Move,
+                modifiers: egui::Modifiers::NONE,
+            })],
+            ..Default::default()
+        };
+        record_complete_window_snapshot(&mut coordinator, source);
+        record_complete_window_snapshot(&mut coordinator, callback);
+        record_unknown_platform_facts(&mut coordinator);
+        let ingress = coordinator.freeze_host_ingress().unwrap();
+        let cycle = crate::HostedViewportCycle::with_native_ingress(
+            [source_input, callback_input],
+            ingress,
+        )
+        .expect("both native callback inputs form one exact hosted cycle");
+
+        assert!(cycle.claim_native_scroll_derivative(source, pointer_sequence));
+        cycle
+            .run(
+                [source_viewport, callback_viewport],
+                |_| Ok(()),
+                |input| {
+                    assert!(input.raw_input().events.is_empty());
+                    Ok(())
+                },
+                |_| Ok(()),
+            )
+            .expect("the cross-viewport derivative is removed before either egui pass");
     }
 
     #[test]

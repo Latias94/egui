@@ -1471,13 +1471,16 @@ impl HostedViewportCycle {
     /// Affinely settles the egui wheel derivative of one exact native scroll edge.
     ///
     /// A successful settlement either removes the one required correlated derivative before the
-    /// viewport begins its egui pass or consumes a provider-minted explicit-absence proof. Merely
-    /// failing to find a wheel event is not evidence of absence. Both outcomes prevent a native
-    /// protocol consumer and egui's `WheelState` from consuming the same physical sample.
+    /// callback viewport begins its egui pass or consumes a provider-minted explicit-absence
+    /// proof. The semantic scroll owner may differ from that callback viewport after a phaseful
+    /// sequence crosses a native-window boundary; backend event correlation, not viewport
+    /// equality, binds the derivative to the physical sample. Merely failing to find a wheel event
+    /// is not evidence of absence. Both outcomes prevent a native protocol consumer and egui's
+    /// `WheelState` from consuming the same physical sample.
     /// Unknown, ambiguous, foreign, mismatched, and repeated settlements fail closed.
     pub fn claim_native_scroll_derivative(
         &self,
-        binding: crate::NativeViewportBinding,
+        semantic_binding: crate::NativeViewportBinding,
         pointer_sequence: crate::NativePointerSequence,
     ) -> bool {
         let Some(ingress) = self.native_ingress.as_deref() else {
@@ -1494,13 +1497,15 @@ impl HostedViewportCycle {
         let Some(record) = records.next() else {
             return false;
         };
-        if records.next().is_some() || !native_ingress_record_matches_binding(record, binding) {
+        if records.next().is_some()
+            || !native_ingress_record_matches_binding(record, semantic_binding)
+        {
             return false;
         }
         let Some(disposition) = record.scroll_derivative_disposition() else {
             return false;
         };
-        if !self.inputs.contains_key(&binding.viewport_id()) {
+        if !self.inputs.contains_key(&semantic_binding.viewport_id()) {
             return false;
         }
         let mut derivatives =
@@ -1537,7 +1542,7 @@ impl HostedViewportCycle {
             }
             _ => {}
         }
-        let scroll_key = (binding, pointer_sequence);
+        let scroll_key = (semantic_binding, pointer_sequence);
         let mut settled_scroll_edges = self.settled_native_scroll_edges.lock();
         if !settled_scroll_edges.insert(scroll_key) {
             return false;
@@ -1550,10 +1555,6 @@ impl HostedViewportCycle {
                 )
             );
         };
-        if derivative_viewport != binding.viewport_id() {
-            settled_scroll_edges.remove(&scroll_key);
-            return false;
-        }
         if self
             .claimed_native_event_envelopes
             .lock()
