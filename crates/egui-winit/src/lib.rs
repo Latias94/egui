@@ -391,8 +391,20 @@ impl State {
                     consumed: false,
                 }
             }
-            WindowEvent::MouseInput { state, button, .. } => {
-                self.on_mouse_button_input(*state, *button);
+            WindowEvent::MouseInput {
+                state,
+                button,
+                position,
+                ..
+            } => {
+                let position = position.map(|position| {
+                    let pixels_per_point = pixels_per_point(&self.egui_ctx, window);
+                    egui::pos2(
+                        position.x as f32 / pixels_per_point,
+                        position.y as f32 / pixels_per_point,
+                    )
+                });
+                self.on_mouse_button_input(*state, *button, position);
                 EventResponse {
                     repaint: true,
                     consumed: self.egui_ctx.egui_wants_pointer_input(),
@@ -872,7 +884,11 @@ impl State {
         &mut self,
         state: winit::event::ElementState,
         button: winit::event::MouseButton,
+        event_position: Option<egui::Pos2>,
     ) {
+        if let Some(position) = event_position {
+            self.pointer_pos_in_points = Some(position);
+        }
         if let Some(pos) = self.pointer_pos_in_points
             && let Some(button) = translate_mouse_button(button)
         {
@@ -978,6 +994,7 @@ impl State {
                     self.on_mouse_button_input(
                         winit::event::ElementState::Pressed,
                         winit::event::MouseButton::Left,
+                        None,
                     );
                 }
                 winit::event::TouchPhase::Moved => {
@@ -988,6 +1005,7 @@ impl State {
                     self.on_mouse_button_input(
                         winit::event::ElementState::Released,
                         winit::event::MouseButton::Left,
+                        None,
                     );
                     // The pointer should vanish completely to not get any
                     // hover effects
@@ -2511,5 +2529,30 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn mouse_button_uses_event_time_position_without_emitting_a_move() {
+        let mut state = state();
+        state.pointer_pos_in_points = Some(egui::pos2(1.0, 2.0));
+        let event_position = egui::pos2(30.0, 40.0);
+
+        state.on_mouse_button_input(
+            winit::event::ElementState::Pressed,
+            winit::event::MouseButton::Left,
+            Some(event_position),
+        );
+
+        assert_eq!(state.pointer_pos_in_points, Some(event_position));
+        assert_eq!(state.egui_input.events.len(), 1);
+        assert!(matches!(
+            state.egui_input.events[0].event(),
+            egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                ..
+            } if *pos == event_position
+        ));
     }
 }

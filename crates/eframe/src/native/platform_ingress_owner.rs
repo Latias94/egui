@@ -515,7 +515,7 @@ impl NativePlatformIngressOwner {
                     device_id: *device_id,
                     stream: WinitPointerStream::Mouse,
                 };
-                let position = desktop_pointer_position(window, *position);
+                let position = desktop_pointer_position(window, Some(*position));
                 let hovered_coordinates = pointer_coordinate_capture(
                     &bound_route_windows,
                     &pointer_route.hovered,
@@ -549,13 +549,14 @@ impl NativePlatformIngressOwner {
                 device_id,
                 state,
                 button,
+                position,
             } => {
                 let key = WinitPointerKey {
                     device_id: *device_id,
                     stream: WinitPointerStream::Mouse,
                 };
                 let source = NativePointerSource::Viewport(binding);
-                let position = self.retained_pointer_position(key, source);
+                let position = desktop_pointer_position(window, *position);
                 let button = native_mouse_button(*button);
                 let kind = match state {
                     winit::event::ElementState::Pressed => {
@@ -652,7 +653,7 @@ impl NativePlatformIngressOwner {
                 };
                 validate_touch_phase(self.pointer_states.contains_key(&key), touch.phase)?;
                 let kind = native_touch_edge_kind(touch.phase);
-                let position = desktop_pointer_position(window, touch.location);
+                let position = desktop_pointer_position(window, Some(touch.location));
                 let hovered_coordinates = pointer_coordinate_capture(
                     &bound_route_windows,
                     &pointer_route.hovered,
@@ -957,10 +958,7 @@ impl NativePlatformIngressOwner {
             sample.phase,
             sample.modifiers.map(native_scroll_modifiers),
         )?;
-        let position = sample.position.map_or_else(
-            || NativeAuthority::unknown(NativeUnavailableReason::NotObserved),
-            |position| desktop_pointer_position(window, position),
-        );
+        let position = desktop_pointer_position(window, sample.position);
         let hovered_coordinates = pointer_coordinate_capture(
             bound_route_windows,
             &pointer_route.hovered,
@@ -995,20 +993,6 @@ impl NativePlatformIngressOwner {
             position,
         });
         Ok(())
-    }
-
-    fn retained_pointer_position(
-        &self,
-        key: WinitPointerKey,
-        source: NativePointerSource,
-    ) -> NativeAuthority<NativePhysicalPoint> {
-        self.pointer_states
-            .get(&key)
-            .filter(|state| state.source == source)
-            .map_or_else(
-                || NativeAuthority::unknown(NativeUnavailableReason::NotObserved),
-                |state| state.position.clone(),
-            )
     }
 
     #[cfg(feature = "accesskit")]
@@ -2092,9 +2076,19 @@ fn native_scroll_modifiers(state: winit::keyboard::ModifiersState) -> NativeScro
 
 fn desktop_pointer_position(
     window: &Window,
-    position: winit::dpi::PhysicalPosition<f64>,
+    position: Option<winit::dpi::PhysicalPosition<f64>>,
 ) -> NativeAuthority<NativePhysicalPoint> {
-    let Ok(origin) = window.inner_position() else {
+    desktop_pointer_position_from_observation(window.inner_position().ok(), position)
+}
+
+fn desktop_pointer_position_from_observation(
+    origin: Option<winit::dpi::PhysicalPosition<i32>>,
+    position: Option<winit::dpi::PhysicalPosition<f64>>,
+) -> NativeAuthority<NativePhysicalPoint> {
+    let Some(position) = position else {
+        return NativeAuthority::unknown(NativeUnavailableReason::NotObserved);
+    };
+    let Some(origin) = origin else {
         return NativeAuthority::unknown(NativeUnavailableReason::Unsupported);
     };
     let Some(x) = exact_physical_component(position.x) else {
@@ -3186,41 +3180,29 @@ mod tests {
     }
 
     #[test]
-    fn wheel_position_never_falls_back_to_retained_cursor_state() {
-        let mut owner = NativePlatformIngressOwner::default();
-        let viewport_id = viewport("wheel-position");
-        let initial = facts(window_id(), viewport_id, false);
-        let binding = owner
-            .freeze_facts(std::slice::from_ref(&initial))
-            .unwrap()
-            .platform()
-            .inventory()[0];
-        let key = mouse_pointer_key();
-        let position = NativePhysicalPoint::new(123, 456);
-        owner.pointer_states.insert(
-            key,
-            WinitPointerState {
-                identity: NativePointerIdentity::new(
-                    NativePointerDeviceId::new(9),
-                    NativePointerId::new(1),
-                ),
-                source: NativePointerSource::Viewport(binding),
-                position: NativeAuthority::known(position),
-            },
+    fn pointer_position_absence_never_becomes_a_retained_cursor_fact() {
+        let event_position = desktop_pointer_position_from_observation(
+            Some(winit::dpi::PhysicalPosition::new(100, 200)),
+            None,
+        );
+
+        assert!(event_position.value().is_none());
+        assert_eq!(
+            event_position.unavailable_reason(),
+            Some(NativeUnavailableReason::NotObserved)
+        );
+    }
+
+    #[test]
+    fn event_time_pointer_position_is_converted_without_resampling() {
+        let event_position = desktop_pointer_position_from_observation(
+            Some(winit::dpi::PhysicalPosition::new(100, 200)),
+            Some(winit::dpi::PhysicalPosition::new(23.0, 45.0)),
         );
 
         assert_eq!(
-            owner
-                .retained_pointer_position(key, NativePointerSource::Viewport(binding))
-                .value(),
-            Some(&position)
-        );
-        let event_probe =
-            NativeAuthority::<NativePhysicalPoint>::unknown(NativeUnavailableReason::NotObserved);
-        assert!(event_probe.value().is_none());
-        assert_eq!(
-            event_probe.unavailable_reason(),
-            Some(NativeUnavailableReason::NotObserved)
+            event_position.value(),
+            Some(&NativePhysicalPoint::new(123, 245))
         );
     }
 
