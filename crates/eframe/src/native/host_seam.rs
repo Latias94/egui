@@ -35,12 +35,18 @@ pub struct NativeOutputToken {
     context: NonZeroU64,
     nonce: NonZeroU64,
     viewport_id: ViewportId,
+    window_id: WindowId,
 }
 
 impl NativeOutputToken {
     /// Returns the viewport whose UI callback owns this token.
     pub const fn viewport_id(self) -> ViewportId {
         self.viewport_id
+    }
+
+    /// Returns the native window whose callback generated this output.
+    pub const fn window_id(self) -> WindowId {
+        self.window_id
     }
 }
 
@@ -252,12 +258,14 @@ impl NativeHostState {
         &self,
         ctx: &egui::Context,
         viewport_id: ViewportId,
+        window_id: WindowId,
     ) -> Option<NativeOutputScope> {
         let inner = Arc::clone(self.inner.as_ref()?);
         let token = NativeOutputToken {
             context: inner.context,
             nonce: next_non_zero(&inner.next_token, "native output token exhausted"),
             viewport_id,
+            window_id,
         };
         inner.handler.on_output_begin(token);
         ACTIVE_OUTPUTS.with(|outputs| outputs.borrow_mut().push(token));
@@ -514,10 +522,14 @@ mod tests {
             }
         });
 
-        let outer = state.begin_output(&ctx, ViewportId::ROOT).unwrap();
+        let outer = state
+            .begin_output(&ctx, ViewportId::ROOT, WindowId::from(11))
+            .unwrap();
         let outer_token = current_native_output_token().unwrap();
         let child_id = ViewportId::from_hash_of("child");
-        let child = state.begin_output(&ctx, child_id).unwrap();
+        let child = state
+            .begin_output(&ctx, child_id, WindowId::from(22))
+            .unwrap();
         let child_token = current_native_output_token().unwrap();
 
         child.finish().present();
@@ -552,7 +564,7 @@ mod tests {
         });
 
         state
-            .begin_output(&ctx, ViewportId::ROOT)
+            .begin_output(&ctx, ViewportId::ROOT, WindowId::from(11))
             .unwrap()
             .finish()
             .present();
@@ -568,7 +580,10 @@ mod tests {
         let state = NativeHostState::new(Some(handler));
         let ctx = egui::Context::default();
 
-        let mut settlement = state.begin_output(&ctx, ViewportId::ROOT).unwrap().finish();
+        let mut settlement = state
+            .begin_output(&ctx, ViewportId::ROOT, WindowId::from(11))
+            .unwrap()
+            .finish();
         settlement.settle(NativeOutputStatus::Presented);
         settlement.settle(NativeOutputStatus::NotPresented);
 
@@ -577,6 +592,21 @@ mod tests {
             host.outputs.lock()[0].status(),
             NativeOutputStatus::Presented
         );
+    }
+
+    #[test]
+    fn output_token_keeps_the_callback_window_identity() {
+        let host = Arc::new(RecordingHost::default());
+        let handler: Arc<dyn NativeHostHandler> = Arc::<RecordingHost>::clone(&host);
+        let state = NativeHostState::new(Some(handler));
+        let window = WindowId::from(17);
+        let scope = state
+            .begin_output(&egui::Context::default(), ViewportId::ROOT, window)
+            .unwrap();
+        let token = current_native_output_token().expect("output scope publishes its token");
+
+        assert_eq!(token.window_id(), window);
+        scope.finish().present();
     }
 
     #[test]

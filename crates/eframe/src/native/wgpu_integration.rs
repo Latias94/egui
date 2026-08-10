@@ -788,7 +788,7 @@ impl WgpuWinitRunning<'_> {
         // Runs the update, which could call immediate viewports,
         // so make sure we hold no locks here!
         #[cfg(feature = "native-host-seam")]
-        let output_scope = native_host.begin_output(&integration.egui_ctx, viewport_id);
+        let output_scope = native_host.begin_output(&integration.egui_ctx, viewport_id, window_id);
         let full_output = integration.update(app.as_mut(), viewport_ui_cb.as_deref(), raw_input);
         #[cfg(feature = "native-host-seam")]
         let mut output_settlement = output_scope.map(|scope| scope.finish());

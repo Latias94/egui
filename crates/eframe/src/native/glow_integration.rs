@@ -764,9 +764,9 @@ impl GlowWinitRunning<'_> {
         // so make sure we don't hold any locks here required by the immediate viewports rendeer.
 
         #[cfg(feature = "native-host-seam")]
-        let output_scope = self
-            .native_host
-            .begin_output(&self.integration.egui_ctx, viewport_id);
+        let output_scope =
+            self.native_host
+                .begin_output(&self.integration.egui_ctx, viewport_id, window_id);
         let full_output =
             self.integration
                 .update(self.app.as_mut(), viewport_ui_cb.as_deref(), raw_input);
