@@ -502,10 +502,18 @@ impl WinitApp for GlowWinitApp<'_> {
 
         let running = if let Some(running) = &mut self.running {
             // Not the first resume event. Create all outstanding windows.
-            running
+            let failed_viewports = running
                 .glutin
                 .borrow_mut()
                 .initialize_all_windows(event_loop);
+            #[cfg(feature = "native-host-seam")]
+            for viewport_id in failed_viewports {
+                running
+                    .native_host
+                    .notify_viewport_create_failed(&running.integration.egui_ctx, viewport_id);
+            }
+            #[cfg(not(feature = "native-host-seam"))]
+            drop(failed_viewports);
             running
         } else {
             // First resume event. Create our root window etc.
@@ -778,6 +786,8 @@ impl GlowWinitRunning<'_> {
         let Self {
             integration,
             app,
+            #[cfg(feature = "native-host-seam")]
+            native_host,
             glutin,
             painter,
             pending_deltas,
@@ -904,7 +914,14 @@ impl GlowWinitRunning<'_> {
             }
         }
 
-        glutin.handle_viewport_output(event_loop, &integration.egui_ctx, &viewport_output);
+        let failed_viewports =
+            glutin.handle_viewport_output(event_loop, &integration.egui_ctx, &viewport_output);
+        #[cfg(feature = "native-host-seam")]
+        for viewport_id in failed_viewports {
+            native_host.notify_viewport_create_failed(&integration.egui_ctx, viewport_id);
+        }
+        #[cfg(not(feature = "native-host-seam"))]
+        drop(failed_viewports);
 
         integration.report_frame_time(frame_timer.total_time_sec()); // don't count auto-save time as part of regular frame time
 
@@ -1274,16 +1291,19 @@ impl GlutinWindowContext {
     /// Create a surface, window, and winit integration for all viewports lacking any of that.
     ///
     /// Errors will be logged.
-    fn initialize_all_windows(&mut self, event_loop: &ActiveEventLoop) {
+    fn initialize_all_windows(&mut self, event_loop: &ActiveEventLoop) -> Vec<ViewportId> {
         profiling::function_scope!();
 
         let viewports: Vec<ViewportId> = self.viewports.keys().copied().collect();
+        let mut failed_viewports = Vec::new();
 
         for viewport_id in viewports {
             if let Err(err) = self.initialize_window(viewport_id, event_loop) {
                 log::error!("Failed to initialize a window for viewport {viewport_id:?}: {err}");
+                failed_viewports.push(viewport_id);
             }
         }
+        failed_viewports
     }
 
     /// Create a surface, window, and winit integration for the viewport, if missing.
@@ -1473,7 +1493,7 @@ impl GlutinWindowContext {
         event_loop: &ActiveEventLoop,
         egui_ctx: &egui::Context,
         viewport_output: &OrderedViewportIdMap<ViewportOutput>,
-    ) {
+    ) -> Vec<ViewportId> {
         profiling::function_scope!();
 
         for (
@@ -1515,9 +1535,10 @@ impl GlutinWindowContext {
         }
 
         // Create windows for any new viewports:
-        self.initialize_all_windows(event_loop);
+        let failed_viewports = self.initialize_all_windows(event_loop);
 
         self.remove_viewports_not_in(viewport_output);
+        failed_viewports
     }
 }
 
@@ -1751,7 +1772,7 @@ fn render_immediate_viewport(
     egui_winit.handle_platform_output(window, platform_output);
 
     event_loop_context::with_current_event_loop(|event_loop| {
-        glutin.handle_viewport_output(event_loop, egui_ctx, &viewport_output);
+        let _ = glutin.handle_viewport_output(event_loop, egui_ctx, &viewport_output);
     });
 }
 

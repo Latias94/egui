@@ -108,6 +108,19 @@ pub enum NativeHostWake {
     RepaintRoot,
 }
 
+/// Terminal failure to create the native window for one deferred viewport.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct NativeViewportCreateFailure {
+    viewport_id: ViewportId,
+}
+
+impl NativeViewportCreateFailure {
+    /// Returns the deferred viewport whose native window could not be created.
+    pub const fn viewport_id(self) -> ViewportId {
+        self.viewport_id
+    }
+}
+
 /// One immutable native window event observed before egui input translation.
 #[derive(Clone, Copy, Debug)]
 pub struct NativeWindowEvent<'a> {
@@ -158,6 +171,11 @@ pub trait NativeHostHandler: Send + Sync + 'static {
 
     /// Receives one terminal output result and decides whether queued work needs another frame.
     fn on_output(&self, _result: NativeOutputResult) -> NativeHostWake {
+        NativeHostWake::Wait
+    }
+
+    /// Reports that eframe could not create the native window for a deferred viewport.
+    fn on_viewport_create_failed(&self, _failure: NativeViewportCreateFailure) -> NativeHostWake {
         NativeHostWake::Wait
     }
 }
@@ -275,6 +293,23 @@ impl NativeHostState {
             token,
             active: true,
         })
+    }
+
+    pub(crate) fn notify_viewport_create_failed(
+        &self,
+        ctx: &egui::Context,
+        viewport_id: ViewportId,
+    ) {
+        let Some(inner) = &self.inner else {
+            return;
+        };
+        if inner
+            .handler
+            .on_viewport_create_failed(NativeViewportCreateFailure { viewport_id })
+            == NativeHostWake::RepaintRoot
+        {
+            ctx.request_repaint_of(ViewportId::ROOT);
+        }
     }
 }
 
@@ -414,6 +449,7 @@ mod tests {
         >,
         output_begins: Mutex<Vec<NativeOutputToken>>,
         outputs: Mutex<Vec<NativeOutputResult>>,
+        create_failures: Mutex<Vec<NativeViewportCreateFailure>>,
         wake: NativeHostWake,
     }
 
@@ -439,6 +475,14 @@ mod tests {
 
         fn on_output_begin(&self, token: NativeOutputToken) {
             self.output_begins.lock().push(token);
+        }
+
+        fn on_viewport_create_failed(
+            &self,
+            failure: NativeViewportCreateFailure,
+        ) -> NativeHostWake {
+            self.create_failures.lock().push(failure);
+            self.wake
         }
     }
 
@@ -607,6 +651,30 @@ mod tests {
 
         assert_eq!(token.window_id(), window);
         scope.finish().present();
+    }
+
+    #[test]
+    fn viewport_create_failure_keeps_identity_and_wake() {
+        let host = Arc::new(RecordingHost {
+            wake: NativeHostWake::RepaintRoot,
+            ..Default::default()
+        });
+        let handler: Arc<dyn NativeHostHandler> = Arc::<RecordingHost>::clone(&host);
+        let state = NativeHostState::new(Some(handler));
+        let ctx = egui::Context::default();
+        let repaint_count = Arc::new(AtomicUsize::new(0));
+        ctx.set_request_repaint_callback({
+            let repaint_count = Arc::clone(&repaint_count);
+            move |_| {
+                repaint_count.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+        let viewport_id = ViewportId::from_hash_of("failed-child");
+
+        state.notify_viewport_create_failed(&ctx, viewport_id);
+
+        assert_eq!(host.create_failures.lock()[0].viewport_id(), viewport_id);
+        assert_eq!(repaint_count.load(Ordering::Relaxed), 1);
     }
 
     #[test]

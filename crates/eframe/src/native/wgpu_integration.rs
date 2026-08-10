@@ -166,6 +166,9 @@ impl<'app> WgpuWinitApp<'app> {
         let Some(running) = &mut self.running else {
             return;
         };
+        let egui_ctx = running.integration.egui_ctx.clone();
+        #[cfg(feature = "native-host-seam")]
+        let native_host = running.native_host.clone();
         let mut shared = running.shared.borrow_mut();
         let SharedState {
             viewports,
@@ -175,12 +178,14 @@ impl<'app> WgpuWinitApp<'app> {
         } = &mut *shared;
 
         for viewport in viewports.values_mut() {
-            viewport.initialize_window(
-                event_loop,
-                &running.integration.egui_ctx,
-                viewport_from_window,
-                painter,
-            );
+            let viewport_id = viewport.ids.this;
+            if let Err(err) =
+                viewport.initialize_window(event_loop, &egui_ctx, viewport_from_window, painter)
+            {
+                log::error!("Failed to create window for viewport {viewport_id:?}: {err}");
+                #[cfg(feature = "native-host-seam")]
+                native_host.notify_viewport_create_failed(&egui_ctx, viewport_id);
+            }
         }
     }
 
@@ -202,7 +207,8 @@ impl<'app> WgpuWinitApp<'app> {
             None,
             painter,
         )
-        .initialize_window(event_loop, egui_ctx, viewport_from_window, painter);
+        .initialize_window(event_loop, egui_ctx, viewport_from_window, painter)
+        .unwrap_or_else(|err| log::error!("Failed to recreate Android window: {err}"));
     }
 
     #[cfg(target_os = "android")]
@@ -1115,43 +1121,38 @@ impl Viewport {
         egui_ctx: &egui::Context,
         windows_id: &mut HashMap<WindowId, ViewportId>,
         painter: &mut egui_wgpu::winit::Painter,
-    ) {
+    ) -> Result<(), winit::error::OsError> {
         if self.window.is_some() {
-            return; // we already have one
+            return Ok(()); // we already have one
         }
 
         profiling::function_scope!();
 
         let viewport_id = self.ids.this;
 
-        match egui_winit::create_window(egui_ctx, event_loop, &self.builder) {
-            Ok(window) => {
-                windows_id.insert(window.id(), viewport_id);
+        let window = egui_winit::create_window(egui_ctx, event_loop, &self.builder)?;
+        windows_id.insert(window.id(), viewport_id);
 
-                let window = Arc::new(window);
+        let window = Arc::new(window);
 
-                if let Err(err) =
-                    pollster::block_on(painter.set_window(viewport_id, Some(Arc::clone(&window))))
-                {
-                    log::error!("on set_window: viewport_id {viewport_id:?} {err}");
-                }
-
-                self.egui_winit = Some(egui_winit::State::new(
-                    egui_ctx.clone(),
-                    viewport_id,
-                    event_loop,
-                    Some(window.scale_factor() as f32),
-                    event_loop.system_theme(),
-                    painter.max_texture_side(),
-                ));
-
-                egui_winit::update_viewport_info(&mut self.info, egui_ctx, &window, true);
-                self.window = Some(window);
-            }
-            Err(err) => {
-                log::error!("Failed to create window: {err}");
-            }
+        if let Err(err) =
+            pollster::block_on(painter.set_window(viewport_id, Some(Arc::clone(&window))))
+        {
+            log::error!("on set_window: viewport_id {viewport_id:?} {err}");
         }
+
+        self.egui_winit = Some(egui_winit::State::new(
+            egui_ctx.clone(),
+            viewport_id,
+            event_loop,
+            Some(window.scale_factor() as f32),
+            event_loop.system_theme(),
+            painter.max_texture_side(),
+        ));
+
+        egui_winit::update_viewport_info(&mut self.info, egui_ctx, &window, true);
+        self.window = Some(window);
+        Ok(())
     }
 }
 
@@ -1228,7 +1229,14 @@ fn render_immediate_viewport(
         );
         if viewport.window.is_none() {
             event_loop_context::with_current_event_loop(|event_loop| {
-                viewport.initialize_window(event_loop, egui_ctx, viewport_from_window, painter);
+                if let Err(err) =
+                    viewport.initialize_window(event_loop, egui_ctx, viewport_from_window, painter)
+                {
+                    log::error!(
+                        "Failed to initialize an immediate viewport window {:?}: {err}",
+                        ids.this
+                    );
+                }
             });
         }
 

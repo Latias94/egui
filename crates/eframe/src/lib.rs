@@ -205,7 +205,8 @@ pub use native::run::EframeWinitApplication;
 #[cfg(feature = "native-host-seam")]
 pub use native::host_seam::{
     NativeEventOrdinal, NativeHostHandler, NativeHostWake, NativeOutputOrdinal, NativeOutputResult,
-    NativeOutputStatus, NativeOutputToken, NativeWindowEvent, current_native_output_token,
+    NativeOutputStatus, NativeOutputToken, NativeViewportCreateFailure, NativeWindowEvent,
+    current_native_output_token,
 };
 
 #[cfg(not(any(target_arch = "wasm32", target_os = "ios")))]
