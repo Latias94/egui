@@ -359,6 +359,16 @@ pub struct NativeOptions {
     #[cfg(any(feature = "glow", feature = "wgpu_no_default_features"))]
     pub window_builder: Option<WindowBuilderHook>,
 
+    /// Observes exact native input facts and renderer output settlement.
+    ///
+    /// Installing a host disables immediate viewports. Use deferred viewports so native window
+    /// and renderer side effects remain outside application UI recursion.
+    #[cfg(all(
+        feature = "native-host-seam",
+        any(feature = "glow", feature = "wgpu_no_default_features")
+    ))]
+    pub native_host: Option<std::sync::Arc<dyn crate::NativeHostHandler>>,
+
     /// On desktop: make the window position to be centered at initialization.
     ///
     /// Platform specific:
@@ -414,6 +424,12 @@ impl Clone for NativeOptions {
             #[cfg(any(feature = "glow", feature = "wgpu_no_default_features"))]
             window_builder: None, // Skip any builder callbacks if cloning
 
+            #[cfg(all(
+                feature = "native-host-seam",
+                any(feature = "glow", feature = "wgpu_no_default_features")
+            ))]
+            native_host: self.native_host.clone(),
+
             #[cfg(feature = "glow")]
             glow_options: self.glow_options.clone(),
 
@@ -450,6 +466,12 @@ impl Default for NativeOptions {
 
             #[cfg(any(feature = "glow", feature = "wgpu_no_default_features"))]
             window_builder: None,
+
+            #[cfg(all(
+                feature = "native-host-seam",
+                any(feature = "glow", feature = "wgpu_no_default_features")
+            ))]
+            native_host: None,
 
             centered: false,
 

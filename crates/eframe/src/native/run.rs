@@ -9,6 +9,8 @@ use winit::{
 use ahash::HashMap;
 
 use super::winit_integration::{UserEvent, WinitApp};
+#[cfg(feature = "native-host-seam")]
+use crate::native::host_seam::{NativeEventSequencer, NativeHostState};
 use crate::{
     Result, epi,
     native::{
@@ -78,6 +80,10 @@ fn with_event_loop<R>(
 /// some events, but otherwise forwards events to the [`WinitApp`].
 struct WinitAppWrapper<T: WinitApp> {
     windows_next_repaint_times: HashMap<WindowId, Instant>,
+    #[cfg(feature = "native-host-seam")]
+    native_host: NativeHostState,
+    #[cfg(feature = "native-host-seam")]
+    native_event_sequence: NativeEventSequencer,
     winit_app: T,
     return_result: Result<(), crate::Error>,
     run_and_return: bool,
@@ -85,8 +91,14 @@ struct WinitAppWrapper<T: WinitApp> {
 
 impl<T: WinitApp> WinitAppWrapper<T> {
     fn new(winit_app: T, run_and_return: bool) -> Self {
+        #[cfg(feature = "native-host-seam")]
+        let native_host = winit_app.native_host_state();
         Self {
             windows_next_repaint_times: HashMap::default(),
+            #[cfg(feature = "native-host-seam")]
+            native_host,
+            #[cfg(feature = "native-host-seam")]
+            native_event_sequence: NativeEventSequencer::default(),
             winit_app,
             return_result: Ok(()),
             run_and_return,
@@ -362,7 +374,21 @@ impl<T: WinitApp> ApplicationHandler<UserEvent> for WinitAppWrapper<T> {
                 winit::event::WindowEvent::RedrawRequested => {
                     self.winit_app.run_ui_and_paint(event_loop, window_id)
                 }
-                _ => self.winit_app.window_event(event_loop, window_id, event),
+                event => {
+                    #[cfg(feature = "native-host-seam")]
+                    if self.native_host.is_enabled() {
+                        let ordinal = self.native_event_sequence.next();
+                        let viewport_id = self.winit_app.viewport_id_from_window_id(window_id);
+                        self.native_host.observe_window_event(
+                            self.winit_app.egui_ctx(),
+                            ordinal,
+                            window_id,
+                            viewport_id,
+                            &event,
+                        );
+                    }
+                    self.winit_app.window_event(event_loop, window_id, event)
+                }
             };
 
             self.handle_event_result(event_loop, event_result);

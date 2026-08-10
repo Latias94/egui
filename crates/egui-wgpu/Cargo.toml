@@ -38,6 +38,9 @@ capture = ["dep:egui"]
 ## Enable [`winit`](https://docs.rs/winit) integration. On Linux, requires either `wayland` or `x11`
 winit = ["dep:winit", "winit/rwh_06", "dep:egui", "capture"]
 
+## Expose renderer presentation settlement to eframe's native host seam.
+native-host-seam = []
+
 ## Enables Wayland support for winit.
 wayland = ["winit?/wayland"]
 

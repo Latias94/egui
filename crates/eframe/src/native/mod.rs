@@ -1,6 +1,8 @@
 mod app_icon;
 mod epi_integration;
 mod event_loop_context;
+#[cfg(feature = "native-host-seam")]
+pub(crate) mod host_seam;
 pub mod run;
 
 #[cfg(target_os = "macos")]

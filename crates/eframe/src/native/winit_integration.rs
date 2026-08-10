@@ -89,9 +89,15 @@ impl From<accesskit_winit::Event> for UserEvent {
 pub trait WinitApp {
     fn egui_ctx(&self) -> Option<&egui::Context>;
 
+    #[cfg(feature = "native-host-seam")]
+    fn native_host_state(&self) -> super::host_seam::NativeHostState;
+
     fn window(&self, window_id: WindowId) -> Option<Arc<Window>>;
 
     fn window_id_from_viewport_id(&self, id: ViewportId) -> Option<WindowId>;
+
+    #[cfg(feature = "native-host-seam")]
+    fn viewport_id_from_window_id(&self, id: WindowId) -> Option<ViewportId>;
 
     fn save(&mut self);
 

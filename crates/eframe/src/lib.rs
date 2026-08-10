@@ -190,12 +190,23 @@ pub use web::{WebLogger, WebRunner};
 #[cfg(any(feature = "glow", feature = "wgpu_no_default_features"))]
 mod native;
 
-#[cfg(target_os = "macos")]
+#[cfg(all(
+    target_os = "macos",
+    any(feature = "glow", feature = "wgpu_no_default_features")
+))]
 pub use native::macos::WindowChromeMetrics;
 
 #[cfg(not(target_arch = "wasm32"))]
 #[cfg(any(feature = "glow", feature = "wgpu_no_default_features"))]
 pub use native::run::EframeWinitApplication;
+
+#[cfg(not(target_arch = "wasm32"))]
+#[cfg(any(feature = "glow", feature = "wgpu_no_default_features"))]
+#[cfg(feature = "native-host-seam")]
+pub use native::host_seam::{
+    NativeEventOrdinal, NativeHostHandler, NativeHostWake, NativeOutputOrdinal, NativeOutputResult,
+    NativeOutputStatus, NativeOutputToken, NativeWindowEvent, current_native_output_token,
+};
 
 #[cfg(not(any(target_arch = "wasm32", target_os = "ios")))]
 #[cfg(any(feature = "glow", feature = "wgpu_no_default_features"))]

@@ -38,6 +38,8 @@ use super::{
     winit_integration::{EventResult, UserEvent, WinitApp, create_egui_context},
 };
 use crate::epaint::textures::TexturesDelta;
+#[cfg(feature = "native-host-seam")]
+use crate::native::host_seam::NativeHostState;
 use crate::{
     App, AppCreator, CreationContext, NativeOptions, Result, Storage,
     native::{epi_integration::EpiIntegration, winit_integration::sleep_if_invisible_or_minimized},
@@ -48,6 +50,8 @@ use crate::{
 
 pub struct GlowWinitApp<'app> {
     repaint_proxy: Arc<egui::mutex::Mutex<EventLoopProxy<UserEvent>>>,
+    #[cfg(feature = "native-host-seam")]
+    native_host: NativeHostState,
     app_name: String,
     native_options: NativeOptions,
     running: Option<GlowWinitRunning<'app>>,
@@ -67,6 +71,8 @@ pub struct GlowWinitApp<'app> {
 /// initialized once the application has an associated `SurfaceView`.
 struct GlowWinitRunning<'app> {
     integration: EpiIntegration,
+    #[cfg(feature = "native-host-seam")]
+    native_host: NativeHostState,
     app: Box<dyn 'app + App>,
 
     // These needs to be shared with the immediate viewport renderer, hence the Rc/Arc/RefCells:
@@ -178,8 +184,12 @@ impl<'app> GlowWinitApp<'app> {
         app_creator: AppCreator<'app>,
     ) -> Self {
         profiling::function_scope!();
+        #[cfg(feature = "native-host-seam")]
+        let native_host = NativeHostState::from_options(&native_options);
         Self {
             repaint_proxy: Arc::new(egui::mutex::Mutex::new(event_loop.create_proxy())),
+            #[cfg(feature = "native-host-seam")]
+            native_host,
             app_name: app_name.to_owned(),
             native_options,
             running: None,
@@ -374,8 +384,12 @@ impl<'app> GlowWinitApp<'app> {
             let glutin = Rc::downgrade(&glutin);
             let painter = Rc::downgrade(&painter);
             let beginning = integration.beginning;
+            #[cfg(feature = "native-host-seam")]
+            let native_host = self.native_host.clone();
 
             egui::Context::set_immediate_viewport_renderer(move |egui_ctx, immediate_viewport| {
+                #[cfg(feature = "native-host-seam")]
+                native_host.assert_immediate_viewports_supported();
                 if let (Some(glutin), Some(painter)) = (glutin.upgrade(), painter.upgrade()) {
                     render_immediate_viewport(
                         egui_ctx,
@@ -392,6 +406,8 @@ impl<'app> GlowWinitApp<'app> {
 
         Ok(self.running.insert(GlowWinitRunning {
             integration,
+            #[cfg(feature = "native-host-seam")]
+            native_host: self.native_host.clone(),
             app,
             glutin,
             painter,
@@ -403,6 +419,11 @@ impl<'app> GlowWinitApp<'app> {
 impl WinitApp for GlowWinitApp<'_> {
     fn egui_ctx(&self) -> Option<&egui::Context> {
         self.running.as_ref().map(|r| &r.integration.egui_ctx)
+    }
+
+    #[cfg(feature = "native-host-seam")]
+    fn native_host_state(&self) -> NativeHostState {
+        self.native_host.clone()
     }
 
     fn window(&self, window_id: WindowId) -> Option<Arc<Window>> {
@@ -422,6 +443,17 @@ impl WinitApp for GlowWinitApp<'_> {
             .glutin
             .borrow()
             .window_from_viewport
+            .get(&id)
+            .copied()
+    }
+
+    #[cfg(feature = "native-host-seam")]
+    fn viewport_id_from_window_id(&self, id: WindowId) -> Option<ViewportId> {
+        self.running
+            .as_ref()?
+            .glutin
+            .borrow()
+            .viewport_from_window
             .get(&id)
             .copied()
     }
@@ -731,9 +763,15 @@ impl GlowWinitRunning<'_> {
         // The update function, which could call immediate viewports,
         // so make sure we don't hold any locks here required by the immediate viewports rendeer.
 
+        #[cfg(feature = "native-host-seam")]
+        let output_scope = self
+            .native_host
+            .begin_output(&self.integration.egui_ctx, viewport_id);
         let full_output =
             self.integration
                 .update(self.app.as_mut(), viewport_ui_cb.as_deref(), raw_input);
+        #[cfg(feature = "native-host-seam")]
+        let mut output_settlement = output_scope.map(|scope| scope.finish());
 
         // ------------------------------------------------------------
 
@@ -850,6 +888,11 @@ impl GlowWinitRunning<'_> {
 
                 gl_surface.swap_buffers(context)?;
                 frame_timer.resume();
+            }
+
+            #[cfg(feature = "native-host-seam")]
+            if let Some(settlement) = output_settlement.take() {
+                settlement.present();
             }
 
             // give it time to settle:

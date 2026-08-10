@@ -26,6 +26,8 @@ use egui_winit::accesskit_winit;
 use log::warn;
 use winit_integration::UserEvent;
 
+#[cfg(feature = "native-host-seam")]
+use crate::native::host_seam::NativeHostState;
 use crate::{
     App, AppCreator, CreationContext, NativeOptions, Result, Storage,
     native::{
@@ -41,6 +43,8 @@ use super::{epi_integration, event_loop_context, winit_integration, winit_integr
 
 pub struct WgpuWinitApp<'app> {
     repaint_proxy: Arc<Mutex<EventLoopProxy<UserEvent>>>,
+    #[cfg(feature = "native-host-seam")]
+    native_host: NativeHostState,
     app_name: String,
     native_options: NativeOptions,
 
@@ -60,6 +64,8 @@ pub struct WgpuWinitApp<'app> {
 /// initialized once the application has an associated `SurfaceView`.
 struct WgpuWinitRunning<'app> {
     integration: EpiIntegration,
+    #[cfg(feature = "native-host-seam")]
+    native_host: NativeHostState,
 
     /// The users application.
     app: Box<dyn 'app + App>,
@@ -134,6 +140,9 @@ impl<'app> WgpuWinitApp<'app> {
     ) -> Self {
         profiling::function_scope!();
 
+        #[cfg(feature = "native-host-seam")]
+        let native_host = NativeHostState::from_options(&native_options);
+
         #[cfg(feature = "__screenshot")]
         assert!(
             std::env::var("EFRAME_SCREENSHOT_TO").is_err(),
@@ -142,6 +151,8 @@ impl<'app> WgpuWinitApp<'app> {
 
         Self {
             repaint_proxy: Arc::new(Mutex::new(event_loop.create_proxy())),
+            #[cfg(feature = "native-host-seam")]
+            native_host,
             app_name: app_name.to_owned(),
             native_options,
             running: None,
@@ -365,8 +376,12 @@ impl<'app> WgpuWinitApp<'app> {
             // Create a weak pointer so that we don't keep state alive for too long.
             let shared = Rc::downgrade(&shared);
             let beginning = integration.beginning;
+            #[cfg(feature = "native-host-seam")]
+            let native_host = self.native_host.clone();
 
             egui::Context::set_immediate_viewport_renderer(move |_egui_ctx, immediate_viewport| {
+                #[cfg(feature = "native-host-seam")]
+                native_host.assert_immediate_viewports_supported();
                 if let Some(shared) = shared.upgrade() {
                     render_immediate_viewport(beginning, &shared, immediate_viewport);
                 } else {
@@ -377,6 +392,8 @@ impl<'app> WgpuWinitApp<'app> {
 
         Ok(self.running.insert(WgpuWinitRunning {
             integration,
+            #[cfg(feature = "native-host-seam")]
+            native_host: self.native_host.clone(),
             app,
             shared,
             pending_deltas: Default::default(),
@@ -387,6 +404,11 @@ impl<'app> WgpuWinitApp<'app> {
 impl WinitApp for WgpuWinitApp<'_> {
     fn egui_ctx(&self) -> Option<&egui::Context> {
         self.running.as_ref().map(|r| &r.integration.egui_ctx)
+    }
+
+    #[cfg(feature = "native-host-seam")]
+    fn native_host_state(&self) -> NativeHostState {
+        self.native_host.clone()
     }
 
     fn window(&self, window_id: WindowId) -> Option<Arc<Window>> {
@@ -412,6 +434,17 @@ impl WinitApp for WgpuWinitApp<'_> {
                 .as_ref()?
                 .id(),
         )
+    }
+
+    #[cfg(feature = "native-host-seam")]
+    fn viewport_id_from_window_id(&self, id: WindowId) -> Option<ViewportId> {
+        self.running
+            .as_ref()?
+            .shared
+            .borrow()
+            .viewport_from_window
+            .get(&id)
+            .copied()
     }
 
     fn save(&mut self) {
@@ -617,6 +650,8 @@ impl WgpuWinitRunning<'_> {
         let Self {
             app,
             integration,
+            #[cfg(feature = "native-host-seam")]
+            native_host,
             shared,
             pending_deltas,
         } = self;
@@ -752,7 +787,11 @@ impl WgpuWinitRunning<'_> {
 
         // Runs the update, which could call immediate viewports,
         // so make sure we hold no locks here!
+        #[cfg(feature = "native-host-seam")]
+        let output_scope = native_host.begin_output(&integration.egui_ctx, viewport_id);
         let full_output = integration.update(app.as_mut(), viewport_ui_cb.as_deref(), raw_input);
+        #[cfg(feature = "native-host-seam")]
+        let mut output_settlement = output_scope.map(|scope| scope.finish());
 
         // ------------------------------------------------------------
 
@@ -807,6 +846,28 @@ impl WgpuWinitRunning<'_> {
                     true
                 }
             });
+            #[cfg(feature = "native-host-seam")]
+            let vsync_secs = {
+                let paint_result = painter.paint_and_update_textures_with_result(
+                    viewport_id,
+                    pixels_per_point,
+                    app.clear_color(&egui_ctx.global_style().visuals),
+                    &clipped_primitives,
+                    pending_deltas,
+                    screenshot_commands,
+                    window,
+                );
+
+                if paint_result.presented()
+                    && let Some(settlement) = output_settlement.take()
+                {
+                    settlement.present();
+                }
+
+                paint_result.vsync_seconds()
+            };
+
+            #[cfg(not(feature = "native-host-seam"))]
             let vsync_secs = painter.paint_and_update_textures(
                 viewport_id,
                 pixels_per_point,

@@ -44,6 +44,118 @@ pub struct Painter {
     capture_rx: CaptureReceiver,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WinitPaintMode {
+    Legacy,
+    #[cfg(feature = "native-host-seam")]
+    PreservePendingTextures,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct WinitPaintRunResult {
+    vsync_seconds: f32,
+    #[cfg(feature = "native-host-seam")]
+    presented: bool,
+}
+
+impl WinitPaintRunResult {
+    const fn dropped(vsync_seconds: f32) -> Self {
+        Self {
+            vsync_seconds,
+            #[cfg(feature = "native-host-seam")]
+            presented: false,
+        }
+    }
+
+    const fn presented(vsync_seconds: f32) -> Self {
+        Self {
+            vsync_seconds,
+            #[cfg(feature = "native-host-seam")]
+            presented: true,
+        }
+    }
+
+    const fn vsync_seconds(self) -> f32 {
+        self.vsync_seconds
+    }
+}
+
+/// Terminal renderer result for one native-host winit viewport paint.
+#[cfg(feature = "native-host-seam")]
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct WinitPaintResult(WinitPaintRunResult);
+
+#[cfg(feature = "native-host-seam")]
+impl WinitPaintResult {
+    /// Returns the approximate number of seconds spent waiting for presentation.
+    pub const fn vsync_seconds(self) -> f32 {
+        self.0.vsync_seconds
+    }
+
+    /// Returns whether this call submitted and presented a surface frame.
+    pub const fn presented(self) -> bool {
+        self.0.presented
+    }
+}
+
+struct RendererQueueGuard<'queue> {
+    queue: &'queue wgpu::Queue,
+    commands_submitted: bool,
+}
+
+impl Drop for RendererQueueGuard<'_> {
+    fn drop(&mut self) {
+        if !self.commands_submitted {
+            self.queue.submit([]);
+        }
+    }
+}
+
+fn prepare_render_resources(
+    render_state: &RenderState,
+    size_in_pixels: [u32; 2],
+    pixels_per_point: f32,
+    clipped_primitives: &[epaint::ClippedPrimitive],
+    textures_delta: &mut epaint::textures::TexturesDelta,
+) -> (
+    wgpu::CommandEncoder,
+    Vec<wgpu::CommandBuffer>,
+    renderer::ScreenDescriptor,
+) {
+    let mut encoder = render_state
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("encoder"),
+        });
+    let screen_descriptor = renderer::ScreenDescriptor {
+        size_in_pixels,
+        pixels_per_point,
+    };
+    let user_cmd_bufs = {
+        let mut renderer = render_state.renderer.write();
+        #[expect(clippy::iter_over_hash_type)] // Order doesn't matter here
+        for (id, image_deltas) in textures_delta.set.drain() {
+            for image_delta in image_deltas {
+                renderer.update_texture(
+                    &render_state.device,
+                    &render_state.queue,
+                    id,
+                    &image_delta,
+                );
+            }
+        }
+        renderer.update_buffers(
+            &render_state.device,
+            &render_state.queue,
+            &mut encoder,
+            clipped_primitives,
+            &screen_descriptor,
+        )
+    };
+    (encoder, user_cmd_bufs, screen_descriptor)
+}
+
 impl Painter {
     /// Manages [`wgpu`] state, including surface state, required to render egui.
     ///
@@ -482,29 +594,58 @@ impl Painter {
         capture_data: Vec<UserData>,
         window: &Arc<winit::window::Window>,
     ) -> f32 {
+        self.paint_and_update_textures_impl(
+            viewport_id,
+            pixels_per_point,
+            clear_color,
+            clipped_primitives,
+            textures_delta,
+            capture_data,
+            window,
+            WinitPaintMode::Legacy,
+        )
+        .vsync_seconds()
+    }
+
+    /// Paints one viewport and reports whether a surface frame was presented.
+    #[cfg(feature = "native-host-seam")]
+    #[doc(hidden)]
+    #[expect(clippy::too_many_arguments)]
+    pub fn paint_and_update_textures_with_result(
+        &mut self,
+        viewport_id: ViewportId,
+        pixels_per_point: f32,
+        clear_color: [f32; 4],
+        clipped_primitives: &[epaint::ClippedPrimitive],
+        textures_delta: &mut epaint::textures::TexturesDelta,
+        capture_data: Vec<UserData>,
+        window: &Arc<winit::window::Window>,
+    ) -> WinitPaintResult {
+        WinitPaintResult(self.paint_and_update_textures_impl(
+            viewport_id,
+            pixels_per_point,
+            clear_color,
+            clipped_primitives,
+            textures_delta,
+            capture_data,
+            window,
+            WinitPaintMode::PreservePendingTextures,
+        ))
+    }
+
+    #[expect(clippy::too_many_arguments)]
+    fn paint_and_update_textures_impl(
+        &mut self,
+        viewport_id: ViewportId,
+        pixels_per_point: f32,
+        clear_color: [f32; 4],
+        clipped_primitives: &[epaint::ClippedPrimitive],
+        textures_delta: &mut epaint::textures::TexturesDelta,
+        capture_data: Vec<UserData>,
+        window: &Arc<winit::window::Window>,
+        mode: WinitPaintMode,
+    ) -> WinitPaintRunResult {
         profiling::function_scope!();
-
-        /// Guard to ensure that commands are always submitted to the renderer queue
-        /// so that calls to [`write_buffer()`](https://docs.rs/wgpu/latest/wgpu/struct.Queue.html#method.write_buffer)
-        /// are completed even if we take a codepath which doesn't submit commands and avoids
-        /// internal buffers growing indefinitely.
-        ///
-        /// This may happen, for example, if no output frame is resolved.
-        /// See <https://github.com/emilk/egui/pull/7928> for full context.
-        struct RendererQueueGuard<'q> {
-            queue: &'q wgpu::Queue,
-            commands_submitted: bool,
-        }
-
-        impl Drop for RendererQueueGuard<'_> {
-            fn drop(&mut self) {
-                // Only submit an empty command buffer array if no commands were
-                // explicitly submitted.
-                if !self.commands_submitted {
-                    self.queue.submit([]);
-                }
-            }
-        }
 
         let capture = !capture_data.is_empty();
         let mut vsync_sec = 0.0;
@@ -519,7 +660,7 @@ impl Painter {
             && let Err(err) = self.recreate_surface(viewport_id, window)
         {
             log::error!("Failed to recreate surface for {viewport_id:?}: {err}");
-            return vsync_sec;
+            return WinitPaintRunResult::dropped(vsync_sec);
         }
 
         // Apply any runtime changes requested via `RenderState::surface_config`.
@@ -537,53 +678,32 @@ impl Painter {
         }
 
         let Some(render_state) = self.render_state.as_mut() else {
-            return vsync_sec;
+            return WinitPaintRunResult::dropped(vsync_sec);
         };
 
-        let mut render_queue_guard = RendererQueueGuard {
-            queue: &render_state.queue,
-            commands_submitted: false,
-        };
+        // Preserve the upstream ordering in the normal renderer path: create the queue guard and
+        // upload resources before acquiring a surface texture. The managed-host path intentionally
+        // delays both until acquisition succeeds so a skipped frame retains its texture delta.
+        let mut render_queue_guard =
+            matches!(mode, WinitPaintMode::Legacy).then(|| RendererQueueGuard {
+                queue: &render_state.queue,
+                commands_submitted: false,
+            });
 
         let Some(surface_state) = self.surfaces.get_mut(&viewport_id) else {
-            return vsync_sec;
+            return WinitPaintRunResult::dropped(vsync_sec);
         };
 
-        let mut encoder =
-            render_state
-                .device
-                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("encoder"),
-                });
-
-        // Upload all resources for the GPU.
-        let screen_descriptor = renderer::ScreenDescriptor {
-            size_in_pixels: [surface_state.width, surface_state.height],
-            pixels_per_point,
-        };
-
-        let user_cmd_bufs = {
-            let mut renderer = render_state.renderer.write();
-            #[expect(clippy::iter_over_hash_type)] // Order doesn't matter here
-            for (id, image_deltas) in textures_delta.set.drain() {
-                for image_delta in image_deltas {
-                    renderer.update_texture(
-                        &render_state.device,
-                        &render_state.queue,
-                        id,
-                        &image_delta,
-                    );
-                }
-            }
-
-            renderer.update_buffers(
-                &render_state.device,
-                &render_state.queue,
-                &mut encoder,
+        let size_in_pixels = [surface_state.width, surface_state.height];
+        let mut prepared = matches!(mode, WinitPaintMode::Legacy).then(|| {
+            prepare_render_resources(
+                render_state,
+                size_in_pixels,
+                pixels_per_point,
                 clipped_primitives,
-                &screen_descriptor,
+                textures_delta,
             )
-        };
+        });
 
         if surface_state.needs_reconfigure {
             Self::configure_surface(surface_state, render_state, &self.config.surface);
@@ -622,9 +742,27 @@ impl Painter {
                     }
                     SurfaceErrorAction::SkipFrame => {}
                 }
-                return vsync_sec;
+                return WinitPaintRunResult::dropped(vsync_sec);
             }
         };
+
+        let (mut encoder, user_cmd_bufs, screen_descriptor) =
+            prepared.take().unwrap_or_else(|| {
+                prepare_render_resources(
+                    render_state,
+                    size_in_pixels,
+                    pixels_per_point,
+                    clipped_primitives,
+                    textures_delta,
+                )
+            });
+        let mut render_queue_guard =
+            render_queue_guard
+                .take()
+                .unwrap_or_else(|| RendererQueueGuard {
+                    queue: &render_state.queue,
+                    commands_submitted: false,
+                });
 
         let mut capture_buffer = None;
         {
@@ -767,7 +905,7 @@ impl Painter {
             vsync_sec += start.elapsed().as_secs_f32();
         }
 
-        vsync_sec
+        WinitPaintRunResult::presented(vsync_sec)
     }
 
     /// Call this at the beginning of each frame to receive the requested screenshots.
