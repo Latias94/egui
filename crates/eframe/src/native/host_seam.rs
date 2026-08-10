@@ -143,6 +143,13 @@ pub trait NativeHostHandler: Send + Sync + 'static {
     /// Observes one window event before egui-winit translates it.
     fn on_window_event(&self, _event: NativeWindowEvent<'_>) {}
 
+    /// Announces the output token before the viewport UI callback runs.
+    ///
+    /// Hosts may reserve the token here and attach the affine painted output
+    /// after the core frame commits. The callback is observation-only and must
+    /// not re-enter eframe.
+    fn on_output_begin(&self, _token: NativeOutputToken) {}
+
     /// Receives one terminal output result and decides whether queued work needs another frame.
     fn on_output(&self, _result: NativeOutputResult) -> NativeHostWake {
         NativeHostWake::Wait
@@ -252,6 +259,7 @@ impl NativeHostState {
             nonce: next_non_zero(&inner.next_token, "native output token exhausted"),
             viewport_id,
         };
+        inner.handler.on_output_begin(token);
         ACTIVE_OUTPUTS.with(|outputs| outputs.borrow_mut().push(token));
         Some(NativeOutputScope {
             inner,
@@ -396,6 +404,7 @@ mod tests {
                 winit::event::PointerEventFacts,
             )>,
         >,
+        output_begins: Mutex<Vec<NativeOutputToken>>,
         outputs: Mutex<Vec<NativeOutputResult>>,
         wake: NativeHostWake,
     }
@@ -418,6 +427,10 @@ mod tests {
         fn on_output(&self, result: NativeOutputResult) -> NativeHostWake {
             self.outputs.lock().push(result);
             self.wake
+        }
+
+        fn on_output_begin(&self, token: NativeOutputToken) {
+            self.output_begins.lock().push(token);
         }
     }
 
@@ -505,6 +518,7 @@ mod tests {
         assert_eq!(current_native_output_token(), None);
 
         let outputs = host.outputs.lock();
+        assert_eq!(*host.output_begins.lock(), vec![outer_token, child_token]);
         assert_eq!(outputs.len(), 2);
         assert_eq!(outputs[0].token(), child_token);
         assert_eq!(outputs[0].ordinal().get(), 1);
