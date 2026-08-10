@@ -517,6 +517,7 @@ impl State {
             | WindowEvent::Resized(_)
             | WindowEvent::Moved(_)
             | WindowEvent::TouchpadPressure { .. }
+            | WindowEvent::PointerCaptureChanged { .. }
             | WindowEvent::CloseRequested => EventResponse {
                 repaint: true,
                 consumed: false,
@@ -2295,6 +2296,7 @@ pub fn short_window_event_description(event: &winit::event::WindowEvent) -> &'st
         WindowEvent::CursorMoved { .. } => "WindowEvent::CursorMoved",
         WindowEvent::CursorEntered { .. } => "WindowEvent::CursorEntered",
         WindowEvent::CursorLeft { .. } => "WindowEvent::CursorLeft",
+        WindowEvent::PointerCaptureChanged { .. } => "WindowEvent::PointerCaptureChanged",
         WindowEvent::MouseWheel { .. } => "WindowEvent::MouseWheel",
         WindowEvent::MouseInput { .. } => "WindowEvent::MouseInput",
         WindowEvent::PinchGesture { .. } => "WindowEvent::PinchGesture",

@@ -437,7 +437,9 @@ mod tests {
     #[test]
     fn event_ordinals_preserve_cross_window_facts() {
         use winit::dpi::PhysicalPosition;
-        use winit::event::{DeviceId, ElementState, MouseButton, PointerEventFacts, WindowEvent};
+        use winit::event::{
+            DeviceId, ElementState, MouseButton, PointerEventFacts, PointerWindowRoute, WindowEvent,
+        };
         use winit::keyboard::ModifiersState;
 
         let host = Arc::new(RecordingHost::default());
@@ -451,11 +453,17 @@ mod tests {
             surface_position: Some(PhysicalPosition::new(10.0, 20.0)),
             desktop_position: Some(PhysicalPosition::new(110.0, 220.0)),
             modifiers: Some(ModifiersState::SHIFT),
+            hover: PointerWindowRoute::Window(first_window),
+            capture: PointerWindowRoute::Unknown,
+            ..PointerEventFacts::default()
         };
         let second_facts = PointerEventFacts {
             surface_position: Some(PhysicalPosition::new(30.0, 40.0)),
             desktop_position: Some(PhysicalPosition::new(330.0, 440.0)),
             modifiers: None,
+            hover: PointerWindowRoute::Foreign,
+            capture: PointerWindowRoute::Window(second_window),
+            ..PointerEventFacts::default()
         };
 
         let release = WindowEvent::MouseInput {
