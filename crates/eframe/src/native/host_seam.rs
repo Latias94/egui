@@ -39,6 +39,14 @@ pub struct NativeOutputToken {
 }
 
 impl NativeOutputToken {
+    /// Returns whether two output tokens were minted by the same native context.
+    ///
+    /// The context identity remains opaque; hosts may use only equality to
+    /// validate a context-local output sequence.
+    pub fn same_context(self, other: Self) -> bool {
+        self.context == other.context
+    }
+
     /// Returns the viewport whose UI callback owns this token.
     pub const fn viewport_id(self) -> ViewportId {
         self.viewport_id
@@ -651,6 +659,46 @@ mod tests {
 
         assert_eq!(token.window_id(), window);
         scope.finish().present();
+    }
+
+    #[test]
+    fn output_tokens_expose_only_context_equality() {
+        let first_host = Arc::new(RecordingHost::default());
+        let first_handler: Arc<dyn NativeHostHandler> = Arc::<RecordingHost>::clone(&first_host);
+        let first_state = NativeHostState::new(Some(first_handler));
+        let context = egui::Context::default();
+        let first = first_state
+            .begin_output(&context, ViewportId::ROOT, WindowId::from(11))
+            .expect("first scope exists");
+        let first_token = current_native_output_token().expect("first token is active");
+        let second = first_state
+            .begin_output(
+                &context,
+                ViewportId::from_hash_of("same-context"),
+                WindowId::from(12),
+            )
+            .expect("second scope exists");
+        let second_token = current_native_output_token().expect("second token is active");
+
+        let foreign_host = Arc::new(RecordingHost::default());
+        let foreign_handler: Arc<dyn NativeHostHandler> =
+            Arc::<RecordingHost>::clone(&foreign_host);
+        let foreign_state = NativeHostState::new(Some(foreign_handler));
+        let foreign = foreign_state
+            .begin_output(
+                &context,
+                ViewportId::from_hash_of("other-context"),
+                WindowId::from(13),
+            )
+            .expect("foreign scope exists");
+        let foreign_token = current_native_output_token().expect("foreign token is active");
+
+        assert!(first_token.same_context(second_token));
+        assert!(!first_token.same_context(foreign_token));
+
+        foreign.finish().present();
+        second.finish().present();
+        first.finish().present();
     }
 
     #[test]
