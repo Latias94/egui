@@ -4,6 +4,83 @@ use emath::TSTransform;
 
 use crate::{LayerId, Pos2, Sense, WidgetRect, WidgetRects, emath, id::IdSet};
 
+/// Opaque identity of one widget selected by a completed-pass hit test.
+///
+/// The layer is part of the identity so integrations cannot accidentally bind
+/// a result to an identically named widget in another layer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct WidgetHitIdentity {
+    id: crate::Id,
+    layer_id: LayerId,
+}
+
+impl WidgetHitIdentity {
+    /// Returns the widget id.
+    pub const fn id(self) -> crate::Id {
+        self.id
+    }
+
+    /// Returns the layer containing the widget.
+    pub const fn layer_id(self) -> LayerId {
+        self.layer_id
+    }
+
+    fn from_widget(widget: WidgetRect) -> Self {
+        Self {
+            id: widget.id,
+            layer_id: widget.layer_id,
+        }
+    }
+}
+
+/// Opaque top-widget result from one completed-pass hit test.
+///
+/// This records widget identities only. It does not expose the retained widget
+/// graph, layer transforms, or interaction state, and it does not imply that a
+/// pointer button or capture transition occurred.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WidgetHitSnapshot {
+    cumulative_pass_nr: u64,
+    click: Option<WidgetHitIdentity>,
+    drag: Option<WidgetHitIdentity>,
+    contains_pointer: Option<WidgetHitIdentity>,
+}
+
+impl WidgetHitSnapshot {
+    /// Returns the completed-pass generation used for this hit test.
+    pub const fn cumulative_pass_nr(self) -> u64 {
+        self.cumulative_pass_nr
+    }
+
+    /// Returns the widget which would receive a click at the queried point.
+    pub const fn click(self) -> Option<WidgetHitIdentity> {
+        self.click
+    }
+
+    /// Returns the widget which would receive a drag at the queried point.
+    pub const fn drag(self) -> Option<WidgetHitIdentity> {
+        self.drag
+    }
+
+    /// Returns the frontmost widget whose interaction rectangle contains the point.
+    pub const fn contains_pointer(self) -> Option<WidgetHitIdentity> {
+        self.contains_pointer
+    }
+
+    pub(crate) fn from_hits(cumulative_pass_nr: u64, hits: &WidgetHits) -> Self {
+        Self {
+            cumulative_pass_nr,
+            click: hits.click.map(WidgetHitIdentity::from_widget),
+            drag: hits.drag.map(WidgetHitIdentity::from_widget),
+            contains_pointer: hits
+                .contains_pointer
+                .last()
+                .copied()
+                .map(WidgetHitIdentity::from_widget),
+        }
+    }
+}
+
 /// Result of a hit-test against [`WidgetRects`].
 ///
 /// Answers the question "what is under the mouse pointer?".

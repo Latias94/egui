@@ -474,6 +474,7 @@ pub use self::{
     drag_and_drop::DragAndDrop,
     epaint::text::TextWrapMode,
     grid::Grid,
+    hit_test::{WidgetHitIdentity, WidgetHitSnapshot},
     id::{AsId, Id, IdMap, IdSet},
     id_salt::{AsIdSalt, IdSalt},
     input_state::{InputOptions, InputState, MultiTouchInfo, PointerState, SurrenderFocusOn},

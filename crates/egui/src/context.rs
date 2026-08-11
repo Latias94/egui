@@ -1418,6 +1418,56 @@ impl Context {
         })
     }
 
+    /// Hit-tests one point against the widgets from a viewport's last completed pass.
+    ///
+    /// This uses the same layer order, transforms, interaction radius, and
+    /// occlusion rules as egui's normal pointer routing. The result contains
+    /// widget identities only and does not mutate current interaction state.
+    ///
+    /// Returns `None` when the viewport has not completed a pass or the point
+    /// is not finite. `Some` with empty lanes is authoritative evidence that no
+    /// widget in the completed pass owns those lanes at the queried point.
+    #[must_use]
+    pub fn hit_test_last_pass(
+        &self,
+        viewport_id: ViewportId,
+        position: Pos2,
+    ) -> Option<crate::WidgetHitSnapshot> {
+        if !position.is_finite() {
+            return None;
+        }
+
+        self.read(|ctx| {
+            let Some(viewport) = ctx.viewports.get(&viewport_id) else {
+                return None;
+            };
+            let cumulative_pass_nr = viewport.repaint.cumulative_pass_nr;
+            if cumulative_pass_nr == 0 {
+                return None;
+            }
+
+            let mut layers: Vec<LayerId> = viewport
+                .prev_pass
+                .widgets
+                .layer_ids()
+                .filter(|layer_id| ctx.memory.areas().is_interactable(*layer_id))
+                .collect();
+            layers.sort_by(|&a, &b| ctx.memory.areas().compare_order(a, b));
+            let radius = ctx.memory.options.style().interaction.interact_radius;
+            let hits = crate::hit_test::hit_test(
+                &viewport.prev_pass.widgets,
+                &layers,
+                &ctx.memory.to_global,
+                position,
+                radius,
+            );
+            Some(crate::WidgetHitSnapshot::from_hits(
+                cumulative_pass_nr,
+                &hits,
+            ))
+        })
+    }
+
     /// Do all interaction for an existing widget, without (re-)registering it.
     pub(crate) fn get_response(&self, widget_rect: WidgetRect) -> Response {
         use response::Flags;
@@ -4377,6 +4427,72 @@ fn warn_if_rect_changes_id(
 #[cfg(test)]
 mod test {
     use super::Context;
+    use crate::{Id, LayerId, Pos2, RawInput, Rect, Sense, Vec2, ViewportId};
+
+    fn test_input() -> RawInput {
+        RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::splat(128.0))),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn last_pass_hit_test_distinguishes_unknown_from_known_empty() {
+        let ctx = Context::default();
+
+        assert_eq!(
+            ctx.hit_test_last_pass(ViewportId::ROOT, Pos2::new(16.0, 16.0)),
+            None
+        );
+
+        let output = ctx.run_ui(test_input(), |_| {});
+        output.drop_without_applying_deltas();
+
+        let snapshot = ctx
+            .hit_test_last_pass(ViewportId::ROOT, Pos2::new(16.0, 16.0))
+            .expect("the root viewport completed one pass");
+        assert_eq!(snapshot.cumulative_pass_nr(), 1);
+        assert_eq!(snapshot.click(), None);
+        assert_eq!(snapshot.drag(), None);
+        assert_eq!(snapshot.contains_pointer(), None);
+        assert_eq!(
+            ctx.hit_test_last_pass(ViewportId::ROOT, Pos2::new(f32::NAN, 0.0)),
+            None
+        );
+    }
+
+    #[test]
+    fn last_pass_hit_test_uses_the_final_multipass_widgets() {
+        let ctx = Context::default();
+        ctx.options_mut(|options| options.max_passes = 2.try_into().unwrap());
+
+        let first_id = Id::new("first-pass-widget");
+        let final_id = Id::new("final-pass-widget");
+        let rect = Rect::from_min_size(Pos2::new(8.0, 8.0), Vec2::splat(32.0));
+        let mut pass = 0;
+        let output = ctx.run_ui(test_input(), |ui| {
+            let id = if pass == 0 { first_id } else { final_id };
+            let _ = ui.interact(rect, id, Sense::click_and_drag());
+            if pass == 0 {
+                ui.request_discard("verify completed-pass hit testing");
+            }
+            pass += 1;
+        });
+        output.drop_without_applying_deltas();
+
+        assert_eq!(pass, 2);
+        let snapshot = ctx
+            .hit_test_last_pass(ViewportId::ROOT, rect.center())
+            .expect("the final pass completed");
+        assert_eq!(snapshot.cumulative_pass_nr(), 2);
+        let click = snapshot.click().expect("the final widget receives clicks");
+        let drag = snapshot.drag().expect("the final widget receives drags");
+        assert_eq!(click.id(), final_id);
+        assert_eq!(drag.id(), final_id);
+        assert_eq!(click.layer_id(), LayerId::background());
+        assert_eq!(drag.layer_id(), LayerId::background());
+        assert_ne!(click.id(), first_id);
+    }
 
     #[test]
     fn test_single_pass() {
