@@ -39,7 +39,7 @@ use super::{
 };
 use crate::epaint::textures::TexturesDelta;
 #[cfg(feature = "native-host-seam")]
-use crate::native::host_seam::{NativeHostState, NativeWindowSnapshot};
+use crate::native::host_seam::{NativeHostState, NativeViewportRecord, NativeWindowSnapshot};
 use crate::{
     App, AppCreator, CreationContext, NativeOptions, Result, Storage,
     native::{epi_integration::EpiIntegration, winit_integration::sleep_if_invisible_or_minimized},
@@ -792,11 +792,26 @@ impl GlowWinitRunning<'_> {
         // so make sure we don't hold any locks here required by the immediate viewports rendeer.
 
         #[cfg(feature = "native-host-seam")]
+        let root_roster = (viewport_id == ViewportId::ROOT).then(|| {
+            self.glutin
+                .borrow()
+                .viewports
+                .iter()
+                .filter_map(|(id, viewport)| {
+                    viewport
+                        .window
+                        .as_deref()
+                        .map(|window| NativeViewportRecord::capture(*id, window))
+                })
+                .collect::<Vec<_>>()
+        });
+        #[cfg(feature = "native-host-seam")]
         let output_scope = self.native_host.begin_output(
             &self.integration.egui_ctx,
             viewport_id,
             window_id,
             output_snapshot,
+            root_roster.as_deref(),
         );
         let full_output =
             self.integration

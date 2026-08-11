@@ -179,6 +179,56 @@ pub struct NativeWindowSnapshot {
     minimized: Option<bool>,
 }
 
+/// One native window in a root-output roster captured from live backend windows.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct NativeViewportRecord {
+    viewport_id: ViewportId,
+    window_id: WindowId,
+    window: NativeWindowSnapshot,
+}
+
+impl NativeViewportRecord {
+    /// Returns the eframe viewport which owns the native window.
+    pub const fn viewport_id(self) -> ViewportId {
+        self.viewport_id
+    }
+
+    /// Returns the exact live native window identity.
+    pub const fn window_id(self) -> WindowId {
+        self.window_id
+    }
+
+    /// Returns the facts captured from this exact live window.
+    pub const fn window(self) -> NativeWindowSnapshot {
+        self.window
+    }
+
+    pub(crate) fn capture(viewport_id: ViewportId, window: &Window) -> Self {
+        Self {
+            viewport_id,
+            window_id: window.id(),
+            window: NativeWindowSnapshot::capture(window),
+        }
+    }
+}
+
+/// Borrowed exact native-window roster attached to one root output callback.
+#[derive(Clone, Copy, Debug)]
+pub struct NativeViewportRoster<'a> {
+    records: &'a [NativeViewportRecord],
+}
+
+impl<'a> NativeViewportRoster<'a> {
+    const fn new(records: &'a [NativeViewportRecord]) -> Self {
+        Self { records }
+    }
+
+    /// Returns every live native window captured for this root callback.
+    pub const fn records(self) -> &'a [NativeViewportRecord] {
+        self.records
+    }
+}
+
 impl NativeWindowSnapshot {
     /// Returns the current physical content rectangle, when the platform can
     /// report its desktop position.
@@ -317,7 +367,13 @@ pub trait NativeHostHandler: Send + Sync + 'static {
     /// Hosts may reserve the token here and attach the affine painted output
     /// after the core frame commits. The callback is observation-only and must
     /// not re-enter eframe.
-    fn on_output_begin(&self, _token: NativeOutputToken, _window: NativeWindowSnapshot) {}
+    fn on_output_begin(
+        &self,
+        _token: NativeOutputToken,
+        _window: NativeWindowSnapshot,
+        _root_roster: Option<NativeViewportRoster<'_>>,
+    ) {
+    }
 
     /// Receives one terminal output result and decides whether queued work needs another frame.
     fn on_output(&self, _result: NativeOutputResult) -> NativeHostWake {
@@ -428,6 +484,7 @@ impl NativeHostState {
         viewport_id: ViewportId,
         window_id: WindowId,
         snapshot: NativeWindowSnapshot,
+        root_roster: Option<&[NativeViewportRecord]>,
     ) -> Option<NativeOutputScope> {
         let inner = Arc::clone(self.inner.as_ref()?);
         let token = NativeOutputToken {
@@ -436,7 +493,9 @@ impl NativeHostState {
             viewport_id,
             window_id,
         };
-        inner.handler.on_output_begin(token, snapshot);
+        inner
+            .handler
+            .on_output_begin(token, snapshot, root_roster.map(NativeViewportRoster::new));
         ACTIVE_OUTPUTS.with(|outputs| outputs.borrow_mut().push(token));
         Some(NativeOutputScope {
             inner,
@@ -464,6 +523,7 @@ impl NativeHostState {
                 visible: None,
                 minimized: None,
             },
+            None,
         )
     }
 
@@ -676,7 +736,13 @@ mod tests {
                 winit::event::PointerEventFacts,
             )>,
         >,
-        output_begins: Mutex<Vec<(NativeOutputToken, NativeWindowSnapshot)>>,
+        output_begins: Mutex<
+            Vec<(
+                NativeOutputToken,
+                NativeWindowSnapshot,
+                Option<Vec<NativeViewportRecord>>,
+            )>,
+        >,
         outputs: Mutex<Vec<NativeOutputResult>>,
         create_failures: Mutex<Vec<NativeViewportCreateFailure>>,
         deferred_rect: Mutex<Option<(ViewportId, NativePhysicalRect)>>,
@@ -713,8 +779,17 @@ mod tests {
             self.wake
         }
 
-        fn on_output_begin(&self, token: NativeOutputToken, window: NativeWindowSnapshot) {
-            self.output_begins.lock().push((token, window));
+        fn on_output_begin(
+            &self,
+            token: NativeOutputToken,
+            window: NativeWindowSnapshot,
+            root_roster: Option<NativeViewportRoster<'_>>,
+        ) {
+            self.output_begins.lock().push((
+                token,
+                window,
+                root_roster.map(|roster| roster.records().to_vec()),
+            ));
         }
 
         fn on_viewport_create_failed(
@@ -826,12 +901,13 @@ mod tests {
         assert_eq!(
             output_begins
                 .iter()
-                .map(|(token, _)| *token)
+                .map(|(token, _, _)| *token)
                 .collect::<Vec<_>>(),
             vec![outer_token, child_token]
         );
-        assert!(output_begins.iter().all(|(_, snapshot)| {
-            snapshot.inner_rect().is_none()
+        assert!(output_begins.iter().all(|(_, snapshot, roster)| {
+            roster.is_none()
+                && snapshot.inner_rect().is_none()
                 && snapshot.outer_rect().is_none()
                 && snapshot.scale_factor() == 1.0
                 && snapshot.visible().is_none()
@@ -845,6 +921,78 @@ mod tests {
         assert_eq!(outputs[1].ordinal().get(), 2);
         assert_eq!(outputs[1].status(), NativeOutputStatus::NotPresented);
         assert_eq!(repaint_count.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn root_output_binds_one_complete_roster_to_the_active_token() {
+        let host = Arc::new(RecordingHost::default());
+        let handler: Arc<dyn NativeHostHandler> = Arc::<RecordingHost>::clone(&host);
+        let state = NativeHostState::new(Some(handler));
+        let ctx = egui::Context::default();
+        let root_window = WindowId::from(11);
+        let child_window = WindowId::from(22);
+        let child_viewport = ViewportId::from_hash_of("child-roster");
+        let root_snapshot = NativeWindowSnapshot {
+            inner_rect: Some(NativePhysicalRect::new(10, 20, 800, 600)),
+            outer_rect: Some(NativePhysicalRect::new(2, -10, 816, 638)),
+            scale_factor: 2.0,
+            visible: Some(true),
+            minimized: Some(false),
+        };
+        let child_snapshot = NativeWindowSnapshot {
+            inner_rect: Some(NativePhysicalRect::new(900, 20, 640, 480)),
+            outer_rect: None,
+            scale_factor: 1.5,
+            visible: None,
+            minimized: None,
+        };
+        let roster = [
+            NativeViewportRecord {
+                viewport_id: ViewportId::ROOT,
+                window_id: root_window,
+                window: root_snapshot,
+            },
+            NativeViewportRecord {
+                viewport_id: child_viewport,
+                window_id: child_window,
+                window: child_snapshot,
+            },
+        ];
+
+        let scope = state
+            .begin_output(
+                &ctx,
+                ViewportId::ROOT,
+                root_window,
+                root_snapshot,
+                Some(&roster),
+            )
+            .expect("root output scope exists");
+        let token = current_native_output_token().expect("root token is active");
+
+        let output_begins = host.output_begins.lock();
+        assert_eq!(output_begins.len(), 1);
+        assert_eq!(output_begins[0].0, token);
+        assert_eq!(output_begins[0].1, root_snapshot);
+        assert_eq!(output_begins[0].2.as_deref(), Some(roster.as_slice()));
+        drop(output_begins);
+        scope.finish().present();
+    }
+
+    #[test]
+    fn deferred_output_never_claims_a_root_roster() {
+        let host = Arc::new(RecordingHost::default());
+        let handler: Arc<dyn NativeHostHandler> = Arc::<RecordingHost>::clone(&host);
+        let state = NativeHostState::new(Some(handler));
+        let child = ViewportId::from_hash_of("child-without-roster");
+
+        state
+            .begin_output_for_test(&egui::Context::default(), child, WindowId::from(22))
+            .expect("child scope exists")
+            .finish()
+            .present();
+
+        assert!(host.output_begins.lock()[0].2.is_none());
     }
 
     #[test]

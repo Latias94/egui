@@ -27,7 +27,7 @@ use log::warn;
 use winit_integration::UserEvent;
 
 #[cfg(feature = "native-host-seam")]
-use crate::native::host_seam::{NativeHostState, NativeWindowSnapshot};
+use crate::native::host_seam::{NativeHostState, NativeViewportRecord, NativeWindowSnapshot};
 use crate::{
     App, AppCreator, CreationContext, NativeOptions, Result, Storage,
     native::{
@@ -819,11 +819,26 @@ impl WgpuWinitRunning<'_> {
         // Runs the update, which could call immediate viewports,
         // so make sure we hold no locks here!
         #[cfg(feature = "native-host-seam")]
+        let root_roster = (viewport_id == ViewportId::ROOT).then(|| {
+            shared
+                .borrow()
+                .viewports
+                .iter()
+                .filter_map(|(id, viewport)| {
+                    viewport
+                        .window
+                        .as_deref()
+                        .map(|window| NativeViewportRecord::capture(*id, window))
+                })
+                .collect::<Vec<_>>()
+        });
+        #[cfg(feature = "native-host-seam")]
         let output_scope = native_host.begin_output(
             &integration.egui_ctx,
             viewport_id,
             window_id,
             output_snapshot,
+            root_roster.as_deref(),
         );
         let full_output = integration.update(app.as_mut(), viewport_ui_cb.as_deref(), raw_input);
         #[cfg(feature = "native-host-seam")]
