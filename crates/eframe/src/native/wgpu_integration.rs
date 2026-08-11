@@ -27,7 +27,7 @@ use log::warn;
 use winit_integration::UserEvent;
 
 #[cfg(feature = "native-host-seam")]
-use crate::native::host_seam::NativeHostState;
+use crate::native::host_seam::{NativeHostState, NativeWindowSnapshot};
 use crate::{
     App, AppCreator, CreationContext, NativeOptions, Result, Storage,
     native::{
@@ -90,6 +90,8 @@ impl Drop for WgpuWinitRunning<'_> {
 /// Wrapped in an `Rc<RefCell<…>>` so it can be re-entrantly shared via a weak-pointer.
 pub struct SharedState {
     egui_ctx: egui::Context,
+    #[cfg(feature = "native-host-seam")]
+    native_host: NativeHostState,
     viewports: Viewports,
     painter: egui_wgpu::winit::Painter,
     viewport_from_window: HashMap<WindowId, ViewportId>,
@@ -179,9 +181,14 @@ impl<'app> WgpuWinitApp<'app> {
 
         for viewport in viewports.values_mut() {
             let viewport_id = viewport.ids.this;
-            if let Err(err) =
-                viewport.initialize_window(event_loop, &egui_ctx, viewport_from_window, painter)
-            {
+            if let Err(err) = viewport.initialize_window(
+                event_loop,
+                &egui_ctx,
+                viewport_from_window,
+                painter,
+                #[cfg(feature = "native-host-seam")]
+                &native_host,
+            ) {
                 log::error!("Failed to create window for viewport {viewport_id:?}: {err}");
                 #[cfg(feature = "native-host-seam")]
                 native_host.notify_viewport_create_failed(&egui_ctx, viewport_id);
@@ -193,6 +200,8 @@ impl<'app> WgpuWinitApp<'app> {
     fn recreate_window(&self, event_loop: &ActiveEventLoop, running: &WgpuWinitRunning<'app>) {
         let SharedState {
             egui_ctx,
+            #[cfg(feature = "native-host-seam")]
+            native_host,
             viewports,
             viewport_from_window,
             painter,
@@ -207,7 +216,14 @@ impl<'app> WgpuWinitApp<'app> {
             None,
             painter,
         )
-        .initialize_window(event_loop, egui_ctx, viewport_from_window, painter)
+        .initialize_window(
+            event_loop,
+            egui_ctx,
+            viewport_from_window,
+            painter,
+            #[cfg(feature = "native-host-seam")]
+            native_host,
+        )
         .unwrap_or_else(|err| log::error!("Failed to recreate Android window: {err}"));
     }
 
@@ -371,6 +387,8 @@ impl<'app> WgpuWinitApp<'app> {
 
         let shared = Rc::new(RefCell::new(SharedState {
             egui_ctx,
+            #[cfg(feature = "native-host-seam")]
+            native_host: self.native_host.clone(),
             viewport_from_window,
             viewports,
             painter,
@@ -665,7 +683,7 @@ impl WgpuWinitRunning<'_> {
         let mut frame_timer = crate::stopwatch::Stopwatch::new();
         frame_timer.start();
 
-        let (viewport_ui_cb, raw_input, is_visible, show_ui) = {
+        let (viewport_ui_cb, raw_input, output_snapshot, is_visible, show_ui) = {
             profiling::scope!("Prepare");
             let mut shared_lock = shared.borrow_mut();
 
@@ -709,7 +727,8 @@ impl WgpuWinitRunning<'_> {
             };
             egui_winit::update_viewport_info(info, &integration.egui_ctx, window, false);
 
-            let is_visible = viewport.info.visible().unwrap_or(true);
+            let is_visible = info.visible().unwrap_or(true);
+            let output_snapshot = NativeWindowSnapshot::capture(window);
 
             {
                 profiling::scope!("set_window");
@@ -733,7 +752,13 @@ impl WgpuWinitRunning<'_> {
 
             painter.handle_screenshots(&mut raw_input.events);
 
-            (viewport_ui_cb, raw_input, is_visible, show_ui)
+            (
+                viewport_ui_cb,
+                raw_input,
+                output_snapshot,
+                is_visible,
+                show_ui,
+            )
         };
 
         if !show_ui {
@@ -794,7 +819,12 @@ impl WgpuWinitRunning<'_> {
         // Runs the update, which could call immediate viewports,
         // so make sure we hold no locks here!
         #[cfg(feature = "native-host-seam")]
-        let output_scope = native_host.begin_output(&integration.egui_ctx, viewport_id, window_id);
+        let output_scope = native_host.begin_output(
+            &integration.egui_ctx,
+            viewport_id,
+            window_id,
+            output_snapshot,
+        );
         let full_output = integration.update(app.as_mut(), viewport_ui_cb.as_deref(), raw_input);
         #[cfg(feature = "native-host-seam")]
         let mut output_settlement = output_scope.map(|scope| scope.finish());
@@ -1121,6 +1151,7 @@ impl Viewport {
         egui_ctx: &egui::Context,
         windows_id: &mut HashMap<WindowId, ViewportId>,
         painter: &mut egui_wgpu::winit::Painter,
+        #[cfg(feature = "native-host-seam")] native_host: &NativeHostState,
     ) -> Result<(), winit::error::OsError> {
         if self.window.is_some() {
             return Ok(()); // we already have one
@@ -1130,7 +1161,35 @@ impl Viewport {
 
         let viewport_id = self.ids.this;
 
-        let window = egui_winit::create_window(egui_ctx, event_loop, &self.builder)?;
+        #[cfg(feature = "native-host-seam")]
+        let native_override = (self.class == ViewportClass::Deferred)
+            .then(|| native_host.deferred_window_override(viewport_id, &self.builder))
+            .flatten();
+
+        let mut window_attributes =
+            egui_winit::create_winit_window_attributes(egui_ctx, self.builder.clone());
+        if let Some(idx) = self.builder.monitor {
+            if let Some(monitor) = event_loop.available_monitors().nth(idx) {
+                window_attributes = window_attributes
+                    .with_fullscreen(Some(winit::window::Fullscreen::Borderless(Some(monitor))));
+            } else {
+                log::warn!(
+                    "ViewportBuilder::with_monitor({idx}): index out of range ({} monitors available)",
+                    event_loop.available_monitors().count()
+                );
+            }
+        }
+        #[cfg(feature = "native-host-seam")]
+        if let Some(native_override) = native_override {
+            window_attributes = native_override.apply_to_attributes(window_attributes);
+        }
+
+        let window = event_loop.create_window(window_attributes)?;
+        egui_winit::apply_viewport_builder_to_window(egui_ctx, &window, &self.builder);
+        #[cfg(feature = "native-host-seam")]
+        if let Some(native_override) = native_override {
+            native_override.reapply_to_window(&window);
+        }
         windows_id.insert(window.id(), viewport_id);
 
         let window = Arc::new(window);
@@ -1213,6 +1272,8 @@ fn render_immediate_viewport(
     let input = {
         let SharedState {
             egui_ctx,
+            #[cfg(feature = "native-host-seam")]
+            native_host,
             viewports,
             painter,
             viewport_from_window,
@@ -1229,9 +1290,14 @@ fn render_immediate_viewport(
         );
         if viewport.window.is_none() {
             event_loop_context::with_current_event_loop(|event_loop| {
-                if let Err(err) =
-                    viewport.initialize_window(event_loop, egui_ctx, viewport_from_window, painter)
-                {
+                if let Err(err) = viewport.initialize_window(
+                    event_loop,
+                    egui_ctx,
+                    viewport_from_window,
+                    painter,
+                    #[cfg(feature = "native-host-seam")]
+                    native_host,
+                ) {
                     log::error!(
                         "Failed to initialize an immediate viewport window {:?}: {err}",
                         ids.this

@@ -39,7 +39,7 @@ use super::{
 };
 use crate::epaint::textures::TexturesDelta;
 #[cfg(feature = "native-host-seam")]
-use crate::native::host_seam::NativeHostState;
+use crate::native::host_seam::{NativeHostState, NativeWindowSnapshot};
 use crate::{
     App, AppCreator, CreationContext, NativeOptions, Result, Storage,
     native::{epi_integration::EpiIntegration, winit_integration::sleep_if_invisible_or_minimized},
@@ -107,6 +107,9 @@ impl Drop for GlowWinitRunning<'_> {
 /// `new` fn on all platforms. only on android, do we get multiple resumed events because app can be suspended.
 struct GlutinWindowContext {
     egui_ctx: egui::Context,
+
+    #[cfg(feature = "native-host-seam")]
+    native_host: NativeHostState,
 
     swap_interval: glutin::surface::SwapInterval,
     gl_config: glutin::config::Config,
@@ -204,6 +207,7 @@ impl<'app> GlowWinitApp<'app> {
         event_loop: &ActiveEventLoop,
         storage: Option<&dyn Storage>,
         native_options: &mut NativeOptions,
+        #[cfg(feature = "native-host-seam")] native_host: &NativeHostState,
     ) -> Result<(GlutinWindowContext, egui_glow::Painter)> {
         profiling::function_scope!();
         let window_settings = epi_integration::load_window_settings(storage);
@@ -217,7 +221,14 @@ impl<'app> GlowWinitApp<'app> {
         .with_visible(false); // Start hidden until we render the first frame to fix white flash on startup (https://github.com/emilk/egui/pull/3631)
 
         let mut glutin_window_context = unsafe {
-            GlutinWindowContext::new(egui_ctx, winit_window_builder, native_options, event_loop)?
+            GlutinWindowContext::new(
+                egui_ctx,
+                winit_window_builder,
+                native_options,
+                event_loop,
+                #[cfg(feature = "native-host-seam")]
+                native_host,
+            )?
         };
 
         // Creates the window - must come before we create our glow context
@@ -277,6 +288,8 @@ impl<'app> GlowWinitApp<'app> {
             event_loop,
             storage.as_deref(),
             &mut self.native_options,
+            #[cfg(feature = "native-host-seam")]
+            &self.native_host,
         )?;
         let gl = Arc::clone(painter.gl());
 
@@ -640,7 +653,7 @@ impl GlowWinitRunning<'_> {
             }
         }
 
-        let (raw_input, viewport_ui_cb, is_visible, show_ui) = {
+        let (raw_input, viewport_ui_cb, output_snapshot, is_visible, show_ui) = {
             let mut glutin = self.glutin.borrow_mut();
             let egui_ctx = glutin.egui_ctx.clone();
             let Some(viewport) = glutin.viewports.get_mut(&viewport_id) else {
@@ -652,6 +665,7 @@ impl GlowWinitRunning<'_> {
             egui_winit::update_viewport_info(&mut viewport.info, &egui_ctx, window, false);
 
             let is_visible = viewport.info.visible().unwrap_or(true);
+            let output_snapshot = NativeWindowSnapshot::capture(window);
 
             let Some(egui_winit) = viewport.egui_winit.as_mut() else {
                 return Ok(EventResult::Wait);
@@ -671,7 +685,13 @@ impl GlowWinitRunning<'_> {
                 .map(|(id, viewport)| (*id, viewport.info.clone()))
                 .collect();
 
-            (raw_input, viewport_ui_cb, is_visible, show_ui)
+            (
+                raw_input,
+                viewport_ui_cb,
+                output_snapshot,
+                is_visible,
+                show_ui,
+            )
         };
 
         if !show_ui {
@@ -772,9 +792,12 @@ impl GlowWinitRunning<'_> {
         // so make sure we don't hold any locks here required by the immediate viewports rendeer.
 
         #[cfg(feature = "native-host-seam")]
-        let output_scope =
-            self.native_host
-                .begin_output(&self.integration.egui_ctx, viewport_id, window_id);
+        let output_scope = self.native_host.begin_output(
+            &self.integration.egui_ctx,
+            viewport_id,
+            window_id,
+            output_snapshot,
+        );
         let full_output =
             self.integration
                 .update(self.app.as_mut(), viewport_ui_cb.as_deref(), raw_input);
@@ -1103,6 +1126,7 @@ impl GlutinWindowContext {
         viewport_builder: ViewportBuilder,
         native_options: &NativeOptions,
         event_loop: &ActiveEventLoop,
+        #[cfg(feature = "native-host-seam")] native_host: &NativeHostState,
     ) -> Result<Self> {
         profiling::function_scope!();
 
@@ -1272,6 +1296,8 @@ impl GlutinWindowContext {
 
         let mut slf = Self {
             egui_ctx: egui_ctx.clone(),
+            #[cfg(feature = "native-host-seam")]
+            native_host: native_host.clone(),
             swap_interval,
             gl_config,
             current_gl_context: None,
@@ -1315,6 +1341,16 @@ impl GlutinWindowContext {
     ) -> Result {
         profiling::function_scope!();
 
+        #[cfg(feature = "native-host-seam")]
+        let native_override = self
+            .viewports
+            .get(&viewport_id)
+            .filter(|viewport| viewport.class == ViewportClass::Deferred)
+            .and_then(|viewport| {
+                self.native_host
+                    .deferred_window_override(viewport_id, &viewport.builder)
+            });
+
         let viewport = self
             .viewports
             .get_mut(&viewport_id)
@@ -1324,10 +1360,14 @@ impl GlutinWindowContext {
             window
         } else {
             log::debug!("Creating a window for viewport {viewport_id:?}");
-            let window_attributes = egui_winit::create_winit_window_attributes(
+            let mut window_attributes = egui_winit::create_winit_window_attributes(
                 &self.egui_ctx,
                 viewport.builder.clone(),
             );
+            #[cfg(feature = "native-host-seam")]
+            if let Some(native_override) = native_override {
+                window_attributes = native_override.apply_to_attributes(window_attributes);
+            }
             if window_attributes.transparent()
                 && self.gl_config.supports_transparency() == Some(false)
             {
@@ -1340,6 +1380,10 @@ impl GlutinWindowContext {
                 &window,
                 &viewport.builder,
             );
+            #[cfg(feature = "native-host-seam")]
+            if let Some(native_override) = native_override {
+                native_override.reapply_to_window(&window);
+            }
 
             egui_winit::update_viewport_info(&mut viewport.info, &self.egui_ctx, &window, true);
             viewport.window.insert(Arc::new(window))

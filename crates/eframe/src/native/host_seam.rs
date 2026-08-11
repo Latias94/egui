@@ -9,8 +9,8 @@ use std::num::NonZeroU64;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use egui::ViewportId;
-use winit::window::WindowId;
+use egui::{ViewportBuilder, ViewportId};
+use winit::window::{Window, WindowAttributes, WindowId};
 
 static NEXT_CONTEXT_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -122,6 +122,134 @@ pub struct NativeViewportCreateFailure {
     viewport_id: ViewportId,
 }
 
+/// A physical desktop rectangle used by the native host seam.
+///
+/// The rectangle is expressed in integer physical pixels and does not imply
+/// that the window manager accepted a corresponding placement request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct NativePhysicalRect {
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+}
+
+impl NativePhysicalRect {
+    /// Creates a physical desktop rectangle.
+    pub const fn new(x: i32, y: i32, width: u32, height: u32) -> Self {
+        Self {
+            x,
+            y,
+            width,
+            height,
+        }
+    }
+
+    /// Returns the physical x coordinate.
+    pub const fn x(self) -> i32 {
+        self.x
+    }
+
+    /// Returns the physical y coordinate.
+    pub const fn y(self) -> i32 {
+        self.y
+    }
+
+    /// Returns the physical width.
+    pub const fn width(self) -> u32 {
+        self.width
+    }
+
+    /// Returns the physical height.
+    pub const fn height(self) -> u32 {
+        self.height
+    }
+}
+
+/// Window facts captured for the exact callback that owns an output token.
+///
+/// Unsupported or unavailable facts remain [`None`]. In particular, this
+/// snapshot does not infer desktop geometry from cached viewport information.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct NativeWindowSnapshot {
+    inner_rect: Option<NativePhysicalRect>,
+    outer_rect: Option<NativePhysicalRect>,
+    scale_factor: f64,
+    visible: Option<bool>,
+    minimized: Option<bool>,
+}
+
+impl NativeWindowSnapshot {
+    /// Returns the current physical content rectangle, when the platform can
+    /// report its desktop position.
+    pub const fn inner_rect(self) -> Option<NativePhysicalRect> {
+        self.inner_rect
+    }
+
+    /// Returns the current physical outer rectangle when the platform exposes
+    /// it without a heuristic.
+    pub const fn outer_rect(self) -> Option<NativePhysicalRect> {
+        self.outer_rect
+    }
+
+    /// Returns the current native scale factor.
+    pub const fn scale_factor(self) -> f64 {
+        self.scale_factor
+    }
+
+    /// Returns the platform visibility flag when it is available.
+    ///
+    /// This is not a compositor presentation acknowledgement.
+    pub const fn visible(self) -> Option<bool> {
+        self.visible
+    }
+
+    /// Returns whether the platform reports the window as minimized.
+    pub const fn minimized(self) -> Option<bool> {
+        self.minimized
+    }
+
+    pub(crate) fn capture(window: &Window) -> Self {
+        let inner_rect = window
+            .inner_position()
+            .ok()
+            .map(|position| physical_rect(position, window.inner_size()));
+
+        #[cfg(any(target_os = "windows", target_os = "macos"))]
+        let outer_rect = window
+            .outer_position()
+            .ok()
+            .map(|position| physical_rect(position, window.outer_size()));
+        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+        let outer_rect = None;
+
+        #[cfg(target_os = "windows")]
+        let minimized = window.is_minimized();
+        #[cfg(not(target_os = "windows"))]
+        let minimized = None;
+
+        #[cfg(any(target_os = "windows", target_os = "macos"))]
+        let visible = window.is_visible();
+        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+        let visible = None;
+
+        Self {
+            inner_rect,
+            outer_rect,
+            scale_factor: window.scale_factor(),
+            visible,
+            minimized,
+        }
+    }
+}
+
+fn physical_rect(
+    position: winit::dpi::PhysicalPosition<i32>,
+    size: winit::dpi::PhysicalSize<u32>,
+) -> NativePhysicalRect {
+    NativePhysicalRect::new(position.x, position.y, size.width, size.height)
+}
+
 impl NativeViewportCreateFailure {
     /// Returns the deferred viewport whose native window could not be created.
     pub const fn viewport_id(self) -> ViewportId {
@@ -167,6 +295,20 @@ impl NativeWindowEvent<'_> {
 /// viewports so native side effects remain outside application UI recursion. Callbacks run on the
 /// native event-loop thread and must not re-enter eframe.
 pub trait NativeHostHandler: Send + Sync + 'static {
+    /// Returns a physical undecorated outer-rectangle request for one deferred
+    /// viewport.
+    ///
+    /// The request is consulted immediately before native window creation. It
+    /// is not an acknowledgement that the platform accepted the placement.
+    /// Eframe ignores the request when the viewport builder also requests
+    /// fullscreen, maximized, or monitor-targeted placement.
+    fn deferred_undecorated_outer_rect(
+        &self,
+        _viewport_id: ViewportId,
+    ) -> Option<NativePhysicalRect> {
+        None
+    }
+
     /// Observes one window event before egui-winit translates it.
     fn on_window_event(&self, _event: NativeWindowEvent<'_>) {}
 
@@ -175,7 +317,7 @@ pub trait NativeHostHandler: Send + Sync + 'static {
     /// Hosts may reserve the token here and attach the affine painted output
     /// after the core frame commits. The callback is observation-only and must
     /// not re-enter eframe.
-    fn on_output_begin(&self, _token: NativeOutputToken) {}
+    fn on_output_begin(&self, _token: NativeOutputToken, _window: NativeWindowSnapshot) {}
 
     /// Receives one terminal output result and decides whether queued work needs another frame.
     fn on_output(&self, _result: NativeOutputResult) -> NativeHostWake {
@@ -285,6 +427,7 @@ impl NativeHostState {
         ctx: &egui::Context,
         viewport_id: ViewportId,
         window_id: WindowId,
+        snapshot: NativeWindowSnapshot,
     ) -> Option<NativeOutputScope> {
         let inner = Arc::clone(self.inner.as_ref()?);
         let token = NativeOutputToken {
@@ -293,7 +436,7 @@ impl NativeHostState {
             viewport_id,
             window_id,
         };
-        inner.handler.on_output_begin(token);
+        inner.handler.on_output_begin(token, snapshot);
         ACTIVE_OUTPUTS.with(|outputs| outputs.borrow_mut().push(token));
         Some(NativeOutputScope {
             inner,
@@ -301,6 +444,58 @@ impl NativeHostState {
             token,
             active: true,
         })
+    }
+
+    #[cfg(test)]
+    fn begin_output_for_test(
+        &self,
+        ctx: &egui::Context,
+        viewport_id: ViewportId,
+        window_id: WindowId,
+    ) -> Option<NativeOutputScope> {
+        self.begin_output(
+            ctx,
+            viewport_id,
+            window_id,
+            NativeWindowSnapshot {
+                inner_rect: None,
+                outer_rect: None,
+                scale_factor: 1.0,
+                visible: None,
+                minimized: None,
+            },
+        )
+    }
+
+    pub(crate) fn deferred_window_override(
+        &self,
+        viewport_id: ViewportId,
+        builder: &ViewportBuilder,
+    ) -> Option<NativeDeferredWindowOverride> {
+        if viewport_id == ViewportId::ROOT {
+            return None;
+        }
+        if builder.fullscreen == Some(true)
+            || builder.maximized == Some(true)
+            || builder.monitor.is_some()
+        {
+            log::warn!(
+                "ignoring native host geometry for viewport {viewport_id:?}: fullscreen, maximized, and monitor-targeted builders are incompatible with an exact outer-rectangle request"
+            );
+            return None;
+        }
+        let rect = self
+            .inner
+            .as_ref()?
+            .handler
+            .deferred_undecorated_outer_rect(viewport_id)?;
+        if rect.width == 0 || rect.height == 0 {
+            log::warn!(
+                "ignoring native host geometry for viewport {viewport_id:?}: physical size must be non-zero"
+            );
+            return None;
+        }
+        Some(NativeDeferredWindowOverride { rect })
     }
 
     pub(crate) fn notify_viewport_create_failed(
@@ -318,6 +513,32 @@ impl NativeHostState {
         {
             ctx.request_repaint_of(ViewportId::ROOT);
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct NativeDeferredWindowOverride {
+    rect: NativePhysicalRect,
+}
+
+impl NativeDeferredWindowOverride {
+    pub(crate) fn apply_to_attributes(self, attributes: WindowAttributes) -> WindowAttributes {
+        attributes
+            .with_decorations(false)
+            .with_position(winit::dpi::PhysicalPosition::new(self.rect.x, self.rect.y))
+            .with_inner_size(winit::dpi::PhysicalSize::new(
+                self.rect.width,
+                self.rect.height,
+            ))
+    }
+
+    pub(crate) fn reapply_to_window(self, window: &Window) {
+        window.set_decorations(false);
+        window.set_outer_position(winit::dpi::PhysicalPosition::new(self.rect.x, self.rect.y));
+        let _ = window.request_inner_size(winit::dpi::PhysicalSize::new(
+            self.rect.width,
+            self.rect.height,
+        ));
     }
 }
 
@@ -455,13 +676,24 @@ mod tests {
                 winit::event::PointerEventFacts,
             )>,
         >,
-        output_begins: Mutex<Vec<NativeOutputToken>>,
+        output_begins: Mutex<Vec<(NativeOutputToken, NativeWindowSnapshot)>>,
         outputs: Mutex<Vec<NativeOutputResult>>,
         create_failures: Mutex<Vec<NativeViewportCreateFailure>>,
+        deferred_rect: Mutex<Option<(ViewportId, NativePhysicalRect)>>,
         wake: NativeHostWake,
     }
 
     impl NativeHostHandler for RecordingHost {
+        fn deferred_undecorated_outer_rect(
+            &self,
+            viewport_id: ViewportId,
+        ) -> Option<NativePhysicalRect> {
+            self.deferred_rect
+                .lock()
+                .filter(|(requested_viewport, _)| *requested_viewport == viewport_id)
+                .map(|(_, rect)| rect)
+        }
+
         fn on_window_event(&self, event: NativeWindowEvent<'_>) {
             let facts = match event.event() {
                 winit::event::WindowEvent::MouseInput { facts, .. }
@@ -481,8 +713,8 @@ mod tests {
             self.wake
         }
 
-        fn on_output_begin(&self, token: NativeOutputToken) {
-            self.output_begins.lock().push(token);
+        fn on_output_begin(&self, token: NativeOutputToken, window: NativeWindowSnapshot) {
+            self.output_begins.lock().push((token, window));
         }
 
         fn on_viewport_create_failed(
@@ -575,12 +807,12 @@ mod tests {
         });
 
         let outer = state
-            .begin_output(&ctx, ViewportId::ROOT, WindowId::from(11))
+            .begin_output_for_test(&ctx, ViewportId::ROOT, WindowId::from(11))
             .unwrap();
         let outer_token = current_native_output_token().unwrap();
         let child_id = ViewportId::from_hash_of("child");
         let child = state
-            .begin_output(&ctx, child_id, WindowId::from(22))
+            .begin_output_for_test(&ctx, child_id, WindowId::from(22))
             .unwrap();
         let child_token = current_native_output_token().unwrap();
 
@@ -590,7 +822,21 @@ mod tests {
         assert_eq!(current_native_output_token(), None);
 
         let outputs = host.outputs.lock();
-        assert_eq!(*host.output_begins.lock(), vec![outer_token, child_token]);
+        let output_begins = host.output_begins.lock();
+        assert_eq!(
+            output_begins
+                .iter()
+                .map(|(token, _)| *token)
+                .collect::<Vec<_>>(),
+            vec![outer_token, child_token]
+        );
+        assert!(output_begins.iter().all(|(_, snapshot)| {
+            snapshot.inner_rect().is_none()
+                && snapshot.outer_rect().is_none()
+                && snapshot.scale_factor() == 1.0
+                && snapshot.visible().is_none()
+                && snapshot.minimized().is_none()
+        }));
         assert_eq!(outputs.len(), 2);
         assert_eq!(outputs[0].token(), child_token);
         assert_eq!(outputs[0].ordinal().get(), 1);
@@ -616,7 +862,7 @@ mod tests {
         });
 
         state
-            .begin_output(&ctx, ViewportId::ROOT, WindowId::from(11))
+            .begin_output_for_test(&ctx, ViewportId::ROOT, WindowId::from(11))
             .unwrap()
             .finish()
             .present();
@@ -633,7 +879,7 @@ mod tests {
         let ctx = egui::Context::default();
 
         let mut settlement = state
-            .begin_output(&ctx, ViewportId::ROOT, WindowId::from(11))
+            .begin_output_for_test(&ctx, ViewportId::ROOT, WindowId::from(11))
             .unwrap()
             .finish();
         settlement.settle(NativeOutputStatus::Presented);
@@ -653,7 +899,7 @@ mod tests {
         let state = NativeHostState::new(Some(handler));
         let window = WindowId::from(17);
         let scope = state
-            .begin_output(&egui::Context::default(), ViewportId::ROOT, window)
+            .begin_output_for_test(&egui::Context::default(), ViewportId::ROOT, window)
             .unwrap();
         let token = current_native_output_token().expect("output scope publishes its token");
 
@@ -668,11 +914,11 @@ mod tests {
         let first_state = NativeHostState::new(Some(first_handler));
         let context = egui::Context::default();
         let first = first_state
-            .begin_output(&context, ViewportId::ROOT, WindowId::from(11))
+            .begin_output_for_test(&context, ViewportId::ROOT, WindowId::from(11))
             .expect("first scope exists");
         let first_token = current_native_output_token().expect("first token is active");
         let second = first_state
-            .begin_output(
+            .begin_output_for_test(
                 &context,
                 ViewportId::from_hash_of("same-context"),
                 WindowId::from(12),
@@ -685,7 +931,7 @@ mod tests {
             Arc::<RecordingHost>::clone(&foreign_host);
         let foreign_state = NativeHostState::new(Some(foreign_handler));
         let foreign = foreign_state
-            .begin_output(
+            .begin_output_for_test(
                 &context,
                 ViewportId::from_hash_of("other-context"),
                 WindowId::from(13),
@@ -723,6 +969,51 @@ mod tests {
 
         assert_eq!(host.create_failures.lock()[0].viewport_id(), viewport_id);
         assert_eq!(repaint_count.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn deferred_window_override_is_child_only_and_physical() {
+        use winit::dpi::{PhysicalPosition, PhysicalSize, Position, Size};
+
+        let host = Arc::new(RecordingHost::default());
+        let viewport_id = ViewportId::from_hash_of("deferred-child");
+        let rect = NativePhysicalRect::new(120, 240, 800, 600);
+        *host.deferred_rect.lock() = Some((viewport_id, rect));
+        let handler: Arc<dyn NativeHostHandler> = Arc::<RecordingHost>::clone(&host);
+        let state = NativeHostState::new(Some(handler));
+
+        assert!(
+            state
+                .deferred_window_override(ViewportId::ROOT, &ViewportBuilder::default())
+                .is_none()
+        );
+        let attributes = state
+            .deferred_window_override(viewport_id, &ViewportBuilder::default())
+            .expect("the child request is available")
+            .apply_to_attributes(WindowAttributes::default());
+
+        assert!(!attributes.decorations);
+        assert_eq!(
+            attributes.position,
+            Some(Position::Physical(PhysicalPosition::new(120, 240)))
+        );
+        assert_eq!(
+            attributes.inner_size,
+            Some(Size::Physical(PhysicalSize::new(800, 600)))
+        );
+        assert_eq!(
+            (rect.x(), rect.y(), rect.width(), rect.height()),
+            (120, 240, 800, 600)
+        );
+
+        assert!(
+            state
+                .deferred_window_override(
+                    viewport_id,
+                    &ViewportBuilder::default().with_maximized(true)
+                )
+                .is_none()
+        );
     }
 
     #[test]
