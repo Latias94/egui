@@ -653,7 +653,7 @@ impl GlowWinitRunning<'_> {
             }
         }
 
-        let (raw_input, viewport_ui_cb, output_snapshot, is_visible, show_ui) = {
+        let (raw_input, viewport_ui_cb, output_snapshot, is_visible, render_hidden, show_ui) = {
             let mut glutin = self.glutin.borrow_mut();
             let egui_ctx = glutin.egui_ctx.clone();
             let Some(viewport) = glutin.viewports.get_mut(&viewport_id) else {
@@ -665,6 +665,13 @@ impl GlowWinitRunning<'_> {
             egui_winit::update_viewport_info(&mut viewport.info, &egui_ctx, window, false);
 
             let is_visible = viewport.info.visible().unwrap_or(true);
+            #[cfg(feature = "native-host-seam")]
+            let render_hidden = !is_visible
+                && self
+                    .native_host
+                    .render_hidden_deferred_viewport(viewport_id);
+            #[cfg(not(feature = "native-host-seam"))]
+            let render_hidden = false;
             let output_snapshot = NativeWindowSnapshot::capture(window);
 
             let Some(egui_winit) = viewport.egui_winit.as_mut() else {
@@ -673,8 +680,9 @@ impl GlowWinitRunning<'_> {
             let mut raw_input = egui_winit.take_egui_input(window);
             let viewport_ui_cb = viewport.viewport_ui_cb.clone();
 
-            let show_ui =
-                is_visible || is_viewport_or_descendant_visible(&glutin.viewports, viewport_id);
+            let show_ui = is_visible
+                || render_hidden
+                || is_viewport_or_descendant_visible(&glutin.viewports, viewport_id);
 
             self.integration.pre_update();
 
@@ -690,6 +698,7 @@ impl GlowWinitRunning<'_> {
                 viewport_ui_cb,
                 output_snapshot,
                 is_visible,
+                render_hidden,
                 show_ui,
             )
         };
@@ -864,7 +873,7 @@ impl GlowWinitRunning<'_> {
 
         egui_winit.handle_platform_output_with_event_loop(&window, event_loop, platform_output);
 
-        if is_visible {
+        if is_visible || render_hidden {
             let clipped_primitives = integration.egui_ctx.tessellate(shapes, pixels_per_point);
 
             {
@@ -876,7 +885,7 @@ impl GlowWinitRunning<'_> {
 
             let screen_size_in_pixels: [u32; 2] = window.inner_size().into();
 
-            if !clear_before_update {
+            if !clear_before_update || render_hidden {
                 painter.clear(screen_size_in_pixels, clear_color);
             }
 
@@ -921,7 +930,9 @@ impl GlowWinitRunning<'_> {
                     }
                 }
 
-                integration.post_rendering(&window);
+                if is_visible {
+                    integration.post_rendering(&window);
+                }
             }
 
             {

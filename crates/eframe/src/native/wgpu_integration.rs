@@ -683,7 +683,7 @@ impl WgpuWinitRunning<'_> {
         let mut frame_timer = crate::stopwatch::Stopwatch::new();
         frame_timer.start();
 
-        let (viewport_ui_cb, raw_input, output_snapshot, is_visible, show_ui) = {
+        let (viewport_ui_cb, raw_input, output_snapshot, is_visible, render_hidden, show_ui) = {
             profiling::scope!("Prepare");
             let mut shared_lock = shared.borrow_mut();
 
@@ -728,6 +728,11 @@ impl WgpuWinitRunning<'_> {
             egui_winit::update_viewport_info(info, &integration.egui_ctx, window, false);
 
             let is_visible = info.visible().unwrap_or(true);
+            #[cfg(feature = "native-host-seam")]
+            let render_hidden =
+                !is_visible && native_host.render_hidden_deferred_viewport(viewport_id);
+            #[cfg(not(feature = "native-host-seam"))]
+            let render_hidden = false;
             let output_snapshot = NativeWindowSnapshot::capture(window);
 
             {
@@ -740,7 +745,9 @@ impl WgpuWinitRunning<'_> {
             };
             let mut raw_input = egui_winit.take_egui_input(window);
 
-            let show_ui = is_visible || is_viewport_or_descendant_visible(viewports, viewport_id);
+            let show_ui = is_visible
+                || render_hidden
+                || is_viewport_or_descendant_visible(viewports, viewport_id);
 
             integration.pre_update();
 
@@ -757,6 +764,7 @@ impl WgpuWinitRunning<'_> {
                 raw_input,
                 output_snapshot,
                 is_visible,
+                render_hidden,
                 show_ui,
             )
         };
@@ -885,7 +893,7 @@ impl WgpuWinitRunning<'_> {
 
         egui_winit.handle_platform_output_with_event_loop(window, event_loop, platform_output);
 
-        let vsync_secs = if is_visible {
+        let vsync_secs = if is_visible || render_hidden {
             let clipped_primitives = egui_ctx.tessellate(shapes, pixels_per_point);
 
             let mut screenshot_commands = vec![];
@@ -954,7 +962,9 @@ impl WgpuWinitRunning<'_> {
                 }
             }
 
-            integration.post_rendering(window);
+            if is_visible {
+                integration.post_rendering(window);
+            }
 
             vsync_secs
         } else {

@@ -359,6 +359,16 @@ pub trait NativeHostHandler: Send + Sync + 'static {
         None
     }
 
+    /// Returns whether one hidden deferred viewport must still run its UI and renderer output.
+    ///
+    /// This is intended for host-owned pre-show or post-show staging. Returning `true` does not
+    /// make the window visible, and eframe will not run its first-frame auto-show hook for the
+    /// hidden output. The default preserves ordinary eframe behavior and leaves hidden viewports
+    /// dormant.
+    fn render_hidden_deferred_viewport(&self, _viewport_id: ViewportId) -> bool {
+        false
+    }
+
     /// Observes one window event before egui-winit translates it.
     fn on_window_event(&self, _event: NativeWindowEvent<'_>) {}
 
@@ -558,6 +568,14 @@ impl NativeHostState {
         Some(NativeDeferredWindowOverride { rect })
     }
 
+    pub(crate) fn render_hidden_deferred_viewport(&self, viewport_id: ViewportId) -> bool {
+        viewport_id != ViewportId::ROOT
+            && self
+                .inner
+                .as_ref()
+                .is_some_and(|inner| inner.handler.render_hidden_deferred_viewport(viewport_id))
+    }
+
     pub(crate) fn notify_viewport_create_failed(
         &self,
         ctx: &egui::Context,
@@ -746,6 +764,7 @@ mod tests {
         outputs: Mutex<Vec<NativeOutputResult>>,
         create_failures: Mutex<Vec<NativeViewportCreateFailure>>,
         deferred_rect: Mutex<Option<(ViewportId, NativePhysicalRect)>>,
+        hidden_viewport: Mutex<Option<ViewportId>>,
         wake: NativeHostWake,
     }
 
@@ -758,6 +777,10 @@ mod tests {
                 .lock()
                 .filter(|(requested_viewport, _)| *requested_viewport == viewport_id)
                 .map(|(_, rect)| rect)
+        }
+
+        fn render_hidden_deferred_viewport(&self, viewport_id: ViewportId) -> bool {
+            *self.hidden_viewport.lock() == Some(viewport_id)
         }
 
         fn on_window_event(&self, event: NativeWindowEvent<'_>) {
@@ -799,6 +822,22 @@ mod tests {
             self.create_failures.lock().push(failure);
             self.wake
         }
+    }
+
+    #[test]
+    fn hidden_rendering_is_opt_in_and_never_applies_to_root() {
+        let child = ViewportId::from_hash_of("hidden-staging");
+        let host = Arc::new(RecordingHost {
+            hidden_viewport: Mutex::new(Some(child)),
+            ..Default::default()
+        });
+        let handler: Arc<dyn NativeHostHandler> = Arc::<RecordingHost>::clone(&host);
+        let state = NativeHostState::new(Some(handler));
+
+        assert!(state.render_hidden_deferred_viewport(child));
+        assert!(!state.render_hidden_deferred_viewport(ViewportId::ROOT));
+        assert!(!state.render_hidden_deferred_viewport(ViewportId::from_hash_of("other")));
+        assert!(!NativeHostState::default().render_hidden_deferred_viewport(child));
     }
 
     #[test]
