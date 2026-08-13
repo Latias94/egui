@@ -653,7 +653,7 @@ impl GlowWinitRunning<'_> {
             }
         }
 
-        let (raw_input, viewport_ui_cb, output_snapshot, is_visible, render_hidden, show_ui) = {
+        let (raw_input, viewport_ui_cb, _output_snapshot, is_visible, render_hidden, show_ui) = {
             let mut glutin = self.glutin.borrow_mut();
             let egui_ctx = glutin.egui_ctx.clone();
             let Some(viewport) = glutin.viewports.get_mut(&viewport_id) else {
@@ -672,7 +672,10 @@ impl GlowWinitRunning<'_> {
                     .render_hidden_deferred_viewport(viewport_id);
             #[cfg(not(feature = "native-host-seam"))]
             let render_hidden = false;
+            #[cfg(feature = "native-host-seam")]
             let output_snapshot = NativeWindowSnapshot::capture(window);
+            #[cfg(not(feature = "native-host-seam"))]
+            let output_snapshot = ();
 
             let Some(egui_winit) = viewport.egui_winit.as_mut() else {
                 return Ok(EventResult::Wait);
@@ -819,7 +822,7 @@ impl GlowWinitRunning<'_> {
             &self.integration.egui_ctx,
             viewport_id,
             window_id,
-            output_snapshot,
+            _output_snapshot,
             root_roster.as_deref(),
         );
         let full_output =

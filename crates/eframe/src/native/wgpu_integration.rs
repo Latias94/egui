@@ -683,7 +683,7 @@ impl WgpuWinitRunning<'_> {
         let mut frame_timer = crate::stopwatch::Stopwatch::new();
         frame_timer.start();
 
-        let (viewport_ui_cb, raw_input, output_snapshot, is_visible, render_hidden, show_ui) = {
+        let (viewport_ui_cb, raw_input, _output_snapshot, is_visible, render_hidden, show_ui) = {
             profiling::scope!("Prepare");
             let mut shared_lock = shared.borrow_mut();
 
@@ -733,7 +733,10 @@ impl WgpuWinitRunning<'_> {
                 !is_visible && native_host.render_hidden_deferred_viewport(viewport_id);
             #[cfg(not(feature = "native-host-seam"))]
             let render_hidden = false;
+            #[cfg(feature = "native-host-seam")]
             let output_snapshot = NativeWindowSnapshot::capture(window);
+            #[cfg(not(feature = "native-host-seam"))]
+            let output_snapshot = ();
 
             {
                 profiling::scope!("set_window");
@@ -845,7 +848,7 @@ impl WgpuWinitRunning<'_> {
             &integration.egui_ctx,
             viewport_id,
             window_id,
-            output_snapshot,
+            _output_snapshot,
             root_roster.as_deref(),
         );
         let full_output = integration.update(app.as_mut(), viewport_ui_cb.as_deref(), raw_input);
