@@ -29,7 +29,7 @@ use winit_integration::UserEvent;
 #[cfg(feature = "native-host-seam")]
 use crate::native::host_seam::{
     NativeHostState, NativeViewportCreateFailureKind, NativeViewportRecord,
-    NativeViewportVisibilityStatus, NativeWindowSnapshot,
+    NativeViewportRosterCapture, NativeViewportVisibilityStatus, NativeWindowSnapshot,
 };
 use crate::{
     App, AppCreator, CreationContext, NativeOptions, Result, Storage,
@@ -856,7 +856,7 @@ impl WgpuWinitRunning<'_> {
         // so make sure we hold no locks here!
         #[cfg(feature = "native-host-seam")]
         let root_roster = (viewport_id == ViewportId::ROOT).then(|| {
-            shared
+            let records = shared
                 .borrow()
                 .viewports
                 .iter()
@@ -865,7 +865,8 @@ impl WgpuWinitRunning<'_> {
                         NativeViewportRecord::capture(*id, &integration.egui_ctx, window)
                     })
                 })
-                .collect::<Vec<_>>()
+                .collect::<Vec<_>>();
+            NativeViewportRosterCapture::capture(event_loop, records)
         });
         #[cfg(feature = "native-host-seam")]
         let output_scope = native_host.begin_output(
@@ -873,7 +874,9 @@ impl WgpuWinitRunning<'_> {
             viewport_id,
             window_id,
             _output_snapshot,
-            root_roster.as_deref(),
+            root_roster
+                .as_ref()
+                .map(NativeViewportRosterCapture::as_borrowed),
         );
         let full_output = integration.update(app.as_mut(), viewport_ui_cb.as_deref(), raw_input);
         #[cfg(feature = "native-host-seam")]

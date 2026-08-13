@@ -15,6 +15,11 @@ use raw_window_handle::{HasDisplayHandle as _, HasWindowHandle as _};
 use winit::event_loop::ActiveEventLoop;
 use winit::window::{Window, WindowAttributes, WindowId};
 
+mod work_area;
+
+use work_area::OwnedNativeWorkAreaRoster;
+pub use work_area::{NativeDisplayId, NativeWorkAreaRecord, NativeWorkAreaRoster};
+
 static NEXT_CONTEXT_ID: AtomicU64 = AtomicU64::new(1);
 
 thread_local! {
@@ -277,16 +282,50 @@ impl NativeViewportRecord {
 #[derive(Clone, Copy, Debug)]
 pub struct NativeViewportRoster<'a> {
     records: &'a [NativeViewportRecord],
+    work_areas: NativeWorkAreaRoster<'a>,
 }
 
 impl<'a> NativeViewportRoster<'a> {
-    const fn new(records: &'a [NativeViewportRecord]) -> Self {
-        Self { records }
+    /// Creates one complete root roster from exact native facts.
+    pub(crate) const fn new(
+        records: &'a [NativeViewportRecord],
+        work_areas: NativeWorkAreaRoster<'a>,
+    ) -> Self {
+        Self {
+            records,
+            work_areas,
+        }
     }
 
     /// Returns every live native window captured for this root callback.
     pub const fn records(self) -> &'a [NativeViewportRecord] {
         self.records
+    }
+
+    /// Returns the complete work-area authority captured at the same boundary.
+    pub const fn work_areas(self) -> NativeWorkAreaRoster<'a> {
+        self.work_areas
+    }
+}
+
+pub(crate) struct NativeViewportRosterCapture {
+    records: Vec<NativeViewportRecord>,
+    work_areas: OwnedNativeWorkAreaRoster,
+}
+
+impl NativeViewportRosterCapture {
+    pub(crate) fn capture(
+        event_loop: &ActiveEventLoop,
+        records: Vec<NativeViewportRecord>,
+    ) -> Self {
+        Self {
+            records,
+            work_areas: OwnedNativeWorkAreaRoster::capture(event_loop),
+        }
+    }
+
+    pub(crate) fn as_borrowed(&self) -> NativeViewportRoster<'_> {
+        NativeViewportRoster::new(&self.records, self.work_areas.as_borrowed())
     }
 }
 
@@ -571,7 +610,7 @@ impl NativeHostState {
         viewport_id: ViewportId,
         window_id: WindowId,
         snapshot: NativeWindowSnapshot,
-        root_roster: Option<&[NativeViewportRecord]>,
+        root_roster: Option<NativeViewportRoster<'_>>,
     ) -> Option<NativeOutputScope> {
         let inner = Arc::clone(self.inner.as_ref()?);
         let token = NativeOutputToken {
@@ -580,9 +619,7 @@ impl NativeHostState {
             viewport_id,
             window_id,
         };
-        inner
-            .handler
-            .on_output_begin(token, snapshot, root_roster.map(NativeViewportRoster::new));
+        inner.handler.on_output_begin(token, snapshot, root_roster);
         ACTIVE_OUTPUTS.with(|outputs| outputs.borrow_mut().push(token));
         Some(NativeOutputScope {
             inner,
@@ -951,6 +988,25 @@ mod tests {
 
     use super::*;
 
+    #[derive(Debug, Clone, PartialEq)]
+    struct RecordedNativeViewportRoster {
+        records: Vec<NativeViewportRecord>,
+        work_areas: Option<Vec<NativeWorkAreaRecord>>,
+    }
+
+    impl From<NativeViewportRoster<'_>> for RecordedNativeViewportRoster {
+        fn from(roster: NativeViewportRoster<'_>) -> Self {
+            let work_areas = match roster.work_areas() {
+                NativeWorkAreaRoster::Exact(records) => Some(records.to_vec()),
+                NativeWorkAreaRoster::Unknown => None,
+            };
+            Self {
+                records: roster.records().to_vec(),
+                work_areas,
+            }
+        }
+    }
+
     #[derive(Default)]
     struct RecordingHost {
         events: Mutex<
@@ -965,7 +1021,7 @@ mod tests {
             Vec<(
                 NativeOutputToken,
                 NativeWindowSnapshot,
-                Option<Vec<NativeViewportRecord>>,
+                Option<RecordedNativeViewportRoster>,
             )>,
         >,
         outputs: Mutex<Vec<NativeOutputResult>>,
@@ -1019,7 +1075,7 @@ mod tests {
             self.output_begins.lock().push((
                 token,
                 window,
-                root_roster.map(|roster| roster.records().to_vec()),
+                root_roster.map(RecordedNativeViewportRoster::from),
             ));
         }
 
@@ -1213,6 +1269,12 @@ mod tests {
                 window: child_snapshot,
             },
         ];
+        let work_areas = [NativeWorkAreaRecord::new(
+            7,
+            NativePhysicalRect::new(0, 0, 1920, 1080),
+            NativePhysicalRect::new(0, 40, 1920, 1040),
+            2.0,
+        )];
 
         let scope = state
             .begin_output(
@@ -1220,7 +1282,10 @@ mod tests {
                 ViewportId::ROOT,
                 root_window,
                 root_snapshot,
-                Some(&roster),
+                Some(NativeViewportRoster::new(
+                    &roster,
+                    NativeWorkAreaRoster::Exact(&work_areas),
+                )),
             )
             .expect("root output scope exists");
         let token = current_native_output_token().expect("root token is active");
@@ -1229,7 +1294,13 @@ mod tests {
         assert_eq!(output_begins.len(), 1);
         assert_eq!(output_begins[0].0, token);
         assert_eq!(output_begins[0].1, root_snapshot);
-        assert_eq!(output_begins[0].2.as_deref(), Some(roster.as_slice()));
+        assert_eq!(
+            output_begins[0].2,
+            Some(RecordedNativeViewportRoster {
+                records: roster.to_vec(),
+                work_areas: Some(work_areas.to_vec()),
+            })
+        );
         drop(output_begins);
         scope.finish().present();
     }
