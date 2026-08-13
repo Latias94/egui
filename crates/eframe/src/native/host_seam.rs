@@ -174,7 +174,8 @@ impl NativePhysicalRect {
 pub struct NativeWindowSnapshot {
     inner_rect: Option<NativePhysicalRect>,
     outer_rect: Option<NativePhysicalRect>,
-    scale_factor: f64,
+    native_scale_factor: f64,
+    presentation_scale_factor: f64,
     visible: Option<bool>,
     minimized: Option<bool>,
 }
@@ -203,11 +204,15 @@ impl NativeViewportRecord {
         self.window
     }
 
-    pub(crate) fn capture(viewport_id: ViewportId, window: &Window) -> Self {
+    pub(crate) fn capture(
+        viewport_id: ViewportId,
+        egui_ctx: &egui::Context,
+        window: &Window,
+    ) -> Self {
         Self {
             viewport_id,
             window_id: window.id(),
-            window: NativeWindowSnapshot::capture(window),
+            window: NativeWindowSnapshot::capture(egui_ctx, window),
         }
     }
 }
@@ -242,9 +247,17 @@ impl NativeWindowSnapshot {
         self.outer_rect
     }
 
-    /// Returns the current native scale factor.
-    pub const fn scale_factor(self) -> f64 {
-        self.scale_factor
+    /// Returns the current platform-native scale factor.
+    pub const fn native_scale_factor(self) -> f64 {
+        self.native_scale_factor
+    }
+
+    /// Returns the current egui presentation scale factor.
+    ///
+    /// This includes the egui zoom factor and therefore must not be inferred
+    /// from [`Self::native_scale_factor`].
+    pub const fn presentation_scale_factor(self) -> f64 {
+        self.presentation_scale_factor
     }
 
     /// Returns the platform visibility flag when it is available.
@@ -259,7 +272,7 @@ impl NativeWindowSnapshot {
         self.minimized
     }
 
-    pub(crate) fn capture(window: &Window) -> Self {
+    pub(crate) fn capture(egui_ctx: &egui::Context, window: &Window) -> Self {
         let inner_rect = window
             .inner_position()
             .ok()
@@ -286,7 +299,8 @@ impl NativeWindowSnapshot {
         Self {
             inner_rect,
             outer_rect,
-            scale_factor: window.scale_factor(),
+            native_scale_factor: window.scale_factor(),
+            presentation_scale_factor: f64::from(egui_winit::pixels_per_point(egui_ctx, window)),
             visible,
             minimized,
         }
@@ -529,7 +543,8 @@ impl NativeHostState {
             NativeWindowSnapshot {
                 inner_rect: None,
                 outer_rect: None,
-                scale_factor: 1.0,
+                native_scale_factor: 1.0,
+                presentation_scale_factor: 1.0,
                 visible: None,
                 minimized: None,
             },
@@ -948,7 +963,8 @@ mod tests {
             roster.is_none()
                 && snapshot.inner_rect().is_none()
                 && snapshot.outer_rect().is_none()
-                && snapshot.scale_factor() == 1.0
+                && snapshot.native_scale_factor() == 1.0
+                && snapshot.presentation_scale_factor() == 1.0
                 && snapshot.visible().is_none()
                 && snapshot.minimized().is_none()
         }));
@@ -974,14 +990,16 @@ mod tests {
         let root_snapshot = NativeWindowSnapshot {
             inner_rect: Some(NativePhysicalRect::new(10, 20, 800, 600)),
             outer_rect: Some(NativePhysicalRect::new(2, -10, 816, 638)),
-            scale_factor: 2.0,
+            native_scale_factor: 2.0,
+            presentation_scale_factor: 2.5,
             visible: Some(true),
             minimized: Some(false),
         };
         let child_snapshot = NativeWindowSnapshot {
             inner_rect: Some(NativePhysicalRect::new(900, 20, 640, 480)),
             outer_rect: None,
-            scale_factor: 1.5,
+            native_scale_factor: 1.5,
+            presentation_scale_factor: 1.25,
             visible: None,
             minimized: None,
         };

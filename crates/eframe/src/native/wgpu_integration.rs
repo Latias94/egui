@@ -734,7 +734,7 @@ impl WgpuWinitRunning<'_> {
             #[cfg(not(feature = "native-host-seam"))]
             let render_hidden = false;
             #[cfg(feature = "native-host-seam")]
-            let output_snapshot = NativeWindowSnapshot::capture(window);
+            let output_snapshot = NativeWindowSnapshot::capture(&integration.egui_ctx, window);
             #[cfg(not(feature = "native-host-seam"))]
             let output_snapshot = ();
 
@@ -836,10 +836,9 @@ impl WgpuWinitRunning<'_> {
                 .viewports
                 .iter()
                 .filter_map(|(id, viewport)| {
-                    viewport
-                        .window
-                        .as_deref()
-                        .map(|window| NativeViewportRecord::capture(*id, window))
+                    viewport.window.as_deref().map(|window| {
+                        NativeViewportRecord::capture(*id, &integration.egui_ctx, window)
+                    })
                 })
                 .collect::<Vec<_>>()
         });
