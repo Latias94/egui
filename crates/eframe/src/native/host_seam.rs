@@ -10,6 +10,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use egui::{ViewportBuilder, ViewportId};
+#[cfg(target_os = "linux")]
+use raw_window_handle::{HasDisplayHandle as _, HasWindowHandle as _};
+use winit::event_loop::ActiveEventLoop;
 use winit::window::{Window, WindowAttributes, WindowId};
 
 static NEXT_CONTEXT_ID: AtomicU64 = AtomicU64::new(1);
@@ -116,10 +119,63 @@ pub enum NativeHostWake {
     RepaintRoot,
 }
 
+/// Backend disposition after eframe attempted to change native visibility.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum NativeViewportVisibilityStatus {
+    /// Eframe invoked the corresponding native window operation.
+    ///
+    /// This does not prove that the window manager has applied the request.
+    /// Observe a later [`NativeWindowSnapshot::visible`] value for that fact.
+    Dispatched,
+    /// The active window backend does not implement the operation.
+    Unsupported,
+}
+
+/// Result of one native visibility dispatch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct NativeViewportVisibilityResult {
+    viewport_id: ViewportId,
+    window_id: WindowId,
+    visible: bool,
+    status: NativeViewportVisibilityStatus,
+}
+
+impl NativeViewportVisibilityResult {
+    /// Returns the eframe viewport which received the command.
+    pub const fn viewport_id(self) -> ViewportId {
+        self.viewport_id
+    }
+
+    /// Returns the exact native window which received the command.
+    pub const fn window_id(self) -> WindowId {
+        self.window_id
+    }
+
+    /// Returns the requested native visibility.
+    pub const fn visible(self) -> bool {
+        self.visible
+    }
+
+    /// Returns the backend disposition.
+    pub const fn status(self) -> NativeViewportVisibilityStatus {
+        self.status
+    }
+}
+
+/// Why eframe could not create one deferred native viewport.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum NativeViewportCreateFailureKind {
+    /// Native window or renderer initialization failed.
+    WindowUnavailable,
+    /// The active backend cannot keep a host-staged viewport hidden.
+    VisibilityUnsupported,
+}
+
 /// Terminal failure to create the native window for one deferred viewport.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct NativeViewportCreateFailure {
     viewport_id: ViewportId,
+    kind: NativeViewportCreateFailureKind,
 }
 
 /// A physical desktop rectangle used by the native host seam.
@@ -291,10 +347,7 @@ impl NativeWindowSnapshot {
         #[cfg(not(target_os = "windows"))]
         let minimized = None;
 
-        #[cfg(any(target_os = "windows", target_os = "macos"))]
         let visible = window.is_visible();
-        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
-        let visible = None;
 
         Self {
             inner_rect,
@@ -318,6 +371,11 @@ impl NativeViewportCreateFailure {
     /// Returns the deferred viewport whose native window could not be created.
     pub const fn viewport_id(self) -> ViewportId {
         self.viewport_id
+    }
+
+    /// Returns why native viewport creation could not proceed.
+    pub const fn kind(self) -> NativeViewportCreateFailureKind {
+        self.kind
     }
 }
 
@@ -406,6 +464,11 @@ pub trait NativeHostHandler: Send + Sync + 'static {
 
     /// Reports that eframe could not create the native window for a deferred viewport.
     fn on_viewport_create_failed(&self, _failure: NativeViewportCreateFailure) -> NativeHostWake {
+        NativeHostWake::Wait
+    }
+
+    /// Reports a native visibility request after eframe attempts to dispatch it.
+    fn on_viewport_visibility(&self, _result: NativeViewportVisibilityResult) -> NativeHostWake {
         NativeHostWake::Wait
     }
 }
@@ -595,18 +658,147 @@ impl NativeHostState {
         &self,
         ctx: &egui::Context,
         viewport_id: ViewportId,
+        kind: NativeViewportCreateFailureKind,
     ) {
         let Some(inner) = &self.inner else {
             return;
         };
         if inner
             .handler
-            .on_viewport_create_failed(NativeViewportCreateFailure { viewport_id })
+            .on_viewport_create_failed(NativeViewportCreateFailure { viewport_id, kind })
             == NativeHostWake::RepaintRoot
         {
             ctx.request_repaint_of(ViewportId::ROOT);
         }
     }
+
+    fn notify_viewport_visibility(
+        &self,
+        ctx: &egui::Context,
+        viewport_id: ViewportId,
+        window: &Window,
+        visible: bool,
+    ) {
+        let status = visibility_control_for_window(window);
+        self.notify_viewport_visibility_result(
+            ctx,
+            NativeViewportVisibilityResult {
+                viewport_id,
+                window_id: window.id(),
+                visible,
+                status,
+            },
+        );
+    }
+
+    fn notify_viewport_visibility_result(
+        &self,
+        ctx: &egui::Context,
+        result: NativeViewportVisibilityResult,
+    ) {
+        let Some(inner) = &self.inner else {
+            return;
+        };
+        if inner.handler.on_viewport_visibility(result) == NativeHostWake::RepaintRoot {
+            ctx.request_repaint_of(ViewportId::ROOT);
+        }
+    }
+
+    pub(crate) fn deferred_visibility_status(
+        &self,
+        event_loop: &ActiveEventLoop,
+    ) -> NativeViewportVisibilityStatus {
+        visibility_control_for_event_loop(event_loop)
+    }
+
+    pub(crate) fn process_viewport_commands(
+        &self,
+        ctx: &egui::Context,
+        viewport_id: ViewportId,
+        info: &mut egui::ViewportInfo,
+        commands: impl IntoIterator<Item = egui::ViewportCommand>,
+        window: &Window,
+        actions_requested: &mut Vec<egui_winit::ActionRequested>,
+    ) {
+        for command in commands {
+            let requested_visibility = match command {
+                egui::ViewportCommand::Visible(visible) => Some(visible),
+                _ => None,
+            };
+            egui_winit::process_viewport_commands(
+                ctx,
+                info,
+                std::iter::once(command),
+                window,
+                actions_requested,
+            );
+            if let Some(visible) = requested_visibility {
+                self.notify_viewport_visibility(ctx, viewport_id, window, visible);
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn visibility_control_for_window(window: &Window) -> NativeViewportVisibilityStatus {
+    window.window_handle().map_or(
+        NativeViewportVisibilityStatus::Unsupported,
+        |handle| match handle.as_raw() {
+            raw_window_handle::RawWindowHandle::Xlib(_)
+            | raw_window_handle::RawWindowHandle::Xcb(_) => {
+                NativeViewportVisibilityStatus::Dispatched
+            }
+            raw_window_handle::RawWindowHandle::Wayland(_) => {
+                NativeViewportVisibilityStatus::Unsupported
+            }
+            _ => NativeViewportVisibilityStatus::Unsupported,
+        },
+    )
+}
+
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+fn visibility_control_for_window(_window: &Window) -> NativeViewportVisibilityStatus {
+    NativeViewportVisibilityStatus::Dispatched
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
+fn visibility_control_for_window(_window: &Window) -> NativeViewportVisibilityStatus {
+    NativeViewportVisibilityStatus::Unsupported
+}
+
+#[cfg(target_os = "linux")]
+fn visibility_control_for_event_loop(
+    event_loop: &ActiveEventLoop,
+) -> NativeViewportVisibilityStatus {
+    event_loop
+        .display_handle()
+        .map_or(
+            NativeViewportVisibilityStatus::Unsupported,
+            |handle| match handle.as_raw() {
+                raw_window_handle::RawDisplayHandle::Xlib(_)
+                | raw_window_handle::RawDisplayHandle::Xcb(_) => {
+                    NativeViewportVisibilityStatus::Dispatched
+                }
+                raw_window_handle::RawDisplayHandle::Wayland(_) => {
+                    NativeViewportVisibilityStatus::Unsupported
+                }
+                _ => NativeViewportVisibilityStatus::Unsupported,
+            },
+        )
+}
+
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+fn visibility_control_for_event_loop(
+    _event_loop: &ActiveEventLoop,
+) -> NativeViewportVisibilityStatus {
+    NativeViewportVisibilityStatus::Dispatched
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
+fn visibility_control_for_event_loop(
+    _event_loop: &ActiveEventLoop,
+) -> NativeViewportVisibilityStatus {
+    NativeViewportVisibilityStatus::Unsupported
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -778,6 +970,7 @@ mod tests {
         >,
         outputs: Mutex<Vec<NativeOutputResult>>,
         create_failures: Mutex<Vec<NativeViewportCreateFailure>>,
+        visibility_results: Mutex<Vec<NativeViewportVisibilityResult>>,
         deferred_rect: Mutex<Option<(ViewportId, NativePhysicalRect)>>,
         hidden_viewport: Mutex<Option<ViewportId>>,
         wake: NativeHostWake,
@@ -835,6 +1028,11 @@ mod tests {
             failure: NativeViewportCreateFailure,
         ) -> NativeHostWake {
             self.create_failures.lock().push(failure);
+            self.wake
+        }
+
+        fn on_viewport_visibility(&self, result: NativeViewportVisibilityResult) -> NativeHostWake {
+            self.visibility_results.lock().push(result);
             self.wake
         }
     }
@@ -1170,9 +1368,46 @@ mod tests {
         });
         let viewport_id = ViewportId::from_hash_of("failed-child");
 
-        state.notify_viewport_create_failed(&ctx, viewport_id);
+        state.notify_viewport_create_failed(
+            &ctx,
+            viewport_id,
+            NativeViewportCreateFailureKind::WindowUnavailable,
+        );
 
         assert_eq!(host.create_failures.lock()[0].viewport_id(), viewport_id);
+        assert_eq!(
+            host.create_failures.lock()[0].kind(),
+            NativeViewportCreateFailureKind::WindowUnavailable
+        );
+        assert_eq!(repaint_count.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn viewport_visibility_result_keeps_exact_identity_and_wake() {
+        let host = Arc::new(RecordingHost {
+            wake: NativeHostWake::RepaintRoot,
+            ..Default::default()
+        });
+        let handler: Arc<dyn NativeHostHandler> = Arc::<RecordingHost>::clone(&host);
+        let state = NativeHostState::new(Some(handler));
+        let ctx = egui::Context::default();
+        let repaint_count = Arc::new(AtomicUsize::new(0));
+        ctx.set_request_repaint_callback({
+            let repaint_count = Arc::clone(&repaint_count);
+            move |_| {
+                repaint_count.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+        let result = NativeViewportVisibilityResult {
+            viewport_id: ViewportId::from_hash_of("shown-child"),
+            window_id: WindowId::from(31),
+            visible: true,
+            status: NativeViewportVisibilityStatus::Dispatched,
+        };
+
+        state.notify_viewport_visibility_result(&ctx, result);
+
+        assert_eq!(host.visibility_results.lock().as_slice(), &[result]);
         assert_eq!(repaint_count.load(Ordering::Relaxed), 1);
     }
 

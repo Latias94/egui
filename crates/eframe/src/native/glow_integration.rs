@@ -39,7 +39,10 @@ use super::{
 };
 use crate::epaint::textures::TexturesDelta;
 #[cfg(feature = "native-host-seam")]
-use crate::native::host_seam::{NativeHostState, NativeViewportRecord, NativeWindowSnapshot};
+use crate::native::host_seam::{
+    NativeHostState, NativeViewportCreateFailureKind, NativeViewportRecord,
+    NativeViewportVisibilityStatus, NativeWindowSnapshot,
+};
 use crate::{
     App, AppCreator, CreationContext, NativeOptions, Result, Storage,
     native::{epi_integration::EpiIntegration, winit_integration::sleep_if_invisible_or_minimized},
@@ -154,10 +157,21 @@ impl Viewport {
         &mut self,
         egui_ctx: &egui::Context,
         mut commands: Vec<egui::ViewportCommand>,
+        #[cfg(feature = "native-host-seam")] native_host: &NativeHostState,
     ) {
         self.deferred_commands.append(&mut commands);
 
         if let Some(window) = &self.window {
+            #[cfg(feature = "native-host-seam")]
+            native_host.process_viewport_commands(
+                egui_ctx,
+                self.ids.this,
+                &mut self.info,
+                std::mem::take(&mut self.deferred_commands),
+                window,
+                &mut self.actions_requested,
+            );
+            #[cfg(not(feature = "native-host-seam"))]
             egui_winit::process_viewport_commands(
                 egui_ctx,
                 &mut self.info,
@@ -521,9 +535,11 @@ impl WinitApp for GlowWinitApp<'_> {
                 .initialize_all_windows(event_loop);
             #[cfg(feature = "native-host-seam")]
             for viewport_id in failed_viewports {
-                running
-                    .native_host
-                    .notify_viewport_create_failed(&running.integration.egui_ctx, viewport_id);
+                running.native_host.notify_viewport_create_failed(
+                    &running.integration.egui_ctx,
+                    viewport_id,
+                    NativeViewportCreateFailureKind::WindowUnavailable,
+                );
             }
             #[cfg(not(feature = "native-host-seam"))]
             drop(failed_viewports);
@@ -735,7 +751,12 @@ impl GlowWinitRunning<'_> {
                 }
                 for (id, commands) in viewport_commands {
                     if let Some(viewport) = glutin.viewports.get_mut(&id) {
-                        viewport.process_commands(&self.integration.egui_ctx, commands);
+                        viewport.process_commands(
+                            &self.integration.egui_ctx,
+                            commands,
+                            #[cfg(feature = "native-host-seam")]
+                            &self.native_host,
+                        );
                     }
                 }
             }
@@ -969,7 +990,11 @@ impl GlowWinitRunning<'_> {
             glutin.handle_viewport_output(event_loop, &integration.egui_ctx, &viewport_output);
         #[cfg(feature = "native-host-seam")]
         for viewport_id in failed_viewports {
-            native_host.notify_viewport_create_failed(&integration.egui_ctx, viewport_id);
+            native_host.notify_viewport_create_failed(
+                &integration.egui_ctx,
+                viewport_id,
+                NativeViewportCreateFailureKind::WindowUnavailable,
+            );
         }
         #[cfg(not(feature = "native-host-seam"))]
         drop(failed_viewports);
@@ -1352,6 +1377,24 @@ impl GlutinWindowContext {
         let mut failed_viewports = Vec::new();
 
         for viewport_id in viewports {
+            #[cfg(feature = "native-host-seam")]
+            if self
+                .viewports
+                .get(&viewport_id)
+                .is_some_and(|viewport| viewport.class == ViewportClass::Deferred)
+                && self
+                    .native_host
+                    .render_hidden_deferred_viewport(viewport_id)
+                && self.native_host.deferred_visibility_status(event_loop)
+                    == NativeViewportVisibilityStatus::Unsupported
+            {
+                self.native_host.notify_viewport_create_failed(
+                    &self.egui_ctx,
+                    viewport_id,
+                    NativeViewportCreateFailureKind::VisibilityUnsupported,
+                );
+                continue;
+            }
             if let Err(err) = self.initialize_window(viewport_id, event_loop) {
                 log::error!("Failed to initialize a window for viewport {viewport_id:?}: {err}");
                 failed_viewports.push(viewport_id);
@@ -1592,7 +1635,12 @@ impl GlutinWindowContext {
 
             let old_inner_size = viewport.window.as_ref().map(|window| window.inner_size());
 
-            viewport.process_commands(egui_ctx, commands);
+            viewport.process_commands(
+                egui_ctx,
+                commands,
+                #[cfg(feature = "native-host-seam")]
+                &self.native_host,
+            );
 
             // For Wayland : https://github.com/emilk/egui/issues/4196
             if cfg!(target_os = "linux")

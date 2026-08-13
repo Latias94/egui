@@ -27,7 +27,10 @@ use log::warn;
 use winit_integration::UserEvent;
 
 #[cfg(feature = "native-host-seam")]
-use crate::native::host_seam::{NativeHostState, NativeViewportRecord, NativeWindowSnapshot};
+use crate::native::host_seam::{
+    NativeHostState, NativeViewportCreateFailureKind, NativeViewportRecord,
+    NativeViewportVisibilityStatus, NativeWindowSnapshot,
+};
 use crate::{
     App, AppCreator, CreationContext, NativeOptions, Result, Storage,
     native::{
@@ -181,6 +184,19 @@ impl<'app> WgpuWinitApp<'app> {
 
         for viewport in viewports.values_mut() {
             let viewport_id = viewport.ids.this;
+            #[cfg(feature = "native-host-seam")]
+            if viewport.class == ViewportClass::Deferred
+                && native_host.render_hidden_deferred_viewport(viewport_id)
+                && native_host.deferred_visibility_status(event_loop)
+                    == NativeViewportVisibilityStatus::Unsupported
+            {
+                native_host.notify_viewport_create_failed(
+                    &egui_ctx,
+                    viewport_id,
+                    NativeViewportCreateFailureKind::VisibilityUnsupported,
+                );
+                continue;
+            }
             if let Err(err) = viewport.initialize_window(
                 event_loop,
                 &egui_ctx,
@@ -191,7 +207,11 @@ impl<'app> WgpuWinitApp<'app> {
             ) {
                 log::error!("Failed to create window for viewport {viewport_id:?}: {err}");
                 #[cfg(feature = "native-host-seam")]
-                native_host.notify_viewport_create_failed(&egui_ctx, viewport_id);
+                native_host.notify_viewport_create_failed(
+                    &egui_ctx,
+                    viewport_id,
+                    NativeViewportCreateFailureKind::WindowUnavailable,
+                );
             }
         }
     }
@@ -805,7 +825,12 @@ impl WgpuWinitRunning<'_> {
 
                 for (id, commands) in viewport_commands {
                     if let Some(viewport) = viewports.get_mut(&id) {
-                        viewport.process_commands(&integration.egui_ctx, commands);
+                        viewport.process_commands(
+                            &integration.egui_ctx,
+                            commands,
+                            #[cfg(feature = "native-host-seam")]
+                            &native_host,
+                        );
                     }
                 }
             }
@@ -981,6 +1006,8 @@ impl WgpuWinitRunning<'_> {
             viewports,
             painter,
             viewport_from_window,
+            #[cfg(feature = "native-host-seam")]
+            native_host,
         );
 
         // Prune dead viewports:
@@ -1157,10 +1184,21 @@ impl Viewport {
         &mut self,
         egui_ctx: &egui::Context,
         mut commands: Vec<egui::ViewportCommand>,
+        #[cfg(feature = "native-host-seam")] native_host: &NativeHostState,
     ) {
         self.deferred_commands.append(&mut commands);
 
         if let Some(window) = self.window.as_ref() {
+            #[cfg(feature = "native-host-seam")]
+            native_host.process_viewport_commands(
+                egui_ctx,
+                self.ids.this,
+                &mut self.info,
+                std::mem::take(&mut self.deferred_commands),
+                window,
+                &mut self.actions_requested,
+            );
+            #[cfg(not(feature = "native-host-seam"))]
             egui_winit::process_viewport_commands(
                 egui_ctx,
                 &mut self.info,
@@ -1367,6 +1405,8 @@ fn render_immediate_viewport(
 
     let mut shared_mut = shared.borrow_mut();
     let SharedState {
+        #[cfg(feature = "native-host-seam")]
+        native_host,
         viewports,
         painter,
         viewport_from_window,
@@ -1414,6 +1454,8 @@ fn render_immediate_viewport(
         viewports,
         painter,
         viewport_from_window,
+        #[cfg(feature = "native-host-seam")]
+        native_host,
     );
 }
 
@@ -1438,6 +1480,7 @@ fn handle_viewport_output(
     viewports: &mut Viewports,
     painter: &mut egui_wgpu::winit::Painter,
     viewport_from_window: &mut HashMap<WindowId, ViewportId>,
+    #[cfg(feature = "native-host-seam")] native_host: &NativeHostState,
 ) {
     for (
         viewport_id,
@@ -1458,7 +1501,12 @@ fn handle_viewport_output(
 
         let old_inner_size = viewport.window.as_ref().map(|window| window.inner_size());
 
-        viewport.process_commands(egui_ctx, commands);
+        viewport.process_commands(
+            egui_ctx,
+            commands,
+            #[cfg(feature = "native-host-seam")]
+            native_host,
+        );
 
         // For Wayland : https://github.com/emilk/egui/issues/4196
         if cfg!(target_os = "linux")
