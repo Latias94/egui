@@ -1173,6 +1173,68 @@ mod tests {
     }
 
     #[test]
+    fn event_ordinals_preserve_cross_window_wheel_facts() {
+        use winit::dpi::PhysicalPosition;
+        use winit::event::{
+            DeviceId, MouseScrollDelta, PointerEventFacts, PointerWindowRoute, TouchPhase,
+            WindowEvent,
+        };
+        use winit::keyboard::ModifiersState;
+
+        let host = Arc::new(RecordingHost::default());
+        let handler: Arc<dyn NativeHostHandler> = Arc::<RecordingHost>::clone(&host);
+        let state = NativeHostState::new(Some(handler));
+        let mut sequencer = NativeEventSequencer::default();
+        let first_window = WindowId::from(31);
+        let second_window = WindowId::from(32);
+        let second_viewport = ViewportId::from_hash_of("second-wheel");
+        let first_facts = PointerEventFacts {
+            surface_position: Some(PhysicalPosition::new(4.0, 5.0)),
+            desktop_position: Some(PhysicalPosition::new(104.0, 205.0)),
+            modifiers: Some(ModifiersState::CONTROL),
+            hover: PointerWindowRoute::Window(second_window),
+            capture: PointerWindowRoute::Window(first_window),
+        };
+        let second_facts = PointerEventFacts {
+            surface_position: Some(PhysicalPosition::new(6.0, 7.0)),
+            desktop_position: Some(PhysicalPosition::new(306.0, 407.0)),
+            modifiers: None,
+            hover: PointerWindowRoute::Foreign,
+            capture: PointerWindowRoute::Unknown,
+        };
+
+        let first = WindowEvent::MouseWheel {
+            device_id: DeviceId::dummy(),
+            delta: MouseScrollDelta::LineDelta(1.0, -2.0),
+            phase: TouchPhase::Moved,
+            facts: first_facts,
+        };
+        state.observe_window_event(None, sequencer.next(), first_window, None, &first);
+
+        let second = WindowEvent::MouseWheel {
+            device_id: DeviceId::dummy(),
+            delta: MouseScrollDelta::PixelDelta(PhysicalPosition::new(3.0, 4.0)),
+            phase: TouchPhase::Ended,
+            facts: second_facts,
+        };
+        state.observe_window_event(
+            None,
+            sequencer.next(),
+            second_window,
+            Some(second_viewport),
+            &second,
+        );
+
+        assert_eq!(
+            *host.events.lock(),
+            vec![
+                (1, first_window, None, first_facts),
+                (2, second_window, Some(second_viewport), second_facts),
+            ]
+        );
+    }
+
+    #[test]
     fn nested_outputs_use_completion_order_and_terminal_drop() {
         let host = Arc::new(RecordingHost {
             wake: NativeHostWake::RepaintRoot,
