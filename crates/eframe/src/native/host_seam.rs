@@ -1173,6 +1173,48 @@ mod tests {
     }
 
     #[test]
+    fn secondary_window_event_requests_root_repaint() {
+        use winit::event::{DeviceId, ElementState, MouseButton, PointerEventFacts, WindowEvent};
+
+        let host = Arc::new(RecordingHost::default());
+        let handler: Arc<dyn NativeHostHandler> = Arc::<RecordingHost>::clone(&host);
+        let state = NativeHostState::new(Some(handler));
+        let ctx = egui::Context::default();
+        let repaint_count = Arc::new(AtomicUsize::new(0));
+        ctx.set_request_repaint_callback({
+            let repaint_count = Arc::clone(&repaint_count);
+            move |request| {
+                assert_eq!(request.viewport_id, ViewportId::ROOT);
+                repaint_count.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+        let mut sequencer = NativeEventSequencer::default();
+        let child_window = WindowId::from(22);
+        let child_viewport = ViewportId::from_hash_of("secondary-wake");
+        let facts = PointerEventFacts::default();
+        let event = WindowEvent::MouseInput {
+            device_id: DeviceId::dummy(),
+            state: ElementState::Pressed,
+            button: MouseButton::Left,
+            facts,
+        };
+
+        state.observe_window_event(
+            Some(&ctx),
+            sequencer.next(),
+            child_window,
+            Some(child_viewport),
+            &event,
+        );
+
+        assert_eq!(repaint_count.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            *host.events.lock(),
+            vec![(1, child_window, Some(child_viewport), facts)]
+        );
+    }
+
+    #[test]
     fn event_ordinals_preserve_cross_window_wheel_facts() {
         use winit::dpi::PhysicalPosition;
         use winit::event::{
