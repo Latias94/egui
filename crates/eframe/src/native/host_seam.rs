@@ -44,6 +44,7 @@ pub struct NativeOutputToken {
     nonce: NonZeroU64,
     viewport_id: ViewportId,
     window_id: WindowId,
+    create_attempt: Option<NativeViewportCreateAttempt>,
 }
 
 impl NativeOutputToken {
@@ -63,6 +64,15 @@ impl NativeOutputToken {
     /// Returns the native window whose callback generated this output.
     pub const fn window_id(self) -> WindowId {
         self.window_id
+    }
+
+    /// Returns the deferred-create attempt which produced this native window.
+    ///
+    /// Root outputs and ordinary upstream viewports have no attempt. The token
+    /// is correlation only and does not prove that the host still accepts the
+    /// corresponding logical viewport generation.
+    pub const fn create_attempt(self) -> Option<NativeViewportCreateAttempt> {
+        self.create_attempt
     }
 }
 
@@ -179,8 +189,49 @@ pub enum NativeViewportCreateFailureKind {
 /// Terminal failure to create the native window for one deferred viewport.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct NativeViewportCreateFailure {
-    viewport_id: ViewportId,
+    create_attempt: NativeViewportCreateAttempt,
     kind: NativeViewportCreateFailureKind,
+}
+
+impl NativeViewportCreateFailure {
+    /// Returns the exact deferred-create attempt which failed.
+    pub const fn create_attempt(self) -> NativeViewportCreateAttempt {
+        self.create_attempt
+    }
+}
+
+/// Eframe-owned generation for one deferred native-window creation attempt.
+///
+/// The value is minted immediately before eframe asks the host whether the
+/// physical create may proceed. A deferred attempt is discarded without an
+/// output or failure callback. An admitted attempt is echoed through every
+/// output produced by that native window, or through its terminal creation
+/// failure. It is not a window, renderer, viewport-generation, or docking
+/// authority.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct NativeViewportCreateAttempt {
+    context: NonZeroU64,
+    nonce: NonZeroU64,
+    viewport_id: ViewportId,
+}
+
+impl NativeViewportCreateAttempt {
+    /// Returns the deferred viewport whose physical creation was attempted.
+    pub const fn viewport_id(self) -> ViewportId {
+        self.viewport_id
+    }
+}
+
+/// Host admission for one exact deferred native-window creation attempt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum NativeViewportCreateAdmission {
+    /// Proceed with native creation and optionally request exact physical placement.
+    Proceed {
+        /// Undecorated physical outer rectangle requested before window creation.
+        undecorated_outer_rect: Option<NativePhysicalRect>,
+    },
+    /// Keep the deferred viewport logical-only until a later host cycle.
+    Defer,
 }
 
 /// A physical desktop rectangle used by the native host seam.
@@ -409,7 +460,7 @@ fn physical_rect(
 impl NativeViewportCreateFailure {
     /// Returns the deferred viewport whose native window could not be created.
     pub const fn viewport_id(self) -> ViewportId {
-        self.viewport_id
+        self.create_attempt.viewport_id
     }
 
     /// Returns why native viewport creation could not proceed.
@@ -456,18 +507,22 @@ impl NativeWindowEvent<'_> {
 /// viewports so native side effects remain outside application UI recursion. Callbacks run on the
 /// native event-loop thread and must not re-enter eframe.
 pub trait NativeHostHandler: Send + Sync + 'static {
-    /// Returns a physical undecorated outer-rectangle request for one deferred
-    /// viewport.
+    /// Decides whether one exact deferred native-window attempt may proceed.
     ///
-    /// The request is consulted immediately before native window creation. It
-    /// is not an acknowledgement that the platform accepted the placement.
+    /// The admission callback runs immediately before native window creation.
+    /// An admitted attempt token is echoed through the first and all later
+    /// outputs from that window, or through a terminal creation failure. A
+    /// deferred token is discarded. The token is not an acknowledgement that
+    /// the platform accepted creation or placement.
     /// Eframe ignores the request when the viewport builder also requests
     /// fullscreen, maximized, or monitor-targeted placement.
-    fn deferred_undecorated_outer_rect(
+    fn begin_deferred_viewport_create(
         &self,
-        _viewport_id: ViewportId,
-    ) -> Option<NativePhysicalRect> {
-        None
+        _attempt: NativeViewportCreateAttempt,
+    ) -> NativeViewportCreateAdmission {
+        NativeViewportCreateAdmission::Proceed {
+            undecorated_outer_rect: None,
+        }
     }
 
     /// Returns whether one hidden deferred viewport must still run its UI and renderer output.
@@ -530,6 +585,7 @@ struct NativeHostStateInner {
     context: NonZeroU64,
     next_token: AtomicU64,
     next_output: AtomicU64,
+    next_create_attempt: AtomicU64,
 }
 
 /// Single-threaded event ordinal source owned by the outer winit dispatcher.
@@ -566,6 +622,7 @@ impl NativeHostState {
                 context: next_non_zero(&NEXT_CONTEXT_ID, "native context identity exhausted"),
                 next_token: AtomicU64::new(1),
                 next_output: AtomicU64::new(1),
+                next_create_attempt: AtomicU64::new(1),
             })),
         }
     }
@@ -609,15 +666,23 @@ impl NativeHostState {
         ctx: &egui::Context,
         viewport_id: ViewportId,
         window_id: WindowId,
+        create_attempt: Option<NativeViewportCreateAttempt>,
         snapshot: NativeWindowSnapshot,
         root_roster: Option<NativeViewportRoster<'_>>,
     ) -> Option<NativeOutputScope> {
         let inner = Arc::clone(self.inner.as_ref()?);
+        debug_assert!(
+            create_attempt.is_none_or(|attempt| {
+                attempt.context == inner.context && attempt.viewport_id == viewport_id
+            }),
+            "native output attempt must belong to the producing context and viewport"
+        );
         let token = NativeOutputToken {
             context: inner.context,
             nonce: next_non_zero(&inner.next_token, "native output token exhausted"),
             viewport_id,
             window_id,
+            create_attempt,
         };
         inner.handler.on_output_begin(token, snapshot, root_roster);
         ACTIVE_OUTPUTS.with(|outputs| outputs.borrow_mut().push(token));
@@ -640,6 +705,7 @@ impl NativeHostState {
             ctx,
             viewport_id,
             window_id,
+            None,
             NativeWindowSnapshot {
                 inner_rect: None,
                 outer_rect: None,
@@ -652,35 +718,69 @@ impl NativeHostState {
         )
     }
 
-    pub(crate) fn deferred_window_override(
+    pub(crate) fn prepare_deferred_window(
         &self,
+        ctx: &egui::Context,
+        visibility_status: NativeViewportVisibilityStatus,
         viewport_id: ViewportId,
         builder: &ViewportBuilder,
-    ) -> Option<NativeDeferredWindowOverride> {
+    ) -> NativeDeferredWindowPreparation {
+        let Some(inner) = &self.inner else {
+            return NativeDeferredWindowPreparation::Unmanaged;
+        };
         if viewport_id == ViewportId::ROOT {
-            return None;
+            return NativeDeferredWindowPreparation::Unmanaged;
         }
-        if builder.fullscreen == Some(true)
-            || builder.maximized == Some(true)
-            || builder.monitor.is_some()
+
+        let create_attempt = NativeViewportCreateAttempt {
+            context: inner.context,
+            nonce: next_non_zero(
+                &inner.next_create_attempt,
+                "native viewport create attempt exhausted",
+            ),
+            viewport_id,
+        };
+        let NativeViewportCreateAdmission::Proceed {
+            undecorated_outer_rect,
+        } = inner.handler.begin_deferred_viewport_create(create_attempt)
+        else {
+            return NativeDeferredWindowPreparation::Defer;
+        };
+
+        if self.render_hidden_deferred_viewport(viewport_id)
+            && visibility_status == NativeViewportVisibilityStatus::Unsupported
         {
-            log::warn!(
-                "ignoring native host geometry for viewport {viewport_id:?}: fullscreen, maximized, and monitor-targeted builders are incompatible with an exact outer-rectangle request"
+            self.notify_viewport_create_failed(
+                ctx,
+                create_attempt,
+                NativeViewportCreateFailureKind::VisibilityUnsupported,
             );
-            return None;
+            return NativeDeferredWindowPreparation::Failed;
         }
-        let rect = self
-            .inner
-            .as_ref()?
-            .handler
-            .deferred_undecorated_outer_rect(viewport_id)?;
-        if rect.width == 0 || rect.height == 0 {
-            log::warn!(
-                "ignoring native host geometry for viewport {viewport_id:?}: physical size must be non-zero"
-            );
-            return None;
+
+        let window_override = undecorated_outer_rect.and_then(|rect| {
+            if builder.fullscreen == Some(true)
+                || builder.maximized == Some(true)
+                || builder.monitor.is_some()
+            {
+                log::warn!(
+                    "ignoring native host geometry for viewport {viewport_id:?}: fullscreen, maximized, and monitor-targeted builders are incompatible with an exact outer-rectangle request"
+                );
+                return None;
+            }
+            if rect.width == 0 || rect.height == 0 {
+                log::warn!(
+                    "ignoring native host geometry for viewport {viewport_id:?}: physical size must be non-zero"
+                );
+                return None;
+            }
+            Some(NativeDeferredWindowOverride { rect })
+        });
+
+        NativeDeferredWindowPreparation::Admitted {
+            create_attempt,
+            window_override,
         }
-        Some(NativeDeferredWindowOverride { rect })
     }
 
     pub(crate) fn render_hidden_deferred_viewport(&self, viewport_id: ViewportId) -> bool {
@@ -694,7 +794,7 @@ impl NativeHostState {
     pub(crate) fn notify_viewport_create_failed(
         &self,
         ctx: &egui::Context,
-        viewport_id: ViewportId,
+        create_attempt: NativeViewportCreateAttempt,
         kind: NativeViewportCreateFailureKind,
     ) {
         let Some(inner) = &self.inner else {
@@ -702,7 +802,10 @@ impl NativeHostState {
         };
         if inner
             .handler
-            .on_viewport_create_failed(NativeViewportCreateFailure { viewport_id, kind })
+            .on_viewport_create_failed(NativeViewportCreateFailure {
+                create_attempt,
+                kind,
+            })
             == NativeHostWake::RepaintRoot
         {
             ctx.request_repaint_of(ViewportId::ROOT);
@@ -838,29 +941,36 @@ fn visibility_control_for_event_loop(
     NativeViewportVisibilityStatus::Unsupported
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum NativeDeferredWindowPreparation {
+    Unmanaged,
+    Admitted {
+        create_attempt: NativeViewportCreateAttempt,
+        window_override: Option<NativeDeferredWindowOverride>,
+    },
+    Defer,
+    Failed,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct NativeDeferredWindowOverride {
     rect: NativePhysicalRect,
 }
 
 impl NativeDeferredWindowOverride {
     pub(crate) fn apply_to_attributes(self, attributes: WindowAttributes) -> WindowAttributes {
+        let rect = self.rect;
         attributes
             .with_decorations(false)
-            .with_position(winit::dpi::PhysicalPosition::new(self.rect.x, self.rect.y))
-            .with_inner_size(winit::dpi::PhysicalSize::new(
-                self.rect.width,
-                self.rect.height,
-            ))
+            .with_position(winit::dpi::PhysicalPosition::new(rect.x, rect.y))
+            .with_inner_size(winit::dpi::PhysicalSize::new(rect.width, rect.height))
     }
 
     pub(crate) fn reapply_to_window(self, window: &Window) {
+        let rect = self.rect;
         window.set_decorations(false);
-        window.set_outer_position(winit::dpi::PhysicalPosition::new(self.rect.x, self.rect.y));
-        let _ = window.request_inner_size(winit::dpi::PhysicalSize::new(
-            self.rect.width,
-            self.rect.height,
-        ));
+        window.set_outer_position(winit::dpi::PhysicalPosition::new(rect.x, rect.y));
+        let _ = window.request_inner_size(winit::dpi::PhysicalSize::new(rect.width, rect.height));
     }
 }
 
@@ -1027,20 +1137,29 @@ mod tests {
         outputs: Mutex<Vec<NativeOutputResult>>,
         create_failures: Mutex<Vec<NativeViewportCreateFailure>>,
         visibility_results: Mutex<Vec<NativeViewportVisibilityResult>>,
+        create_attempts: Mutex<Vec<NativeViewportCreateAttempt>>,
         deferred_rect: Mutex<Option<(ViewportId, NativePhysicalRect)>>,
+        deferred_viewport: Mutex<Option<ViewportId>>,
         hidden_viewport: Mutex<Option<ViewportId>>,
         wake: NativeHostWake,
     }
 
     impl NativeHostHandler for RecordingHost {
-        fn deferred_undecorated_outer_rect(
+        fn begin_deferred_viewport_create(
             &self,
-            viewport_id: ViewportId,
-        ) -> Option<NativePhysicalRect> {
-            self.deferred_rect
-                .lock()
-                .filter(|(requested_viewport, _)| *requested_viewport == viewport_id)
-                .map(|(_, rect)| rect)
+            attempt: NativeViewportCreateAttempt,
+        ) -> NativeViewportCreateAdmission {
+            self.create_attempts.lock().push(attempt);
+            if *self.deferred_viewport.lock() == Some(attempt.viewport_id()) {
+                return NativeViewportCreateAdmission::Defer;
+            }
+            NativeViewportCreateAdmission::Proceed {
+                undecorated_outer_rect: self
+                    .deferred_rect
+                    .lock()
+                    .filter(|(requested_viewport, _)| *requested_viewport == attempt.viewport_id())
+                    .map(|(_, rect)| rect),
+            }
         }
 
         fn render_hidden_deferred_viewport(&self, viewport_id: ViewportId) -> bool {
@@ -1385,6 +1504,7 @@ mod tests {
                 &ctx,
                 ViewportId::ROOT,
                 root_window,
+                None,
                 root_snapshot,
                 Some(NativeViewportRoster::new(
                     &roster,
@@ -1486,6 +1606,50 @@ mod tests {
     }
 
     #[test]
+    fn deferred_output_echoes_the_exact_physical_create_attempt() {
+        let host = Arc::new(RecordingHost::default());
+        let handler: Arc<dyn NativeHostHandler> = Arc::<RecordingHost>::clone(&host);
+        let state = NativeHostState::new(Some(handler));
+        let ctx = egui::Context::default();
+        let viewport_id = ViewportId::from_hash_of("attempt-bound-output");
+        let window_id = WindowId::from(19);
+        let NativeDeferredWindowPreparation::Admitted { create_attempt, .. } = state
+            .prepare_deferred_window(
+                &ctx,
+                NativeViewportVisibilityStatus::Dispatched,
+                viewport_id,
+                &ViewportBuilder::default(),
+            )
+        else {
+            panic!("an enabled native host mints one exact create attempt");
+        };
+
+        let scope = state
+            .begin_output(
+                &ctx,
+                viewport_id,
+                window_id,
+                Some(create_attempt),
+                NativeWindowSnapshot {
+                    inner_rect: None,
+                    outer_rect: None,
+                    native_scale_factor: 1.0,
+                    presentation_scale_factor: 1.0,
+                    visible: None,
+                    minimized: None,
+                },
+                None,
+            )
+            .expect("the deferred output scope exists");
+        let token = current_native_output_token().expect("the output token is active");
+
+        assert_eq!(token.viewport_id(), viewport_id);
+        assert_eq!(token.window_id(), window_id);
+        assert_eq!(token.create_attempt(), Some(create_attempt));
+        scope.finish().present();
+    }
+
+    #[test]
     fn output_tokens_expose_only_context_equality() {
         let first_host = Arc::new(RecordingHost::default());
         let first_handler: Arc<dyn NativeHostHandler> = Arc::<RecordingHost>::clone(&first_host);
@@ -1542,14 +1706,28 @@ mod tests {
             }
         });
         let viewport_id = ViewportId::from_hash_of("failed-child");
+        let NativeDeferredWindowPreparation::Admitted { create_attempt, .. } = state
+            .prepare_deferred_window(
+                &ctx,
+                NativeViewportVisibilityStatus::Dispatched,
+                viewport_id,
+                &ViewportBuilder::default(),
+            )
+        else {
+            panic!("an enabled native host mints one exact create attempt");
+        };
 
         state.notify_viewport_create_failed(
             &ctx,
-            viewport_id,
+            create_attempt,
             NativeViewportCreateFailureKind::WindowUnavailable,
         );
 
         assert_eq!(host.create_failures.lock()[0].viewport_id(), viewport_id);
+        assert_eq!(
+            host.create_failures.lock()[0].create_attempt(),
+            create_attempt
+        );
         assert_eq!(
             host.create_failures.lock()[0].kind(),
             NativeViewportCreateFailureKind::WindowUnavailable
@@ -1587,7 +1765,7 @@ mod tests {
     }
 
     #[test]
-    fn deferred_window_override_is_child_only_and_physical() {
+    fn deferred_window_preparation_is_exact_child_only_and_physical() {
         use winit::dpi::{PhysicalPosition, PhysicalSize, Position, Size};
 
         let host = Arc::new(RecordingHost::default());
@@ -1597,14 +1775,31 @@ mod tests {
         let handler: Arc<dyn NativeHostHandler> = Arc::<RecordingHost>::clone(&host);
         let state = NativeHostState::new(Some(handler));
 
-        assert!(
-            state
-                .deferred_window_override(ViewportId::ROOT, &ViewportBuilder::default())
-                .is_none()
+        let ctx = egui::Context::default();
+        assert_eq!(
+            state.prepare_deferred_window(
+                &ctx,
+                NativeViewportVisibilityStatus::Dispatched,
+                ViewportId::ROOT,
+                &ViewportBuilder::default(),
+            ),
+            NativeDeferredWindowPreparation::Unmanaged
         );
-        let attributes = state
-            .deferred_window_override(viewport_id, &ViewportBuilder::default())
-            .expect("the child request is available")
+
+        let NativeDeferredWindowPreparation::Admitted {
+            create_attempt: attempt,
+            window_override,
+        } = state.prepare_deferred_window(
+            &ctx,
+            NativeViewportVisibilityStatus::Dispatched,
+            viewport_id,
+            &ViewportBuilder::default(),
+        )
+        else {
+            panic!("the child request is admitted");
+        };
+        let attributes = window_override
+            .expect("the child geometry is available")
             .apply_to_attributes(WindowAttributes::default());
 
         assert!(!attributes.decorations);
@@ -1620,15 +1815,43 @@ mod tests {
             (rect.x(), rect.y(), rect.width(), rect.height()),
             (120, 240, 800, 600)
         );
+        assert_eq!(attempt.viewport_id(), viewport_id);
 
-        assert!(
-            state
-                .deferred_window_override(
-                    viewport_id,
-                    &ViewportBuilder::default().with_maximized(true)
-                )
-                .is_none()
+        let NativeDeferredWindowPreparation::Admitted {
+            create_attempt: second_attempt,
+            window_override: incompatible_override,
+        } = state.prepare_deferred_window(
+            &ctx,
+            NativeViewportVisibilityStatus::Dispatched,
+            viewport_id,
+            &ViewportBuilder::default().with_maximized(true),
+        )
+        else {
+            panic!("incompatible geometry does not cancel physical creation");
+        };
+        assert_ne!(second_attempt, attempt);
+        assert!(incompatible_override.is_none());
+    }
+
+    #[test]
+    fn deferred_admission_does_not_create_a_fake_failure_or_override() {
+        let host = Arc::new(RecordingHost::default());
+        let viewport_id = ViewportId::from_hash_of("deferred-admission");
+        *host.deferred_viewport.lock() = Some(viewport_id);
+        let handler: Arc<dyn NativeHostHandler> = Arc::<RecordingHost>::clone(&host);
+        let state = NativeHostState::new(Some(handler));
+
+        assert_eq!(
+            state.prepare_deferred_window(
+                &egui::Context::default(),
+                NativeViewportVisibilityStatus::Dispatched,
+                viewport_id,
+                &ViewportBuilder::default(),
+            ),
+            NativeDeferredWindowPreparation::Defer
         );
+        assert!(host.create_failures.lock().is_empty());
+        assert_eq!(host.create_attempts.lock().len(), 1);
     }
 
     #[test]

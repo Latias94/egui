@@ -29,8 +29,9 @@ use winit_integration::UserEvent;
 
 #[cfg(feature = "native-host-seam")]
 use crate::native::host_seam::{
-    NativeHostState, NativeViewportCreateFailureKind, NativeViewportRecord,
-    NativeViewportRosterCapture, NativeViewportVisibilityStatus, NativeWindowSnapshot,
+    NativeDeferredWindowPreparation, NativeHostState, NativeViewportCreateAttempt,
+    NativeViewportCreateFailureKind, NativeViewportRecord, NativeViewportRosterCapture,
+    NativeWindowSnapshot,
 };
 use crate::{
     App, AppCreator, CreationContext, NativeOptions, Result, Storage,
@@ -125,6 +126,9 @@ pub struct Viewport {
 
     /// `window` and `egui_winit` are initialized together.
     egui_winit: Option<egui_winit::State>,
+
+    #[cfg(feature = "native-host-seam")]
+    native_create_attempt: Option<NativeViewportCreateAttempt>,
 }
 
 impl Drop for Viewport {
@@ -185,19 +189,6 @@ impl<'app> WgpuWinitApp<'app> {
 
         for viewport in viewports.values_mut() {
             let viewport_id = viewport.ids.this;
-            #[cfg(feature = "native-host-seam")]
-            if viewport.class == ViewportClass::Deferred
-                && native_host.render_hidden_deferred_viewport(viewport_id)
-                && native_host.deferred_visibility_status(event_loop)
-                    == NativeViewportVisibilityStatus::Unsupported
-            {
-                native_host.notify_viewport_create_failed(
-                    &egui_ctx,
-                    viewport_id,
-                    NativeViewportCreateFailureKind::VisibilityUnsupported,
-                );
-                continue;
-            }
             if let Err(err) = viewport.initialize_window(
                 event_loop,
                 &egui_ctx,
@@ -207,12 +198,6 @@ impl<'app> WgpuWinitApp<'app> {
                 &native_host,
             ) {
                 log::error!("Failed to create window for viewport {viewport_id:?}: {err}");
-                #[cfg(feature = "native-host-seam")]
-                native_host.notify_viewport_create_failed(
-                    &egui_ctx,
-                    viewport_id,
-                    NativeViewportCreateFailureKind::WindowUnavailable,
-                );
             }
         }
     }
@@ -402,6 +387,8 @@ impl<'app> WgpuWinitApp<'app> {
                 viewport_ui_cb: None,
                 window: Some(window),
                 egui_winit: Some(egui_winit),
+                #[cfg(feature = "native-host-seam")]
+                native_create_attempt: None,
                 pending_delta: Default::default(),
             },
         );
@@ -704,7 +691,15 @@ impl WgpuWinitRunning<'_> {
         let mut frame_timer = crate::stopwatch::Stopwatch::new();
         frame_timer.start();
 
-        let (viewport_ui_cb, raw_input, _output_snapshot, is_visible, render_hidden, show_ui) = {
+        let (
+            viewport_ui_cb,
+            raw_input,
+            _output_snapshot,
+            _create_attempt,
+            is_visible,
+            render_hidden,
+            show_ui,
+        ) = {
             profiling::scope!("Prepare");
             let mut shared_lock = shared.borrow_mut();
 
@@ -758,6 +753,10 @@ impl WgpuWinitRunning<'_> {
             let output_snapshot = NativeWindowSnapshot::capture(&integration.egui_ctx, window);
             #[cfg(not(feature = "native-host-seam"))]
             let output_snapshot = ();
+            #[cfg(feature = "native-host-seam")]
+            let create_attempt = viewport.native_create_attempt;
+            #[cfg(not(feature = "native-host-seam"))]
+            let create_attempt = ();
 
             {
                 profiling::scope!("set_window");
@@ -787,6 +786,7 @@ impl WgpuWinitRunning<'_> {
                 viewport_ui_cb,
                 raw_input,
                 output_snapshot,
+                create_attempt,
                 is_visible,
                 render_hidden,
                 show_ui,
@@ -874,6 +874,7 @@ impl WgpuWinitRunning<'_> {
             &integration.egui_ctx,
             viewport_id,
             window_id,
+            _create_attempt,
             _output_snapshot,
             root_roster
                 .as_ref()
@@ -1231,9 +1232,24 @@ impl Viewport {
         let viewport_id = self.ids.this;
 
         #[cfg(feature = "native-host-seam")]
-        let native_override = (self.class == ViewportClass::Deferred)
-            .then(|| native_host.deferred_window_override(viewport_id, &self.builder))
-            .flatten();
+        let (native_create_attempt, native_override) = if self.class == ViewportClass::Deferred {
+            match native_host.prepare_deferred_window(
+                egui_ctx,
+                native_host.deferred_visibility_status(event_loop),
+                viewport_id,
+                &self.builder,
+            ) {
+                NativeDeferredWindowPreparation::Unmanaged => (None, None),
+                NativeDeferredWindowPreparation::Admitted {
+                    create_attempt,
+                    window_override,
+                } => (Some(create_attempt), window_override),
+                NativeDeferredWindowPreparation::Defer
+                | NativeDeferredWindowPreparation::Failed => return Ok(()),
+            }
+        } else {
+            (None, None)
+        };
 
         let mut window_attributes =
             egui_winit::create_winit_window_attributes(egui_ctx, self.builder.clone());
@@ -1253,21 +1269,44 @@ impl Viewport {
             window_attributes = native_override.apply_to_attributes(window_attributes);
         }
 
-        let window = event_loop.create_window(window_attributes)?;
+        let window = match event_loop.create_window(window_attributes) {
+            Ok(window) => window,
+            Err(err) => {
+                #[cfg(feature = "native-host-seam")]
+                if let Some(create_attempt) = native_create_attempt {
+                    native_host.notify_viewport_create_failed(
+                        egui_ctx,
+                        create_attempt,
+                        NativeViewportCreateFailureKind::WindowUnavailable,
+                    );
+                }
+                return Err(err);
+            }
+        };
         egui_winit::apply_viewport_builder_to_window(egui_ctx, &window, &self.builder);
         #[cfg(feature = "native-host-seam")]
         if let Some(native_override) = native_override {
             native_override.reapply_to_window(&window);
         }
-        windows_id.insert(window.id(), viewport_id);
-
         let window = Arc::new(window);
 
         if let Err(err) =
             pollster::block_on(painter.set_window(viewport_id, Some(Arc::clone(&window))))
         {
             log::error!("on set_window: viewport_id {viewport_id:?} {err}");
+            #[cfg(feature = "native-host-seam")]
+            if let Some(create_attempt) = native_create_attempt {
+                native_host.notify_viewport_create_failed(
+                    egui_ctx,
+                    create_attempt,
+                    NativeViewportCreateFailureKind::WindowUnavailable,
+                );
+            }
+            let _ = pollster::block_on(painter.set_window(viewport_id, None));
+            return Ok(());
         }
+
+        windows_id.insert(window.id(), viewport_id);
 
         self.egui_winit = Some(egui_winit::State::new(
             egui_ctx.clone(),
@@ -1279,6 +1318,10 @@ impl Viewport {
         ));
 
         egui_winit::update_viewport_info(&mut self.info, egui_ctx, &window, true);
+        #[cfg(feature = "native-host-seam")]
+        {
+            self.native_create_attempt = native_create_attempt;
+        }
         self.window = Some(window);
         Ok(())
     }
@@ -1565,6 +1608,8 @@ fn initialize_or_update_viewport<'a>(
                 viewport_ui_cb,
                 window: None,
                 egui_winit: None,
+                #[cfg(feature = "native-host-seam")]
+                native_create_attempt: None,
                 pending_delta: Default::default(),
             })
         }
@@ -1587,6 +1632,10 @@ fn initialize_or_update_viewport<'a>(
                 );
                 viewport.window = None;
                 viewport.egui_winit = None;
+                #[cfg(feature = "native-host-seam")]
+                {
+                    viewport.native_create_attempt = None;
+                }
                 if let Err(err) = pollster::block_on(painter.set_window(viewport.ids.this, None)) {
                     log::error!(
                         "when rendering viewport_id={:?}, set_window Error {err}",

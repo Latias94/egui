@@ -41,8 +41,9 @@ use super::{
 use crate::epaint::textures::TexturesDelta;
 #[cfg(feature = "native-host-seam")]
 use crate::native::host_seam::{
-    NativeHostState, NativeViewportCreateFailureKind, NativeViewportRecord,
-    NativeViewportRosterCapture, NativeViewportVisibilityStatus, NativeWindowSnapshot,
+    NativeDeferredWindowPreparation, NativeHostState, NativeViewportCreateAttempt,
+    NativeViewportCreateFailureKind, NativeViewportRecord, NativeViewportRosterCapture,
+    NativeWindowSnapshot,
 };
 use crate::{
     App, AppCreator, CreationContext, NativeOptions, Result, Storage,
@@ -150,6 +151,9 @@ struct Viewport {
     gl_surface: Option<glutin::surface::Surface<glutin::surface::WindowSurface>>,
     window: Option<Arc<Window>>,
     egui_winit: Option<egui_winit::State>,
+
+    #[cfg(feature = "native-host-seam")]
+    native_create_attempt: Option<NativeViewportCreateAttempt>,
 }
 
 impl Viewport {
@@ -530,20 +534,10 @@ impl WinitApp for GlowWinitApp<'_> {
 
         let running = if let Some(running) = &mut self.running {
             // Not the first resume event. Create all outstanding windows.
-            let failed_viewports = running
+            running
                 .glutin
                 .borrow_mut()
                 .initialize_all_windows(event_loop);
-            #[cfg(feature = "native-host-seam")]
-            for viewport_id in failed_viewports {
-                running.native_host.notify_viewport_create_failed(
-                    &running.integration.egui_ctx,
-                    viewport_id,
-                    NativeViewportCreateFailureKind::WindowUnavailable,
-                );
-            }
-            #[cfg(not(feature = "native-host-seam"))]
-            drop(failed_viewports);
             running
         } else {
             // First resume event. Create our root window etc.
@@ -670,7 +664,15 @@ impl GlowWinitRunning<'_> {
             }
         }
 
-        let (raw_input, viewport_ui_cb, _output_snapshot, is_visible, render_hidden, show_ui) = {
+        let (
+            raw_input,
+            viewport_ui_cb,
+            _output_snapshot,
+            _create_attempt,
+            is_visible,
+            render_hidden,
+            show_ui,
+        ) = {
             let mut glutin = self.glutin.borrow_mut();
             let egui_ctx = glutin.egui_ctx.clone();
             let Some(viewport) = glutin.viewports.get_mut(&viewport_id) else {
@@ -693,6 +695,10 @@ impl GlowWinitRunning<'_> {
             let output_snapshot = NativeWindowSnapshot::capture(&egui_ctx, window);
             #[cfg(not(feature = "native-host-seam"))]
             let output_snapshot = ();
+            #[cfg(feature = "native-host-seam")]
+            let create_attempt = viewport.native_create_attempt;
+            #[cfg(not(feature = "native-host-seam"))]
+            let create_attempt = ();
 
             let Some(egui_winit) = viewport.egui_winit.as_mut() else {
                 return Ok(EventResult::Wait);
@@ -717,6 +723,7 @@ impl GlowWinitRunning<'_> {
                 raw_input,
                 viewport_ui_cb,
                 output_snapshot,
+                create_attempt,
                 is_visible,
                 render_hidden,
                 show_ui,
@@ -845,6 +852,7 @@ impl GlowWinitRunning<'_> {
             &self.integration.egui_ctx,
             viewport_id,
             window_id,
+            _create_attempt,
             _output_snapshot,
             root_roster
                 .as_ref()
@@ -861,8 +869,6 @@ impl GlowWinitRunning<'_> {
         let Self {
             integration,
             app,
-            #[cfg(feature = "native-host-seam")]
-            native_host,
             glutin,
             painter,
             pending_deltas,
@@ -991,18 +997,7 @@ impl GlowWinitRunning<'_> {
             }
         }
 
-        let failed_viewports =
-            glutin.handle_viewport_output(event_loop, &integration.egui_ctx, &viewport_output);
-        #[cfg(feature = "native-host-seam")]
-        for viewport_id in failed_viewports {
-            native_host.notify_viewport_create_failed(
-                &integration.egui_ctx,
-                viewport_id,
-                NativeViewportCreateFailureKind::WindowUnavailable,
-            );
-        }
-        #[cfg(not(feature = "native-host-seam"))]
-        drop(failed_viewports);
+        glutin.handle_viewport_output(event_loop, &integration.egui_ctx, &viewport_output);
 
         integration.report_frame_time(frame_timer.total_time_sec()); // don't count auto-save time as part of regular frame time
 
@@ -1344,6 +1339,8 @@ impl GlutinWindowContext {
                 gl_surface: None,
                 window: window.map(Arc::new),
                 egui_winit: None,
+                #[cfg(feature = "native-host-seam")]
+                native_create_attempt: None,
             },
         );
 
@@ -1375,37 +1372,16 @@ impl GlutinWindowContext {
     /// Create a surface, window, and winit integration for all viewports lacking any of that.
     ///
     /// Errors will be logged.
-    fn initialize_all_windows(&mut self, event_loop: &ActiveEventLoop) -> Vec<ViewportId> {
+    fn initialize_all_windows(&mut self, event_loop: &ActiveEventLoop) {
         profiling::function_scope!();
 
         let viewports: Vec<ViewportId> = self.viewports.keys().copied().collect();
-        let mut failed_viewports = Vec::new();
 
         for viewport_id in viewports {
-            #[cfg(feature = "native-host-seam")]
-            if self
-                .viewports
-                .get(&viewport_id)
-                .is_some_and(|viewport| viewport.class == ViewportClass::Deferred)
-                && self
-                    .native_host
-                    .render_hidden_deferred_viewport(viewport_id)
-                && self.native_host.deferred_visibility_status(event_loop)
-                    == NativeViewportVisibilityStatus::Unsupported
-            {
-                self.native_host.notify_viewport_create_failed(
-                    &self.egui_ctx,
-                    viewport_id,
-                    NativeViewportCreateFailureKind::VisibilityUnsupported,
-                );
-                continue;
-            }
             if let Err(err) = self.initialize_window(viewport_id, event_loop) {
                 log::error!("Failed to initialize a window for viewport {viewport_id:?}: {err}");
-                failed_viewports.push(viewport_id);
             }
         }
-        failed_viewports
     }
 
     /// Create a surface, window, and winit integration for the viewport, if missing.
@@ -1418,14 +1394,30 @@ impl GlutinWindowContext {
         profiling::function_scope!();
 
         #[cfg(feature = "native-host-seam")]
-        let native_override = self
-            .viewports
-            .get(&viewport_id)
-            .filter(|viewport| viewport.class == ViewportClass::Deferred)
-            .and_then(|viewport| {
-                self.native_host
-                    .deferred_window_override(viewport_id, &viewport.builder)
-            });
+        let (native_create_attempt, native_override) = {
+            let viewport = self
+                .viewports
+                .get(&viewport_id)
+                .expect("viewport doesn't exist");
+            if viewport.window.is_none() && viewport.class == ViewportClass::Deferred {
+                match self.native_host.prepare_deferred_window(
+                    &self.egui_ctx,
+                    self.native_host.deferred_visibility_status(event_loop),
+                    viewport_id,
+                    &viewport.builder,
+                ) {
+                    NativeDeferredWindowPreparation::Unmanaged => (None, None),
+                    NativeDeferredWindowPreparation::Admitted {
+                        create_attempt,
+                        window_override,
+                    } => (Some(create_attempt), window_override),
+                    NativeDeferredWindowPreparation::Defer
+                    | NativeDeferredWindowPreparation::Failed => return Ok(()),
+                }
+            } else {
+                (None, None)
+            }
+        };
 
         let viewport = self
             .viewports
@@ -1436,21 +1428,32 @@ impl GlutinWindowContext {
             window
         } else {
             log::debug!("Creating a window for viewport {viewport_id:?}");
-            let mut window_attributes = egui_winit::create_winit_window_attributes(
+            let window_attributes = egui_winit::create_winit_window_attributes(
                 &self.egui_ctx,
                 viewport.builder.clone(),
             );
             #[cfg(feature = "native-host-seam")]
-            if let Some(native_override) = native_override {
-                window_attributes = native_override.apply_to_attributes(window_attributes);
-            }
+            let window_attributes = match native_override {
+                Some(native_override) => native_override.apply_to_attributes(window_attributes),
+                None => window_attributes,
+            };
             if window_attributes.transparent()
                 && self.gl_config.supports_transparency() == Some(false)
             {
                 log::error!("Cannot create transparent window: the GL config does not support it");
             }
             let window =
-                glutin_winit::finalize_window(event_loop, window_attributes, &self.gl_config)?;
+                glutin_winit::finalize_window(event_loop, window_attributes, &self.gl_config)
+                    .inspect_err(|_| {
+                        #[cfg(feature = "native-host-seam")]
+                        if let Some(create_attempt) = native_create_attempt {
+                            self.native_host.notify_viewport_create_failed(
+                                &self.egui_ctx,
+                                create_attempt,
+                                NativeViewportCreateFailureKind::WindowUnavailable,
+                            );
+                        }
+                    })?;
             egui_winit::apply_viewport_builder_to_window(
                 &self.egui_ctx,
                 &window,
@@ -1462,6 +1465,10 @@ impl GlutinWindowContext {
             }
 
             egui_winit::update_viewport_info(&mut viewport.info, &self.egui_ctx, &window, true);
+            #[cfg(feature = "native-host-seam")]
+            {
+                viewport.native_create_attempt = native_create_attempt;
+            }
             viewport.window.insert(Arc::new(window))
         };
 
@@ -1484,23 +1491,67 @@ impl GlutinWindowContext {
             let (width_px, height_px): (u32, u32) = window.inner_size().into();
             let width_px = NonZeroU32::new(width_px).unwrap_or(NonZeroU32::MIN);
             let height_px = NonZeroU32::new(height_px).unwrap_or(NonZeroU32::MIN);
+            let raw_window_handle = match window.window_handle() {
+                Ok(handle) => handle.as_raw(),
+                Err(err) => {
+                    let failed_window = window.id();
+                    clear_failed_window(
+                        viewport,
+                        viewport_id,
+                        failed_window,
+                        &mut self.viewport_from_window,
+                        &mut self.window_from_viewport,
+                    );
+                    #[cfg(feature = "native-host-seam")]
+                    if let Some(create_attempt) = native_create_attempt {
+                        self.native_host.notify_viewport_create_failed(
+                            &self.egui_ctx,
+                            create_attempt,
+                            NativeViewportCreateFailureKind::WindowUnavailable,
+                        );
+                    }
+                    log::error!(
+                        "Failed to get the native window handle for viewport {viewport_id:?}: {err}"
+                    );
+                    return Err(glutin::error::Error::from(
+                        glutin::error::ErrorKind::BadNativeWindow,
+                    )
+                    .into());
+                }
+            };
             let surface_attributes = {
                 glutin::surface::SurfaceAttributesBuilder::<glutin::surface::WindowSurface>::new()
-                    .build(
-                        window
-                            .window_handle()
-                            .expect("Failed to get display handle")
-                            .as_raw(),
-                        width_px,
-                        height_px,
-                    )
+                    .build(raw_window_handle, width_px, height_px)
             };
 
             log::trace!("creating surface with attributes: {surface_attributes:?}");
-            let gl_surface = unsafe {
+            let gl_surface = match unsafe {
                 self.gl_config
                     .display()
-                    .create_window_surface(&self.gl_config, &surface_attributes)?
+                    .create_window_surface(&self.gl_config, &surface_attributes)
+            } {
+                Ok(gl_surface) => gl_surface,
+                Err(err) => {
+                    let failed_window = window.id();
+                    clear_failed_window(
+                        viewport,
+                        viewport_id,
+                        failed_window,
+                        &mut self.viewport_from_window,
+                        &mut self.window_from_viewport,
+                    );
+                    #[cfg(feature = "native-host-seam")]
+                    {
+                        if let Some(create_attempt) = native_create_attempt {
+                            self.native_host.notify_viewport_create_failed(
+                                &self.egui_ctx,
+                                create_attempt,
+                                NativeViewportCreateFailureKind::WindowUnavailable,
+                            );
+                        }
+                    }
+                    return Err(err.into());
+                }
             };
 
             log::trace!("surface created successfully: {gl_surface:?}. making context current");
@@ -1515,7 +1566,30 @@ impl GlutinWindowContext {
                         .make_not_current()
                         .unwrap()
                 };
-            let current_gl_context = not_current_gl_context.make_current(&gl_surface)?;
+            let current_gl_context = match not_current_gl_context.make_current(&gl_surface) {
+                Ok(current_gl_context) => current_gl_context,
+                Err(err) => {
+                    let failed_window = window.id();
+                    clear_failed_window(
+                        viewport,
+                        viewport_id,
+                        failed_window,
+                        &mut self.viewport_from_window,
+                        &mut self.window_from_viewport,
+                    );
+                    #[cfg(feature = "native-host-seam")]
+                    {
+                        if let Some(create_attempt) = native_create_attempt {
+                            self.native_host.notify_viewport_create_failed(
+                                &self.egui_ctx,
+                                create_attempt,
+                                NativeViewportCreateFailureKind::WindowUnavailable,
+                            );
+                        }
+                    }
+                    return Err(err.into());
+                }
+            };
 
             // try setting swap interval. but its not absolutely necessary, so don't panic on failure.
             log::trace!("made context current. setting swap interval for surface");
@@ -1544,6 +1618,10 @@ impl GlutinWindowContext {
         for viewport in self.viewports.values_mut() {
             viewport.gl_surface = None;
             viewport.window = None;
+            #[cfg(feature = "native-host-seam")]
+            {
+                viewport.native_create_attempt = None;
+            }
         }
         if let Some(current) = self.current_gl_context.take() {
             log::debug!("context is current, so making it non-current");
@@ -1613,7 +1691,7 @@ impl GlutinWindowContext {
         event_loop: &ActiveEventLoop,
         egui_ctx: &egui::Context,
         viewport_output: &OrderedViewportIdMap<ViewportOutput>,
-    ) -> Vec<ViewportId> {
+    ) {
         profiling::function_scope!();
 
         for (
@@ -1659,12 +1737,29 @@ impl GlutinWindowContext {
             }
         }
 
-        // Create windows for any new viewports:
-        let failed_viewports = self.initialize_all_windows(event_loop);
-
         self.remove_viewports_not_in(viewport_output);
-        failed_viewports
+
+        // Create windows only after obsolete deferred entries have been pruned.
+        self.initialize_all_windows(event_loop);
     }
+}
+
+fn clear_failed_window(
+    viewport: &mut Viewport,
+    viewport_id: ViewportId,
+    window_id: WindowId,
+    viewport_from_window: &mut HashMap<WindowId, ViewportId>,
+    window_from_viewport: &mut OrderedViewportIdMap<WindowId>,
+) {
+    viewport.gl_surface = None;
+    viewport.window = None;
+    viewport.egui_winit = None;
+    #[cfg(feature = "native-host-seam")]
+    {
+        viewport.native_create_attempt = None;
+    }
+    viewport_from_window.remove(&window_id);
+    window_from_viewport.remove(&viewport_id);
 }
 
 fn initialize_or_update_viewport(
@@ -1701,6 +1796,8 @@ fn initialize_or_update_viewport(
                 window: None,
                 egui_winit: None,
                 gl_surface: None,
+                #[cfg(feature = "native-host-seam")]
+                native_create_attempt: None,
             })
         }
 
@@ -1723,6 +1820,10 @@ fn initialize_or_update_viewport(
                 viewport.window = None;
                 viewport.egui_winit = None;
                 viewport.gl_surface = None;
+                #[cfg(feature = "native-host-seam")]
+                {
+                    viewport.native_create_attempt = None;
+                }
             }
 
             viewport.deferred_commands.append(&mut delta_commands);
@@ -1897,7 +1998,7 @@ fn render_immediate_viewport(
     egui_winit.handle_platform_output(window, platform_output);
 
     event_loop_context::with_current_event_loop(|event_loop| {
-        let _ = glutin.handle_viewport_output(event_loop, egui_ctx, &viewport_output);
+        glutin.handle_viewport_output(event_loop, egui_ctx, &viewport_output);
     });
 }
 
