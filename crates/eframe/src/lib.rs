@@ -209,6 +209,7 @@ pub use native::host_seam::{
     NativeOutputToken, NativePhysicalRect, NativeViewportCloseRequest,
     NativeViewportCreateAdmission, NativeViewportCreateAttempt, NativeViewportCreateFailure,
     NativeViewportCreateFailureKind, NativeViewportFocusResult, NativeViewportFocusStatus,
+    NativeViewportPointerPassthroughResult, NativeViewportPointerPassthroughStatus,
     NativeViewportRecord, NativeViewportRoster, NativeViewportVisibilityResult,
     NativeViewportVisibilityStatus, NativeWindowEvent, NativeWindowSnapshot, NativeWorkAreaRecord,
     NativeWorkAreaRoster, current_native_output_token,

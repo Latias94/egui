@@ -598,6 +598,48 @@ impl NativeViewportFocusResult {
     }
 }
 
+/// Result of applying one exact viewport pointer pass-through command.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NativeViewportPointerPassthroughStatus {
+    /// Winit applied the requested cursor hit-test state.
+    Applied,
+    /// The active platform backend does not support cursor hit-test control.
+    Unsupported,
+    /// The platform ignored or failed the cursor hit-test request.
+    Failed,
+}
+
+/// Exact pointer pass-through command result for one native viewport.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NativeViewportPointerPassthroughResult {
+    viewport_id: ViewportId,
+    window_id: WindowId,
+    enabled: bool,
+    status: NativeViewportPointerPassthroughStatus,
+}
+
+impl NativeViewportPointerPassthroughResult {
+    /// Returns the target eframe viewport.
+    pub const fn viewport_id(self) -> ViewportId {
+        self.viewport_id
+    }
+
+    /// Returns the exact target native window.
+    pub const fn window_id(self) -> WindowId {
+        self.window_id
+    }
+
+    /// Returns whether pointer input was requested to pass through the window.
+    pub const fn enabled(self) -> bool {
+        self.enabled
+    }
+
+    /// Returns the terminal platform result.
+    pub const fn status(self) -> NativeViewportPointerPassthroughStatus {
+        self.status
+    }
+}
+
 /// External native coordinator callbacks.
 ///
 /// Implementations must copy any retained facts during the callback. Borrowed winit values remain
@@ -643,6 +685,14 @@ pub trait NativeHostHandler: Send + Sync + 'static {
 
     /// Reports that eframe consumed one exact viewport focus command.
     fn on_viewport_focus(&self, _result: NativeViewportFocusResult) -> NativeHostWake {
+        NativeHostWake::Wait
+    }
+
+    /// Reports the terminal result of one exact pointer pass-through command.
+    fn on_viewport_pointer_passthrough(
+        &self,
+        _result: NativeViewportPointerPassthroughResult,
+    ) -> NativeHostWake {
         NativeHostWake::Wait
     }
 
@@ -1052,6 +1102,29 @@ impl NativeHostState {
                     NativeViewportFocusStatus::Requested
                 }
             });
+            if self.is_enabled()
+                && let egui::ViewportCommand::MousePassthrough(enabled) = command
+            {
+                let status = match window.set_cursor_hittest(!enabled) {
+                    Ok(()) => NativeViewportPointerPassthroughStatus::Applied,
+                    Err(winit::error::ExternalError::NotSupported(_)) => {
+                        NativeViewportPointerPassthroughStatus::Unsupported
+                    }
+                    Err(
+                        winit::error::ExternalError::Ignored | winit::error::ExternalError::Os(_),
+                    ) => NativeViewportPointerPassthroughStatus::Failed,
+                };
+                self.notify_viewport_pointer_passthrough(
+                    ctx,
+                    NativeViewportPointerPassthroughResult {
+                        viewport_id,
+                        window_id: window.id(),
+                        enabled,
+                        status,
+                    },
+                );
+                continue;
+            }
             egui_winit::process_viewport_commands(
                 ctx,
                 info,
@@ -1084,6 +1157,19 @@ impl NativeHostState {
             status,
         }) == NativeHostWake::RepaintRoot
         {
+            ctx.request_repaint_of(ViewportId::ROOT);
+        }
+    }
+
+    fn notify_viewport_pointer_passthrough(
+        &self,
+        ctx: &egui::Context,
+        result: NativeViewportPointerPassthroughResult,
+    ) {
+        let Some(inner) = &self.inner else {
+            return;
+        };
+        if inner.handler.on_viewport_pointer_passthrough(result) == NativeHostWake::RepaintRoot {
             ctx.request_repaint_of(ViewportId::ROOT);
         }
     }
@@ -1350,6 +1436,7 @@ mod tests {
         viewport_close_cancellations: Mutex<Vec<NativeViewportCloseRequest>>,
         global_focus_observations: Mutex<Vec<NativeGlobalFocusObservation>>,
         viewport_focus_results: Mutex<Vec<NativeViewportFocusResult>>,
+        viewport_pointer_passthrough_results: Mutex<Vec<NativeViewportPointerPassthroughResult>>,
         create_attempts: Mutex<Vec<NativeViewportCreateAttempt>>,
         deferred_rect: Mutex<Option<(ViewportId, NativePhysicalRect)>>,
         deferred_viewport: Mutex<Option<ViewportId>>,
@@ -1401,6 +1488,16 @@ mod tests {
 
         fn on_viewport_focus(&self, result: NativeViewportFocusResult) -> NativeHostWake {
             self.viewport_focus_results.lock().push(result);
+            self.wake
+        }
+
+        fn on_viewport_pointer_passthrough(
+            &self,
+            result: NativeViewportPointerPassthroughResult,
+        ) -> NativeHostWake {
+            self.viewport_pointer_passthrough_results
+                .lock()
+                .push(result);
             self.wake
         }
 
@@ -1539,6 +1636,35 @@ mod tests {
         assert_eq!(
             results[0].status(),
             NativeViewportFocusStatus::AlreadyFocused
+        );
+    }
+
+    #[test]
+    fn viewport_pointer_passthrough_callback_reports_exact_command_result() {
+        let host = Arc::new(RecordingHost::default());
+        let handler: Arc<dyn NativeHostHandler> = Arc::<RecordingHost>::clone(&host);
+        let state = NativeHostState::new(Some(handler));
+        let child_viewport = ViewportId::from_hash_of("pointer-passthrough-child");
+        let child_window = WindowId::from(23);
+
+        state.notify_viewport_pointer_passthrough(
+            &egui::Context::default(),
+            NativeViewportPointerPassthroughResult {
+                viewport_id: child_viewport,
+                window_id: child_window,
+                enabled: true,
+                status: NativeViewportPointerPassthroughStatus::Applied,
+            },
+        );
+
+        let results = host.viewport_pointer_passthrough_results.lock();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].viewport_id(), child_viewport);
+        assert_eq!(results[0].window_id(), child_window);
+        assert!(results[0].enabled());
+        assert_eq!(
+            results[0].status(),
+            NativeViewportPointerPassthroughStatus::Applied
         );
     }
 
