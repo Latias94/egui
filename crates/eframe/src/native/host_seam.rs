@@ -5,9 +5,10 @@
 //! translation and receives terminal presentation results for context-local output tokens.
 
 use std::cell::RefCell;
+use std::collections::BTreeMap;
 use std::num::NonZeroU64;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use egui::{ViewportBuilder, ViewportId};
 #[cfg(target_os = "linux")]
@@ -34,6 +35,32 @@ impl NativeEventOrdinal {
     /// Returns the process-local ordinal.
     pub const fn get(self) -> u64 {
         self.0.get()
+    }
+}
+
+/// Exact native close request retained until eframe decides whether the
+/// matching viewport output cancelled it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct NativeViewportCloseRequest {
+    event: NativeEventOrdinal,
+    viewport_id: ViewportId,
+    window_id: WindowId,
+}
+
+impl NativeViewportCloseRequest {
+    /// Returns the native event which introduced the close request.
+    pub const fn event(self) -> NativeEventOrdinal {
+        self.event
+    }
+
+    /// Returns the viewport which consumed the close request.
+    pub const fn viewport_id(self) -> ViewportId {
+        self.viewport_id
+    }
+
+    /// Returns the exact window which emitted the close request.
+    pub const fn window_id(self) -> WindowId {
+        self.window_id
     }
 }
 
@@ -565,6 +592,11 @@ pub trait NativeHostHandler: Send + Sync + 'static {
     fn on_viewport_visibility(&self, _result: NativeViewportVisibilityResult) -> NativeHostWake {
         NativeHostWake::Wait
     }
+
+    /// Reports that eframe consumed `CancelClose` for one exact viewport close request.
+    fn on_viewport_close_cancelled(&self, _request: NativeViewportCloseRequest) -> NativeHostWake {
+        NativeHostWake::Wait
+    }
 }
 
 /// Returns the output token for the currently executing viewport UI callback.
@@ -586,6 +618,7 @@ struct NativeHostStateInner {
     next_token: AtomicU64,
     next_output: AtomicU64,
     next_create_attempt: AtomicU64,
+    pending_viewport_closes: Mutex<BTreeMap<ViewportId, NativeViewportCloseRequest>>,
 }
 
 /// Single-threaded event ordinal source owned by the outer winit dispatcher.
@@ -623,6 +656,7 @@ impl NativeHostState {
                 next_token: AtomicU64::new(1),
                 next_output: AtomicU64::new(1),
                 next_create_attempt: AtomicU64::new(1),
+                pending_viewport_closes: Mutex::new(BTreeMap::new()),
             })),
         }
     }
@@ -650,6 +684,21 @@ impl NativeHostState {
         let Some(inner) = &self.inner else {
             return;
         };
+        if let Some(viewport_id) = viewport_id
+            && matches!(event, winit::event::WindowEvent::CloseRequested)
+        {
+            let mut pending = inner
+                .pending_viewport_closes
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            pending
+                .entry(viewport_id)
+                .or_insert(NativeViewportCloseRequest {
+                    event: ordinal,
+                    viewport_id,
+                    window_id,
+                });
+        }
         inner.handler.on_window_event(NativeWindowEvent {
             ordinal,
             window_id,
@@ -657,6 +706,31 @@ impl NativeHostState {
             event,
         });
         if let Some(ctx) = ctx {
+            ctx.request_repaint_of(ViewportId::ROOT);
+        }
+    }
+
+    pub(crate) fn finish_viewport_close_request(
+        &self,
+        ctx: &egui::Context,
+        viewport_id: ViewportId,
+        cancelled: bool,
+    ) {
+        let Some(inner) = &self.inner else {
+            return;
+        };
+        let request = inner
+            .pending_viewport_closes
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&viewport_id);
+        if !cancelled {
+            return;
+        }
+        let Some(request) = request else {
+            return;
+        };
+        if inner.handler.on_viewport_close_cancelled(request) == NativeHostWake::RepaintRoot {
             ctx.request_repaint_of(ViewportId::ROOT);
         }
     }
@@ -1137,6 +1211,7 @@ mod tests {
         outputs: Mutex<Vec<NativeOutputResult>>,
         create_failures: Mutex<Vec<NativeViewportCreateFailure>>,
         visibility_results: Mutex<Vec<NativeViewportVisibilityResult>>,
+        viewport_close_cancellations: Mutex<Vec<NativeViewportCloseRequest>>,
         create_attempts: Mutex<Vec<NativeViewportCreateAttempt>>,
         deferred_rect: Mutex<Option<(ViewportId, NativePhysicalRect)>>,
         deferred_viewport: Mutex<Option<ViewportId>>,
@@ -1170,6 +1245,7 @@ mod tests {
             let facts = match event.event() {
                 winit::event::WindowEvent::MouseInput { facts, .. }
                 | winit::event::WindowEvent::MouseWheel { facts, .. } => *facts,
+                winit::event::WindowEvent::CloseRequested => return,
                 other => panic!("expected pointer event, got {other:?}"),
             };
             self.events.lock().push((
@@ -1210,6 +1286,53 @@ mod tests {
             self.visibility_results.lock().push(result);
             self.wake
         }
+
+        fn on_viewport_close_cancelled(
+            &self,
+            request: NativeViewportCloseRequest,
+        ) -> NativeHostWake {
+            self.viewport_close_cancellations.lock().push(request);
+            self.wake
+        }
+    }
+
+    #[test]
+    fn viewport_close_callback_reports_only_the_exact_cancelled_request() {
+        use winit::event::WindowEvent;
+
+        let host = Arc::new(RecordingHost::default());
+        let handler: Arc<dyn NativeHostHandler> = Arc::<RecordingHost>::clone(&host);
+        let state = NativeHostState::new(Some(handler));
+        let ctx = egui::Context::default();
+        let mut sequencer = NativeEventSequencer::default();
+        let root_window = WindowId::from(11);
+        let child_viewport = ViewportId::from_hash_of("child-close");
+        let child_window = WindowId::from(12);
+
+        state.observe_window_event(
+            None,
+            sequencer.next(),
+            root_window,
+            Some(ViewportId::ROOT),
+            &WindowEvent::CloseRequested,
+        );
+        state.finish_viewport_close_request(&ctx, ViewportId::ROOT, false);
+        assert!(host.viewport_close_cancellations.lock().is_empty());
+
+        state.observe_window_event(
+            None,
+            sequencer.next(),
+            child_window,
+            Some(child_viewport),
+            &WindowEvent::CloseRequested,
+        );
+        state.finish_viewport_close_request(&ctx, child_viewport, true);
+
+        let requests = host.viewport_close_cancellations.lock();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].event().get(), 2);
+        assert_eq!(requests[0].viewport_id(), child_viewport);
+        assert_eq!(requests[0].window_id(), child_window);
     }
 
     #[test]

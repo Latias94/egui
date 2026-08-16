@@ -166,6 +166,10 @@ pub struct EpiIntegration {
     /// When set, it is time to close the native window.
     close: bool,
 
+    /// Result of the latest viewport close request consumed by an egui pass.
+    #[cfg(feature = "native-host-seam")]
+    viewport_close_result: Option<(egui::ViewportId, bool)>,
+
     can_drag_window: bool,
     #[cfg(feature = "persistence")]
     persist_window: bool,
@@ -223,6 +227,8 @@ impl EpiIntegration {
             pending_raw_input: Default::default(),
             pending_full_output: Default::default(),
             close: false,
+            #[cfg(feature = "native-host-seam")]
+            viewport_close_result: None,
             can_drag_window: false,
             #[cfg(feature = "persistence")]
             persist_window: native_options.persist_window,
@@ -238,6 +244,11 @@ impl EpiIntegration {
     /// If `true`, it is time to close the native window.
     pub fn should_close(&self) -> bool {
         self.close
+    }
+
+    #[cfg(feature = "native-host-seam")]
+    pub(crate) fn take_viewport_close_result(&mut self) -> Option<(egui::ViewportId, bool)> {
+        self.viewport_close_result.take()
     }
 
     pub fn on_window_event(
@@ -281,6 +292,7 @@ impl EpiIntegration {
     ) -> egui::FullOutput {
         let raw_input = self.prepare_raw_input(app, raw_input);
 
+        let viewport_id = raw_input.viewport_id;
         let close_requested = raw_input.viewport().close_requested();
 
         let is_root_viewport = viewport_ui_cb.is_none();
@@ -302,11 +314,17 @@ impl EpiIntegration {
             }
         });
 
-        if is_root_viewport && close_requested {
-            let canceled = full_output.viewport_output[&ViewportId::ROOT]
+        if close_requested {
+            let canceled = full_output.viewport_output[&viewport_id]
                 .commands
                 .contains(&egui::ViewportCommand::CancelClose);
-            self.handle_close_request(canceled);
+            if is_root_viewport {
+                self.handle_close_request(canceled);
+            }
+            #[cfg(feature = "native-host-seam")]
+            {
+                self.viewport_close_result = Some((viewport_id, canceled));
+            }
         }
 
         self.pending_full_output.append(full_output);
@@ -327,6 +345,7 @@ impl EpiIntegration {
     ) -> egui::LogicOutput {
         let raw_input = self.prepare_raw_input(app, raw_input);
 
+        let viewport_id = raw_input.viewport_id;
         let close_requested = raw_input.viewport().close_requested();
 
         let logic_output = self.egui_ctx.run_logic(&raw_input, |ctx| {
@@ -343,6 +362,10 @@ impl EpiIntegration {
                 .get(&ViewportId::ROOT)
                 .is_some_and(|commands| commands.contains(&egui::ViewportCommand::CancelClose));
             self.handle_close_request(canceled);
+            #[cfg(feature = "native-host-seam")]
+            {
+                self.viewport_close_result = Some((viewport_id, canceled));
+            }
         }
 
         logic_output

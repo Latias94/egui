@@ -804,6 +804,14 @@ impl WgpuWinitRunning<'_> {
                     platform_output,
                     viewport_commands,
                 } = integration.update_logic_only(app.as_mut(), raw_input);
+                #[cfg(feature = "native-host-seam")]
+                if let Some((viewport_id, cancelled)) = integration.take_viewport_close_result() {
+                    native_host.finish_viewport_close_request(
+                        &integration.egui_ctx,
+                        viewport_id,
+                        cancelled,
+                    );
+                }
 
                 let mut shared_mut = shared.borrow_mut();
                 let SharedState { viewports, .. } = &mut *shared_mut;
@@ -881,6 +889,14 @@ impl WgpuWinitRunning<'_> {
                 .map(NativeViewportRosterCapture::as_borrowed),
         );
         let full_output = integration.update(app.as_mut(), viewport_ui_cb.as_deref(), raw_input);
+        #[cfg(feature = "native-host-seam")]
+        if let Some((viewport_id, cancelled)) = integration.take_viewport_close_result() {
+            native_host.finish_viewport_close_request(
+                &integration.egui_ctx,
+                viewport_id,
+                cancelled,
+            );
+        }
         #[cfg(feature = "native-host-seam")]
         let mut output_settlement = output_scope.map(|scope| scope.finish());
 

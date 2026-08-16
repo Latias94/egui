@@ -206,10 +206,11 @@ pub use native::run::EframeWinitApplication;
 pub use native::host_seam::{
     NativeDisplayId, NativeEventOrdinal, NativeHostHandler, NativeHostWake, NativeOutputOrdinal,
     NativeOutputResult, NativeOutputStatus, NativeOutputToken, NativePhysicalRect,
-    NativeViewportCreateAdmission, NativeViewportCreateAttempt, NativeViewportCreateFailure,
-    NativeViewportCreateFailureKind, NativeViewportRecord, NativeViewportRoster,
-    NativeViewportVisibilityResult, NativeViewportVisibilityStatus, NativeWindowEvent,
-    NativeWindowSnapshot, NativeWorkAreaRecord, NativeWorkAreaRoster, current_native_output_token,
+    NativeViewportCloseRequest, NativeViewportCreateAdmission, NativeViewportCreateAttempt,
+    NativeViewportCreateFailure, NativeViewportCreateFailureKind, NativeViewportRecord,
+    NativeViewportRoster, NativeViewportVisibilityResult, NativeViewportVisibilityStatus,
+    NativeWindowEvent, NativeWindowSnapshot, NativeWorkAreaRecord, NativeWorkAreaRoster,
+    current_native_output_token,
 };
 
 #[cfg(not(any(target_arch = "wasm32", target_os = "ios")))]

@@ -743,6 +743,16 @@ impl GlowWinitRunning<'_> {
                 } = self
                     .integration
                     .update_logic_only(self.app.as_mut(), raw_input);
+                #[cfg(feature = "native-host-seam")]
+                if let Some((viewport_id, cancelled)) =
+                    self.integration.take_viewport_close_result()
+                {
+                    self.native_host.finish_viewport_close_request(
+                        &self.integration.egui_ctx,
+                        viewport_id,
+                        cancelled,
+                    );
+                }
 
                 let mut glutin = self.glutin.borrow_mut();
                 if let Some(viewport) = glutin.viewports.get_mut(&viewport_id) {
@@ -861,6 +871,14 @@ impl GlowWinitRunning<'_> {
         let full_output =
             self.integration
                 .update(self.app.as_mut(), viewport_ui_cb.as_deref(), raw_input);
+        #[cfg(feature = "native-host-seam")]
+        if let Some((viewport_id, cancelled)) = self.integration.take_viewport_close_result() {
+            self.native_host.finish_viewport_close_request(
+                &self.integration.egui_ctx,
+                viewport_id,
+                cancelled,
+            );
+        }
         #[cfg(feature = "native-host-seam")]
         let mut output_settlement = output_scope.map(|scope| scope.finish());
 
