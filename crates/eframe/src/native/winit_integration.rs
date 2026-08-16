@@ -99,6 +99,9 @@ pub trait WinitApp {
     #[cfg(feature = "native-host-seam")]
     fn viewport_id_from_window_id(&self, id: WindowId) -> Option<ViewportId>;
 
+    #[cfg(feature = "native-host-seam")]
+    fn focused_native_viewport(&self) -> Option<(ViewportId, WindowId)>;
+
     fn save(&mut self);
 
     fn save_and_destroy(&mut self);

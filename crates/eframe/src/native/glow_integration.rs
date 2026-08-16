@@ -490,6 +490,14 @@ impl WinitApp for GlowWinitApp<'_> {
             .copied()
     }
 
+    #[cfg(feature = "native-host-seam")]
+    fn focused_native_viewport(&self) -> Option<(ViewportId, WindowId)> {
+        let glutin = self.running.as_ref()?.glutin.borrow();
+        let viewport_id = glutin.focused_viewport?;
+        let window_id = glutin.window_from_viewport.get(&viewport_id).copied()?;
+        Some((viewport_id, window_id))
+    }
+
     fn save(&mut self) {
         log::debug!("WinitApp::save called");
         if let Some(running) = self.running.as_mut() {

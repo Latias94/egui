@@ -479,6 +479,14 @@ impl WinitApp for WgpuWinitApp<'_> {
             .copied()
     }
 
+    #[cfg(feature = "native-host-seam")]
+    fn focused_native_viewport(&self) -> Option<(ViewportId, WindowId)> {
+        let shared = self.running.as_ref()?.shared.borrow();
+        let viewport_id = shared.focused_viewport?;
+        let window_id = shared.viewports.get(&viewport_id)?.window.as_ref()?.id();
+        Some((viewport_id, window_id))
+    }
+
     fn save(&mut self) {
         log::debug!("WinitApp::save called");
         if let Some(running) = self.running.as_mut() {

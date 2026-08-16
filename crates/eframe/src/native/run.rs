@@ -388,7 +388,7 @@ impl<T: WinitApp> ApplicationHandler<UserEvent> for WinitAppWrapper<T> {
                 }
                 event => {
                     #[cfg(feature = "native-host-seam")]
-                    if self.native_host.is_enabled() {
+                    let native_event = if self.native_host.is_enabled() {
                         let ordinal = self.native_event_sequence.next();
                         let viewport_id = self.winit_app.viewport_id_from_window_id(window_id);
                         self.native_host.observe_window_event(
@@ -398,8 +398,23 @@ impl<T: WinitApp> ApplicationHandler<UserEvent> for WinitAppWrapper<T> {
                             viewport_id,
                             &event,
                         );
+                        Some((
+                            ordinal,
+                            matches!(event, winit::event::WindowEvent::Focused(_)),
+                        ))
+                    } else {
+                        None
+                    };
+                    let event_result = self.winit_app.window_event(event_loop, window_id, event);
+                    #[cfg(feature = "native-host-seam")]
+                    if let Some((ordinal, true)) = native_event {
+                        self.native_host.observe_global_focus(
+                            self.winit_app.egui_ctx(),
+                            ordinal,
+                            self.winit_app.focused_native_viewport(),
+                        );
                     }
-                    self.winit_app.window_event(event_loop, window_id, event)
+                    event_result
                 }
             };
 

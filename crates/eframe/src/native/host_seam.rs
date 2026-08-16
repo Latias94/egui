@@ -527,6 +527,77 @@ impl NativeWindowEvent<'_> {
     }
 }
 
+/// Globally consistent native focus after eframe applies one focus event.
+///
+/// `Unknown` means eframe cannot prove which native window owns focus. In
+/// particular, losing focus to another process must not be reported as an
+/// authoritative no-focus state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NativeGlobalFocus {
+    /// One exact eframe viewport owns native focus.
+    Viewport {
+        /// Focused eframe viewport.
+        viewport_id: ViewportId,
+        /// Exact native window attached to the focused viewport.
+        window_id: WindowId,
+    },
+    /// Eframe cannot prove the globally focused native window.
+    Unknown,
+}
+
+/// One focus observation causally paired with a native focus event.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NativeGlobalFocusObservation {
+    event: NativeEventOrdinal,
+    focused: NativeGlobalFocus,
+}
+
+impl NativeGlobalFocusObservation {
+    /// Returns the event ordinal which produced this observation.
+    pub const fn event(self) -> NativeEventOrdinal {
+        self.event
+    }
+
+    /// Returns the globally focused viewport fact.
+    pub const fn focused(self) -> NativeGlobalFocus {
+        self.focused
+    }
+}
+
+/// Result of consuming one exact viewport focus command.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NativeViewportFocusStatus {
+    /// The target window was already focused when the command was consumed.
+    AlreadyFocused,
+    /// Eframe dispatched the platform focus request and awaits a native event.
+    Requested,
+}
+
+/// Exact viewport focus command consumed by eframe.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NativeViewportFocusResult {
+    viewport_id: ViewportId,
+    window_id: WindowId,
+    status: NativeViewportFocusStatus,
+}
+
+impl NativeViewportFocusResult {
+    /// Returns the target eframe viewport.
+    pub const fn viewport_id(self) -> ViewportId {
+        self.viewport_id
+    }
+
+    /// Returns the exact target native window.
+    pub const fn window_id(self) -> WindowId {
+        self.window_id
+    }
+
+    /// Returns whether the command observed focus or requested it.
+    pub const fn status(self) -> NativeViewportFocusStatus {
+        self.status
+    }
+}
+
 /// External native coordinator callbacks.
 ///
 /// Implementations must copy any retained facts during the callback. Borrowed winit values remain
@@ -564,6 +635,16 @@ pub trait NativeHostHandler: Send + Sync + 'static {
 
     /// Observes one window event before egui-winit translates it.
     fn on_window_event(&self, _event: NativeWindowEvent<'_>) {}
+
+    /// Observes globally consistent focus after eframe applies one focus event.
+    fn on_global_focus(&self, _observation: NativeGlobalFocusObservation) -> NativeHostWake {
+        NativeHostWake::Wait
+    }
+
+    /// Reports that eframe consumed one exact viewport focus command.
+    fn on_viewport_focus(&self, _result: NativeViewportFocusResult) -> NativeHostWake {
+        NativeHostWake::Wait
+    }
 
     /// Announces the output token before the viewport UI callback runs.
     ///
@@ -706,6 +787,31 @@ impl NativeHostState {
             event,
         });
         if let Some(ctx) = ctx {
+            ctx.request_repaint_of(ViewportId::ROOT);
+        }
+    }
+
+    pub(crate) fn observe_global_focus(
+        &self,
+        ctx: Option<&egui::Context>,
+        event: NativeEventOrdinal,
+        focused: Option<(ViewportId, WindowId)>,
+    ) {
+        let Some(inner) = &self.inner else {
+            return;
+        };
+        let focused = focused.map_or(NativeGlobalFocus::Unknown, |(viewport_id, window_id)| {
+            NativeGlobalFocus::Viewport {
+                viewport_id,
+                window_id,
+            }
+        });
+        if inner
+            .handler
+            .on_global_focus(NativeGlobalFocusObservation { event, focused })
+            == NativeHostWake::RepaintRoot
+            && let Some(ctx) = ctx
+        {
             ctx.request_repaint_of(ViewportId::ROOT);
         }
     }
@@ -939,6 +1045,13 @@ impl NativeHostState {
                 egui::ViewportCommand::Visible(visible) => Some(visible),
                 _ => None,
             };
+            let requested_focus = matches!(command, egui::ViewportCommand::Focus).then(|| {
+                if window.has_focus() {
+                    NativeViewportFocusStatus::AlreadyFocused
+                } else {
+                    NativeViewportFocusStatus::Requested
+                }
+            });
             egui_winit::process_viewport_commands(
                 ctx,
                 info,
@@ -949,6 +1062,29 @@ impl NativeHostState {
             if let Some(visible) = requested_visibility {
                 self.notify_viewport_visibility(ctx, viewport_id, window, visible);
             }
+            if let Some(status) = requested_focus {
+                self.notify_viewport_focus(ctx, viewport_id, window.id(), status);
+            }
+        }
+    }
+
+    fn notify_viewport_focus(
+        &self,
+        ctx: &egui::Context,
+        viewport_id: ViewportId,
+        window_id: WindowId,
+        status: NativeViewportFocusStatus,
+    ) {
+        let Some(inner) = &self.inner else {
+            return;
+        };
+        if inner.handler.on_viewport_focus(NativeViewportFocusResult {
+            viewport_id,
+            window_id,
+            status,
+        }) == NativeHostWake::RepaintRoot
+        {
+            ctx.request_repaint_of(ViewportId::ROOT);
         }
     }
 }
@@ -1212,6 +1348,8 @@ mod tests {
         create_failures: Mutex<Vec<NativeViewportCreateFailure>>,
         visibility_results: Mutex<Vec<NativeViewportVisibilityResult>>,
         viewport_close_cancellations: Mutex<Vec<NativeViewportCloseRequest>>,
+        global_focus_observations: Mutex<Vec<NativeGlobalFocusObservation>>,
+        viewport_focus_results: Mutex<Vec<NativeViewportFocusResult>>,
         create_attempts: Mutex<Vec<NativeViewportCreateAttempt>>,
         deferred_rect: Mutex<Option<(ViewportId, NativePhysicalRect)>>,
         deferred_viewport: Mutex<Option<ViewportId>>,
@@ -1254,6 +1392,16 @@ mod tests {
                 event.viewport_id(),
                 facts,
             ));
+        }
+
+        fn on_global_focus(&self, observation: NativeGlobalFocusObservation) -> NativeHostWake {
+            self.global_focus_observations.lock().push(observation);
+            self.wake
+        }
+
+        fn on_viewport_focus(&self, result: NativeViewportFocusResult) -> NativeHostWake {
+            self.viewport_focus_results.lock().push(result);
+            self.wake
         }
 
         fn on_output(&self, result: NativeOutputResult) -> NativeHostWake {
@@ -1333,6 +1481,65 @@ mod tests {
         assert_eq!(requests[0].event().get(), 2);
         assert_eq!(requests[0].viewport_id(), child_viewport);
         assert_eq!(requests[0].window_id(), child_window);
+    }
+
+    #[test]
+    fn global_focus_callback_preserves_event_and_exact_window() {
+        let host = Arc::new(RecordingHost::default());
+        let handler: Arc<dyn NativeHostHandler> = Arc::<RecordingHost>::clone(&host);
+        let state = NativeHostState::new(Some(handler));
+        let child_viewport = ViewportId::from_hash_of("focused-child");
+        let child_window = WindowId::from(17);
+        let ctx = egui::Context::default();
+
+        state.observe_global_focus(
+            Some(&ctx),
+            NativeEventOrdinal(NonZeroU64::new(4).expect("test ordinal is non-zero")),
+            Some((child_viewport, child_window)),
+        );
+        state.observe_global_focus(
+            Some(&ctx),
+            NativeEventOrdinal(NonZeroU64::new(5).expect("test ordinal is non-zero")),
+            None,
+        );
+
+        let observations = host.global_focus_observations.lock();
+        assert_eq!(observations.len(), 2);
+        assert_eq!(observations[0].event().get(), 4);
+        assert_eq!(
+            observations[0].focused(),
+            NativeGlobalFocus::Viewport {
+                viewport_id: child_viewport,
+                window_id: child_window,
+            }
+        );
+        assert_eq!(observations[1].event().get(), 5);
+        assert_eq!(observations[1].focused(), NativeGlobalFocus::Unknown);
+    }
+
+    #[test]
+    fn viewport_focus_callback_reports_command_consumption() {
+        let host = Arc::new(RecordingHost::default());
+        let handler: Arc<dyn NativeHostHandler> = Arc::<RecordingHost>::clone(&host);
+        let state = NativeHostState::new(Some(handler));
+        let child_viewport = ViewportId::from_hash_of("focus-command-child");
+        let child_window = WindowId::from(19);
+
+        state.notify_viewport_focus(
+            &egui::Context::default(),
+            child_viewport,
+            child_window,
+            NativeViewportFocusStatus::AlreadyFocused,
+        );
+
+        let results = host.viewport_focus_results.lock();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].viewport_id(), child_viewport);
+        assert_eq!(results[0].window_id(), child_window);
+        assert_eq!(
+            results[0].status(),
+            NativeViewportFocusStatus::AlreadyFocused
+        );
     }
 
     #[test]
