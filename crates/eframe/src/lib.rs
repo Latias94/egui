@@ -209,10 +209,11 @@ pub use native::host_seam::{
     NativeOutputToken, NativePhysicalRect, NativeViewportCloseRequest,
     NativeViewportCreateAdmission, NativeViewportCreateAttempt, NativeViewportCreateFailure,
     NativeViewportCreateFailureKind, NativeViewportFocusResult, NativeViewportFocusStatus,
-    NativeViewportPointerPassthroughResult, NativeViewportPointerPassthroughStatus,
-    NativeViewportRecord, NativeViewportRoster, NativeViewportVisibilityResult,
-    NativeViewportVisibilityStatus, NativeWindowEvent, NativeWindowSnapshot, NativeWorkAreaRecord,
-    NativeWorkAreaRoster, current_native_output_token,
+    NativeViewportPointerPassthroughCommandToken, NativeViewportPointerPassthroughResult,
+    NativeViewportPointerPassthroughStatus, NativeViewportRecord, NativeViewportRoster,
+    NativeViewportVisibilityResult, NativeViewportVisibilityStatus, NativeWindowEvent,
+    NativeWindowSnapshot, NativeWorkAreaRecord, NativeWorkAreaRoster, current_native_output_token,
+    queue_native_viewport_pointer_passthrough,
 };
 
 #[cfg(not(any(target_arch = "wasm32", target_os = "ios")))]

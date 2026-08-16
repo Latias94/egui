@@ -5,7 +5,7 @@
 //! translation and receives terminal presentation results for context-local output tokens.
 
 use std::cell::RefCell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::num::NonZeroU64;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -22,6 +22,7 @@ use work_area::OwnedNativeWorkAreaRoster;
 pub use work_area::{NativeDisplayId, NativeWorkAreaRecord, NativeWorkAreaRoster};
 
 static NEXT_CONTEXT_ID: AtomicU64 = AtomicU64::new(1);
+static NEXT_POINTER_PASSTHROUGH_COMMAND: AtomicU64 = AtomicU64::new(1);
 
 thread_local! {
     static ACTIVE_OUTPUTS: RefCell<Vec<NativeOutputToken>> = const { RefCell::new(Vec::new()) };
@@ -609,9 +610,14 @@ pub enum NativeViewportPointerPassthroughStatus {
     Failed,
 }
 
+/// Opaque identity for one host-owned pointer pass-through command.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct NativeViewportPointerPassthroughCommandToken(NonZeroU64);
+
 /// Exact pointer pass-through command result for one native viewport.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct NativeViewportPointerPassthroughResult {
+    token: NativeViewportPointerPassthroughCommandToken,
     viewport_id: ViewportId,
     window_id: WindowId,
     enabled: bool,
@@ -619,6 +625,11 @@ pub struct NativeViewportPointerPassthroughResult {
 }
 
 impl NativeViewportPointerPassthroughResult {
+    /// Returns the exact host command which produced this result.
+    pub const fn token(self) -> NativeViewportPointerPassthroughCommandToken {
+        self.token
+    }
+
     /// Returns the target eframe viewport.
     pub const fn viewport_id(self) -> ViewportId {
         self.viewport_id
@@ -638,6 +649,70 @@ impl NativeViewportPointerPassthroughResult {
     pub const fn status(self) -> NativeViewportPointerPassthroughStatus {
         self.status
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct QueuedNativeViewportPointerPassthroughCommand {
+    token: NativeViewportPointerPassthroughCommandToken,
+    enabled: bool,
+}
+
+#[derive(Clone, Default)]
+struct QueuedNativeViewportPointerPassthroughCommands(
+    BTreeMap<ViewportId, VecDeque<QueuedNativeViewportPointerPassthroughCommand>>,
+);
+
+fn pointer_passthrough_commands_id() -> egui::Id {
+    egui::Id::new("eframe::native_host::pointer_passthrough_commands")
+}
+
+/// Queues one host-owned pointer pass-through command for an exact viewport.
+///
+/// Ordinary [`egui::ViewportCommand::MousePassthrough`] commands remain application-owned and do
+/// not produce [`NativeHostHandler::on_viewport_pointer_passthrough`] callbacks. This dedicated
+/// path returns an opaque token which is echoed by the terminal callback, so a native coordinator
+/// cannot accidentally consume an unrelated same-value application command.
+pub fn queue_native_viewport_pointer_passthrough(
+    ctx: &egui::Context,
+    viewport_id: ViewportId,
+    enabled: bool,
+) -> NativeViewportPointerPassthroughCommandToken {
+    let token = NativeViewportPointerPassthroughCommandToken(next_non_zero(
+        &NEXT_POINTER_PASSTHROUGH_COMMAND,
+        "native pointer pass-through command identity exhausted",
+    ));
+    ctx.data_mut(|data| {
+        data.get_temp_mut_or_default::<QueuedNativeViewportPointerPassthroughCommands>(
+            pointer_passthrough_commands_id(),
+        )
+        .0
+        .entry(viewport_id)
+        .or_default()
+        .push_back(QueuedNativeViewportPointerPassthroughCommand { token, enabled });
+    });
+
+    // Ensure the target viewport participates in platform-output processing. The ordinary command
+    // is intentionally callback-free; the host-owned command is applied last and supplies the
+    // exact terminal result.
+    ctx.send_viewport_cmd_to(
+        viewport_id,
+        egui::ViewportCommand::MousePassthrough(enabled),
+    );
+    token
+}
+
+fn take_native_viewport_pointer_passthrough_commands(
+    ctx: &egui::Context,
+    viewport_id: ViewportId,
+) -> VecDeque<QueuedNativeViewportPointerPassthroughCommand> {
+    ctx.data_mut(|data| {
+        data.get_temp_mut_or_default::<QueuedNativeViewportPointerPassthroughCommands>(
+            pointer_passthrough_commands_id(),
+        )
+        .0
+        .remove(&viewport_id)
+        .unwrap_or_default()
+    })
 }
 
 /// External native coordinator callbacks.
@@ -1102,29 +1177,6 @@ impl NativeHostState {
                     NativeViewportFocusStatus::Requested
                 }
             });
-            if self.is_enabled()
-                && let egui::ViewportCommand::MousePassthrough(enabled) = command
-            {
-                let status = match window.set_cursor_hittest(!enabled) {
-                    Ok(()) => NativeViewportPointerPassthroughStatus::Applied,
-                    Err(winit::error::ExternalError::NotSupported(_)) => {
-                        NativeViewportPointerPassthroughStatus::Unsupported
-                    }
-                    Err(
-                        winit::error::ExternalError::Ignored | winit::error::ExternalError::Os(_),
-                    ) => NativeViewportPointerPassthroughStatus::Failed,
-                };
-                self.notify_viewport_pointer_passthrough(
-                    ctx,
-                    NativeViewportPointerPassthroughResult {
-                        viewport_id,
-                        window_id: window.id(),
-                        enabled,
-                        status,
-                    },
-                );
-                continue;
-            }
             egui_winit::process_viewport_commands(
                 ctx,
                 info,
@@ -1138,6 +1190,28 @@ impl NativeHostState {
             if let Some(status) = requested_focus {
                 self.notify_viewport_focus(ctx, viewport_id, window.id(), status);
             }
+        }
+
+        for command in take_native_viewport_pointer_passthrough_commands(ctx, viewport_id) {
+            let status = match window.set_cursor_hittest(!command.enabled) {
+                Ok(()) => NativeViewportPointerPassthroughStatus::Applied,
+                Err(winit::error::ExternalError::NotSupported(_)) => {
+                    NativeViewportPointerPassthroughStatus::Unsupported
+                }
+                Err(winit::error::ExternalError::Ignored | winit::error::ExternalError::Os(_)) => {
+                    NativeViewportPointerPassthroughStatus::Failed
+                }
+            };
+            self.notify_viewport_pointer_passthrough(
+                ctx,
+                NativeViewportPointerPassthroughResult {
+                    token: command.token,
+                    viewport_id,
+                    window_id: window.id(),
+                    enabled: command.enabled,
+                    status,
+                },
+            );
         }
     }
 
@@ -1644,12 +1718,15 @@ mod tests {
         let host = Arc::new(RecordingHost::default());
         let handler: Arc<dyn NativeHostHandler> = Arc::<RecordingHost>::clone(&host);
         let state = NativeHostState::new(Some(handler));
+        let context = egui::Context::default();
         let child_viewport = ViewportId::from_hash_of("pointer-passthrough-child");
         let child_window = WindowId::from(23);
+        let token = queue_native_viewport_pointer_passthrough(&context, child_viewport, true);
 
         state.notify_viewport_pointer_passthrough(
-            &egui::Context::default(),
+            &context,
             NativeViewportPointerPassthroughResult {
+                token,
                 viewport_id: child_viewport,
                 window_id: child_window,
                 enabled: true,
@@ -1659,12 +1736,51 @@ mod tests {
 
         let results = host.viewport_pointer_passthrough_results.lock();
         assert_eq!(results.len(), 1);
+        assert_eq!(results[0].token(), token);
         assert_eq!(results[0].viewport_id(), child_viewport);
         assert_eq!(results[0].window_id(), child_window);
         assert!(results[0].enabled());
         assert_eq!(
             results[0].status(),
             NativeViewportPointerPassthroughStatus::Applied
+        );
+    }
+
+    #[test]
+    fn pointer_passthrough_host_commands_keep_exact_tokens_and_viewport_order() {
+        let context = egui::Context::default();
+        let first_viewport = ViewportId::from_hash_of("pointer-passthrough-first");
+        let second_viewport = ViewportId::from_hash_of("pointer-passthrough-second");
+        let first = queue_native_viewport_pointer_passthrough(&context, first_viewport, true);
+        let other = queue_native_viewport_pointer_passthrough(&context, second_viewport, true);
+        let second = queue_native_viewport_pointer_passthrough(&context, first_viewport, false);
+
+        let first_commands =
+            take_native_viewport_pointer_passthrough_commands(&context, first_viewport);
+        assert_eq!(
+            first_commands.into_iter().collect::<Vec<_>>(),
+            [
+                QueuedNativeViewportPointerPassthroughCommand {
+                    token: first,
+                    enabled: true,
+                },
+                QueuedNativeViewportPointerPassthroughCommand {
+                    token: second,
+                    enabled: false,
+                },
+            ]
+        );
+        assert_eq!(
+            take_native_viewport_pointer_passthrough_commands(&context, second_viewport)
+                .into_iter()
+                .collect::<Vec<_>>(),
+            [QueuedNativeViewportPointerPassthroughCommand {
+                token: other,
+                enabled: true,
+            }]
+        );
+        assert!(
+            take_native_viewport_pointer_passthrough_commands(&context, first_viewport).is_empty()
         );
     }
 
