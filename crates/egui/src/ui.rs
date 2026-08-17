@@ -933,6 +933,24 @@ impl Ui {
         )
     }
 
+    /// Registers one product-owned scroll receiver candidate for completed-pass hit testing.
+    ///
+    /// The rectangle is clipped to this [`Ui`] and retained only for the current pass. This
+    /// sidecar registration does not create a widget or change ordinary click, drag, or hover
+    /// routing. Register candidates in the same order they are painted so later overlapping
+    /// candidates remain frontmost.
+    #[must_use]
+    pub fn register_scroll_hit_candidate(&self, rect: Rect, id: Id) -> crate::WidgetHitIdentity {
+        let candidate = crate::WidgetHitIdentity::new(id, self.layer_id());
+        let rect = self.clip_rect().intersect(rect);
+        self.ctx().pass_state_mut(|state| {
+            state
+                .scroll_hits
+                .register_candidate(rect, candidate, self.enabled);
+        });
+        candidate
+    }
+
     /// Read the [`Ui`]'s background [`Response`].
     /// Its [`Sense`] will be based on the [`UiBuilder::sense`] used to create this [`Ui`].
     ///

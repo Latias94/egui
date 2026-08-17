@@ -701,6 +701,8 @@ struct Prepared {
     /// not for us to handle so we save it and restore it after this [`ScrollArea`] is done.
     saved_scroll_target: [Option<pass_state::ScrollTarget>; 2],
 
+    scroll_hit_registration: crate::hit_test::WidgetScrollHitRegistration,
+
     /// The response from dragging the background (if enabled)
     background_drag_response: Option<Response>,
 
@@ -738,6 +740,8 @@ impl ScrollArea {
             "ScrollArea",
         );
         let mut state = State::load(&ctx, id).unwrap_or_default();
+        let scroll_hit_registration =
+            ctx.pass_state_mut(|state| state.scroll_hits.reserve_scroll_area(ui.layer_id()));
 
         state.offset.x = offset_x.unwrap_or(state.offset.x);
         state.offset.y = offset_y.unwrap_or(state.offset.y);
@@ -948,6 +952,7 @@ impl ScrollArea {
             wheel_scroll_multiplier,
             stick_to_end,
             saved_scroll_target,
+            scroll_hit_registration,
             background_drag_response,
             animated,
         }
@@ -1075,6 +1080,7 @@ impl Prepared {
             wheel_scroll_multiplier,
             stick_to_end,
             saved_scroll_target,
+            scroll_hit_registration,
             background_drag_response,
             animated,
         } = self;
@@ -1216,25 +1222,24 @@ impl Prepared {
             && ui.ctx().dragged_id().is_none()
             || is_dragging_background;
 
+        let always_scroll_enabled_direction = ui.style().always_scroll_the_only_direction
+            && direction_enabled[0] != direction_enabled[1];
+        let live_scroll_hit_state = crate::hit_test::ScrollAreaScrollHitState::new(
+            direction_enabled,
+            state.offset,
+            max_offset,
+            wheel_scroll_multiplier,
+            always_scroll_enabled_direction,
+        );
+
         if scroll_source.mouse_wheel && ui.is_enabled() && is_hovering_outer_rect {
-            let always_scroll_enabled_direction = ui.style().always_scroll_the_only_direction
-                && direction_enabled[0] != direction_enabled[1];
             for d in 0..2 {
                 if direction_enabled[d] {
                     let scroll_delta = ui.input(|input| {
-                        if always_scroll_enabled_direction {
-                            // no bidirectional scrolling; allow horizontal scrolling without pressing shift
-                            input.smooth_scroll_delta()[0] + input.smooth_scroll_delta()[1]
-                        } else {
-                            input.smooth_scroll_delta()[d]
-                        }
+                        live_scroll_hit_state.live_scroll_delta(input.smooth_scroll_delta(), d)
                     });
-                    let scroll_delta = scroll_delta * wheel_scroll_multiplier[d];
 
-                    let scrolling_up = state.offset[d] > 0.0 && scroll_delta > 0.0;
-                    let scrolling_down = state.offset[d] < max_offset[d] && scroll_delta < 0.0;
-
-                    if scrolling_up || scrolling_down {
+                    if live_scroll_hit_state.accepts_live_axis(d, scroll_delta) {
                         state.offset[d] -= scroll_delta;
 
                         // Clear scroll delta so no parent scroll will use it:
@@ -1552,6 +1557,23 @@ impl Prepared {
         state.show_scroll = show_scroll_this_frame;
         state.content_is_too_large = content_is_too_large;
         state.interact_rect = Some(inner_rect);
+
+        let scroll_hit_state = crate::hit_test::ScrollAreaScrollHitState::new(
+            direction_enabled,
+            state.offset,
+            max_offset,
+            wheel_scroll_multiplier,
+            always_scroll_enabled_direction,
+        );
+        let scroll_hit_rect = ui.clip_rect().intersect(outer_rect);
+        ui.ctx().pass_state_mut(|pass_state| {
+            pass_state.scroll_hits.finish_scroll_area(
+                scroll_hit_registration,
+                scroll_hit_rect,
+                scroll_source.mouse_wheel && ui.is_enabled(),
+                scroll_hit_state,
+            );
+        });
 
         state.store(ui.ctx(), id);
 

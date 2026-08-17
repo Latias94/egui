@@ -192,6 +192,9 @@ pub struct PassState {
     /// All widgets produced this pass.
     pub widgets: WidgetRects,
 
+    /// Scroll receiver candidates and framework scroll areas produced this pass.
+    pub(crate) scroll_hits: crate::hit_test::WidgetScrollHitRecords,
+
     /// Per-layer state.
     ///
     /// Not all layers registers themselves there though.
@@ -237,6 +240,7 @@ impl Default for PassState {
         Self {
             used_ids: Default::default(),
             widgets: Default::default(),
+            scroll_hits: Default::default(),
             layers: Default::default(),
             tooltips: Default::default(),
             root_ui_available_rect: None,
@@ -258,6 +262,7 @@ impl PassState {
         let Self {
             used_ids,
             widgets,
+            scroll_hits,
             tooltips,
             layers,
             root_ui_available_rect,
@@ -273,6 +278,7 @@ impl PassState {
 
         used_ids.clear();
         widgets.clear();
+        scroll_hits.clear();
         tooltips.clear();
         layers.clear();
         *root_ui_available_rect = None;

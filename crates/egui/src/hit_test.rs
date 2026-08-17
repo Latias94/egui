@@ -2,7 +2,7 @@ use ahash::HashMap;
 
 use emath::TSTransform;
 
-use crate::{LayerId, Pos2, Sense, WidgetRect, WidgetRects, emath, id::IdSet};
+use crate::{LayerId, Pos2, Rect, Sense, Vec2, Vec2b, WidgetRect, WidgetRects, emath, id::IdSet};
 
 /// Opaque identity of one widget selected by a completed-pass hit test.
 ///
@@ -30,6 +30,10 @@ impl WidgetHitIdentity {
             id: widget.id,
             layer_id: widget.layer_id,
         }
+    }
+
+    pub(crate) const fn new(id: crate::Id, layer_id: LayerId) -> Self {
+        Self { id, layer_id }
     }
 }
 
@@ -78,6 +82,340 @@ impl WidgetHitSnapshot {
                 .copied()
                 .map(WidgetHitIdentity::from_widget),
         }
+    }
+}
+
+/// A finite scroll direction projected through the platform modifiers that
+/// apply to one native scroll edge.
+///
+/// The values are used for direction and axis admission only. Their units do
+/// not need to match egui points.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct WidgetScrollDelta {
+    x: f64,
+    y: f64,
+}
+
+impl WidgetScrollDelta {
+    /// Constructs a projected scroll direction, returning `None` for non-finite input.
+    #[must_use]
+    pub fn new(x: f64, y: f64) -> Option<Self> {
+        if x.is_finite() && y.is_finite() {
+            Some(Self { x, y })
+        } else {
+            None
+        }
+    }
+
+    /// Returns horizontal content movement.
+    #[must_use]
+    pub const fn x(self) -> f64 {
+        self.x
+    }
+
+    /// Returns vertical content movement.
+    #[must_use]
+    pub const fn y(self) -> f64 {
+        self.y
+    }
+}
+
+/// Scroll receiver requirement for one completed-pass hit test.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum WidgetScrollHitChallenge {
+    /// Resolve the frontmost receiver at the queried point.
+    Spatial {
+        /// Modifier-projected direction, when the edge carries a directional sample.
+        projected_delta: Option<WidgetScrollDelta>,
+    },
+
+    /// Prove that the candidate frozen at sequence start still owns delivery.
+    Locked {
+        /// Exact candidate identity frozen for the sequence.
+        receiver: WidgetHitIdentity,
+        /// Modifier-projected direction, when the edge carries a directional sample.
+        projected_delta: Option<WidgetScrollDelta>,
+    },
+}
+
+impl WidgetScrollHitChallenge {
+    /// Returns the projected direction used for receiver admission.
+    #[must_use]
+    pub const fn projected_delta(self) -> Option<WidgetScrollDelta> {
+        match self {
+            Self::Spatial { projected_delta }
+            | Self::Locked {
+                projected_delta, ..
+            } => projected_delta,
+        }
+    }
+
+    pub(crate) fn classify_candidate(
+        self,
+        candidate: WidgetHitIdentity,
+        presented_candidates: &[WidgetHitIdentity],
+    ) -> WidgetScrollHit {
+        let is_presented = presented_candidates.contains(&candidate);
+        match self {
+            Self::Spatial { .. } => {
+                if is_presented {
+                    WidgetScrollHit::Candidate(candidate)
+                } else {
+                    WidgetScrollHit::Blocked
+                }
+            }
+            Self::Locked { receiver, .. } => {
+                if candidate == receiver {
+                    if is_presented {
+                        WidgetScrollHit::Candidate(candidate)
+                    } else {
+                        WidgetScrollHit::Blocked
+                    }
+                } else if is_presented {
+                    WidgetScrollHit::NoReceiver
+                } else {
+                    WidgetScrollHit::Blocked
+                }
+            }
+        }
+    }
+}
+
+/// Authoritative scroll receiver result from one completed pass.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WidgetScrollHit {
+    /// The frontmost registered product candidate accepted the edge.
+    Candidate(WidgetHitIdentity),
+    /// A framework receiver or an unrecognized candidate blocked product delivery.
+    Blocked,
+    /// No receiver accepted the edge.
+    NoReceiver,
+}
+
+/// Result of a scroll hit test against one viewport's final completed pass.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WidgetScrollHitSnapshot {
+    cumulative_pass_nr: u64,
+    hit: WidgetScrollHit,
+}
+
+impl WidgetScrollHitSnapshot {
+    /// Returns the completed-pass generation used for this hit test.
+    #[must_use]
+    pub const fn cumulative_pass_nr(self) -> u64 {
+        self.cumulative_pass_nr
+    }
+
+    /// Returns the authoritative receiver result.
+    #[must_use]
+    pub const fn hit(self) -> WidgetScrollHit {
+        self.hit
+    }
+
+    pub(crate) const fn new(cumulative_pass_nr: u64, hit: WidgetScrollHit) -> Self {
+        Self {
+            cumulative_pass_nr,
+            hit,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct WidgetScrollHitRegistration(usize);
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum WidgetScrollHitRoute {
+    Candidate(WidgetHitIdentity),
+    Framework,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum WidgetScrollHitRecordKind {
+    Candidate(WidgetHitIdentity),
+    ScrollArea(ScrollAreaScrollHitState),
+    PendingScrollArea,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct WidgetScrollHitRecord {
+    layer_id: LayerId,
+    rect: Rect,
+    enabled: bool,
+    kind: WidgetScrollHitRecordKind,
+}
+
+impl WidgetScrollHitRecord {
+    pub(crate) const fn layer_id(self) -> LayerId {
+        self.layer_id
+    }
+
+    pub(crate) fn contains_global_position(
+        self,
+        position: Pos2,
+        layer_to_global: Option<emath::TSTransform>,
+    ) -> bool {
+        let rect = layer_to_global.map_or(self.rect, |to_global| to_global * self.rect);
+        rect.is_positive() && rect.is_finite() && rect.contains(position)
+    }
+
+    pub(crate) fn route(
+        self,
+        projected_delta: Option<WidgetScrollDelta>,
+    ) -> Option<WidgetScrollHitRoute> {
+        if !self.enabled {
+            return None;
+        }
+
+        match self.kind {
+            WidgetScrollHitRecordKind::Candidate(candidate) => {
+                Some(WidgetScrollHitRoute::Candidate(candidate))
+            }
+            WidgetScrollHitRecordKind::ScrollArea(state) => state
+                .accepts_projected_delta(projected_delta)
+                .then_some(WidgetScrollHitRoute::Framework),
+            WidgetScrollHitRecordKind::PendingScrollArea => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct WidgetScrollHitRecords {
+    records: Vec<WidgetScrollHitRecord>,
+}
+
+impl WidgetScrollHitRecords {
+    pub(crate) fn register_candidate(
+        &mut self,
+        rect: Rect,
+        candidate: WidgetHitIdentity,
+        enabled: bool,
+    ) {
+        self.records.push(WidgetScrollHitRecord {
+            layer_id: candidate.layer_id(),
+            rect,
+            enabled,
+            kind: WidgetScrollHitRecordKind::Candidate(candidate),
+        });
+    }
+
+    pub(crate) fn reserve_scroll_area(&mut self, layer_id: LayerId) -> WidgetScrollHitRegistration {
+        let registration = WidgetScrollHitRegistration(self.records.len());
+        self.records.push(WidgetScrollHitRecord {
+            layer_id,
+            rect: Rect::NOTHING,
+            enabled: false,
+            kind: WidgetScrollHitRecordKind::PendingScrollArea,
+        });
+        registration
+    }
+
+    pub(crate) fn finish_scroll_area(
+        &mut self,
+        registration: WidgetScrollHitRegistration,
+        rect: Rect,
+        enabled: bool,
+        state: ScrollAreaScrollHitState,
+    ) {
+        debug_assert!(
+            registration.0 < self.records.len(),
+            "scroll-area hit registration must belong to this pass"
+        );
+        let Some(record) = self.records.get_mut(registration.0) else {
+            return;
+        };
+        debug_assert!(
+            matches!(record.kind, WidgetScrollHitRecordKind::PendingScrollArea),
+            "scroll-area hit registration must be completed exactly once"
+        );
+        record.rect = rect;
+        record.enabled = enabled;
+        record.kind = WidgetScrollHitRecordKind::ScrollArea(state);
+    }
+
+    pub(crate) fn front_to_back(&self) -> impl Iterator<Item = WidgetScrollHitRecord> + '_ {
+        self.records.iter().rev().copied()
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.records.clear();
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ScrollAreaScrollHitState {
+    direction_enabled: Vec2b,
+    offset: Vec2,
+    max_offset: Vec2,
+    wheel_scroll_multiplier: Vec2,
+    always_scroll_enabled_direction: bool,
+}
+
+impl ScrollAreaScrollHitState {
+    pub(crate) const fn new(
+        direction_enabled: Vec2b,
+        offset: Vec2,
+        max_offset: Vec2,
+        wheel_scroll_multiplier: Vec2,
+        always_scroll_enabled_direction: bool,
+    ) -> Self {
+        Self {
+            direction_enabled,
+            offset,
+            max_offset,
+            wheel_scroll_multiplier,
+            always_scroll_enabled_direction,
+        }
+    }
+
+    pub(crate) fn live_scroll_delta(self, input_delta: Vec2, axis: usize) -> f32 {
+        let projected_delta = if self.always_scroll_enabled_direction {
+            input_delta.x + input_delta.y
+        } else {
+            input_delta[axis]
+        };
+        projected_delta * self.wheel_scroll_multiplier[axis]
+    }
+
+    pub(crate) fn accepts_live_axis(self, axis: usize, scroll_delta: f32) -> bool {
+        self.accepts_axis(axis, f64::from(scroll_delta))
+    }
+
+    fn accepts_projected_delta(self, projected_delta: Option<WidgetScrollDelta>) -> bool {
+        match projected_delta {
+            Some(projected_delta) => (0..2).any(|axis| {
+                let projected_delta = if self.always_scroll_enabled_direction {
+                    projected_delta.x + projected_delta.y
+                } else if axis == 0 {
+                    projected_delta.x
+                } else {
+                    projected_delta.y
+                };
+                let scroll_delta = projected_delta * f64::from(self.wheel_scroll_multiplier[axis]);
+                self.accepts_axis(axis, scroll_delta)
+            }),
+            None => (0..2).any(|axis| self.has_potential_capacity(axis)),
+        }
+    }
+
+    fn accepts_axis(self, axis: usize, scroll_delta: f64) -> bool {
+        if !self.direction_enabled[axis] {
+            return false;
+        }
+
+        let scrolling_up = self.offset[axis] > 0.0 && scroll_delta > 0.0;
+        let scrolling_down = self.offset[axis] < self.max_offset[axis] && scroll_delta < 0.0;
+        scrolling_up || scrolling_down
+    }
+
+    fn has_potential_capacity(self, axis: usize) -> bool {
+        if !self.direction_enabled[axis] {
+            return false;
+        }
+
+        let multiplier = self.wheel_scroll_multiplier[axis];
+        let multiplier_can_project = multiplier != 0.0 && !multiplier.is_nan();
+        multiplier_can_project
+            && (self.offset[axis] > 0.0 || self.offset[axis] < self.max_offset[axis])
     }
 }
 

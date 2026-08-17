@@ -1439,9 +1439,7 @@ impl Context {
         }
 
         self.read(|ctx| {
-            let Some(viewport) = ctx.viewports.get(&viewport_id) else {
-                return None;
-            };
+            let viewport = ctx.viewports.get(&viewport_id)?;
             let cumulative_pass_nr = viewport.repaint.cumulative_pass_nr;
             if cumulative_pass_nr == 0 {
                 return None;
@@ -1466,6 +1464,90 @@ impl Context {
                 cumulative_pass_nr,
                 &hits,
             ))
+        })
+    }
+
+    /// Hit-tests one scroll edge against the final completed pass of a viewport.
+    ///
+    /// Product candidates are registered explicitly with
+    /// [`Ui::register_scroll_hit_candidate`]. Framework [`crate::ScrollArea`]s participate
+    /// automatically and reuse their ordinary wheel direction and saturation rules. The query
+    /// uses exact clipped rectangles and layer occlusion; it does not use pointer proximity or
+    /// mutate egui input state.
+    ///
+    /// `presented_candidates` must contain only identities bound to the exact presented output
+    /// being queried. An unrecognized frontmost candidate and a framework scroll receiver both
+    /// produce [`crate::WidgetScrollHit::Blocked`].
+    ///
+    /// Returns `None` when the viewport has not completed a pass or the point is not finite.
+    /// [`crate::WidgetScrollHit::NoReceiver`] is authoritative known-empty evidence.
+    #[must_use]
+    pub fn scroll_hit_test_last_pass(
+        &self,
+        viewport_id: ViewportId,
+        position: Pos2,
+        presented_candidates: &[crate::WidgetHitIdentity],
+        challenge: crate::WidgetScrollHitChallenge,
+    ) -> Option<crate::WidgetScrollHitSnapshot> {
+        if !position.is_finite() {
+            return None;
+        }
+
+        self.read(|ctx| {
+            let viewport = ctx.viewports.get(&viewport_id)?;
+            let cumulative_pass_nr = viewport.repaint.cumulative_pass_nr;
+            if cumulative_pass_nr == 0 {
+                return None;
+            }
+
+            let top_layer = ctx.memory.layer_id_at(position);
+            let projected_delta = challenge.projected_delta();
+            let mut selected_route = None;
+            let mut eligible_route_was_occluded = false;
+
+            for record in viewport.prev_pass.scroll_hits.front_to_back() {
+                let layer_id = record.layer_id();
+                if !layer_id.order.allow_interaction()
+                    || !ctx.memory.areas().is_interactable(layer_id)
+                {
+                    continue;
+                }
+
+                let to_global = ctx.memory.to_global.get(&layer_id).copied();
+                if !record.contains_global_position(position, to_global) {
+                    continue;
+                }
+                let Some(route) = record.route(projected_delta) else {
+                    continue;
+                };
+
+                if top_layer == Some(layer_id) {
+                    selected_route = Some(route);
+                    break;
+                }
+
+                if let Some(top_layer) = top_layer
+                    && matches!(
+                        ctx.memory.areas().compare_order(layer_id, top_layer),
+                        core::cmp::Ordering::Less
+                    )
+                {
+                    eligible_route_was_occluded = true;
+                }
+            }
+
+            let hit = match selected_route {
+                Some(crate::hit_test::WidgetScrollHitRoute::Candidate(candidate)) => {
+                    challenge.classify_candidate(candidate, presented_candidates)
+                }
+                Some(crate::hit_test::WidgetScrollHitRoute::Framework) => {
+                    crate::WidgetScrollHit::Blocked
+                }
+                None if eligible_route_was_occluded => crate::WidgetScrollHit::Blocked,
+                None => crate::WidgetScrollHit::NoReceiver,
+            };
+
+            Some(crate::WidgetScrollHitSnapshot::new(cumulative_pass_nr, hit))
         })
     }
 
@@ -4428,12 +4510,25 @@ fn warn_if_rect_changes_id(
 #[cfg(test)]
 mod test {
     use super::Context;
-    use crate::{Id, LayerId, Pos2, RawInput, Rect, Sense, Vec2, ViewportId};
+    use crate::{
+        Id, LayerId, Pos2, RawInput, Rect, ScrollArea, Sense, UiBuilder, Vec2, ViewportId,
+        WidgetScrollDelta, WidgetScrollHit, WidgetScrollHitChallenge,
+    };
 
     fn test_input() -> RawInput {
         RawInput {
             screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::splat(128.0))),
             ..Default::default()
+        }
+    }
+
+    fn scroll_delta(x: f64, y: f64) -> WidgetScrollDelta {
+        WidgetScrollDelta::new(x, y).expect("test scroll deltas are finite")
+    }
+
+    fn spatial_scroll(x: f64, y: f64) -> WidgetScrollHitChallenge {
+        WidgetScrollHitChallenge::Spatial {
+            projected_delta: Some(scroll_delta(x, y)),
         }
     }
 
@@ -4493,6 +4588,217 @@ mod test {
         assert_eq!(click.layer_id(), LayerId::background());
         assert_eq!(drag.layer_id(), LayerId::background());
         assert_ne!(click.id(), first_id);
+    }
+
+    #[test]
+    fn last_pass_scroll_hit_distinguishes_unknown_from_known_empty() {
+        let ctx = Context::default();
+        let point = Pos2::new(16.0, 16.0);
+        let challenge = spatial_scroll(0.0, -1.0);
+
+        assert_eq!(
+            ctx.scroll_hit_test_last_pass(ViewportId::ROOT, point, &[], challenge),
+            None
+        );
+
+        let output = ctx.run_ui(test_input(), |_| {});
+        output.drop_without_applying_deltas();
+
+        let snapshot = ctx
+            .scroll_hit_test_last_pass(ViewportId::ROOT, point, &[], challenge)
+            .expect("the root viewport completed one pass");
+        assert_eq!(snapshot.cumulative_pass_nr(), 1);
+        assert_eq!(snapshot.hit(), WidgetScrollHit::NoReceiver);
+        assert_eq!(
+            ctx.scroll_hit_test_last_pass(
+                ViewportId::ROOT,
+                Pos2::new(f32::NAN, 0.0),
+                &[],
+                challenge,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn last_pass_scroll_hit_uses_the_final_multipass_candidates() {
+        let ctx = Context::default();
+        ctx.options_mut(|options| options.max_passes = 2.try_into().unwrap());
+
+        let first_id = Id::new("first-pass-scroll-candidate");
+        let final_id = Id::new("final-pass-scroll-candidate");
+        let rect = Rect::from_min_size(Pos2::new(8.0, 8.0), Vec2::splat(32.0));
+        let mut pass = 0;
+        let mut final_candidate = None;
+        let output = ctx.run_ui(test_input(), |ui| {
+            let id = if pass == 0 { first_id } else { final_id };
+            let candidate = ui.register_scroll_hit_candidate(rect, id);
+            if pass == 1 {
+                final_candidate = Some(candidate);
+            }
+            if pass == 0 {
+                ui.request_discard("verify completed-pass scroll hit testing");
+            }
+            pass += 1;
+        });
+        output.drop_without_applying_deltas();
+
+        assert_eq!(pass, 2);
+        let final_candidate = final_candidate.expect("the final pass registered a candidate");
+        let snapshot = ctx
+            .scroll_hit_test_last_pass(
+                ViewportId::ROOT,
+                rect.center(),
+                &[final_candidate],
+                spatial_scroll(0.0, -1.0),
+            )
+            .expect("the final pass completed");
+        assert_eq!(snapshot.cumulative_pass_nr(), 2);
+        assert_eq!(snapshot.hit(), WidgetScrollHit::Candidate(final_candidate));
+        assert_eq!(final_candidate.id(), final_id);
+        assert_ne!(final_candidate.id(), first_id);
+
+        let ordinary_hit = ctx
+            .hit_test_last_pass(ViewportId::ROOT, rect.center())
+            .expect("the final pass completed");
+        assert_eq!(ordinary_hit.click(), None);
+        assert_eq!(ordinary_hit.drag(), None);
+        assert_eq!(ordinary_hit.contains_pointer(), None);
+
+        let just_outside = Pos2::new(rect.right() + 1.0, rect.center().y);
+        let outside_hit = ctx
+            .scroll_hit_test_last_pass(
+                ViewportId::ROOT,
+                just_outside,
+                &[final_candidate],
+                spatial_scroll(0.0, -1.0),
+            )
+            .expect("the final pass completed");
+        assert_eq!(outside_hit.hit(), WidgetScrollHit::NoReceiver);
+    }
+
+    #[test]
+    fn nested_scroll_hit_respects_direction_and_saturation() {
+        let ctx = Context::default();
+        let mut inner_rect = Rect::NOTHING;
+        let output = ctx.run_ui(test_input(), |ui| {
+            ui.style_mut().always_scroll_the_only_direction = false;
+            let outer = ScrollArea::vertical()
+                .id_salt("outer-scroll-hit")
+                .max_height(96.0)
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    let inner = ScrollArea::horizontal()
+                        .id_salt("inner-scroll-hit")
+                        .max_width(80.0)
+                        .max_height(32.0)
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            ui.set_min_size(Vec2::new(240.0, 24.0));
+                        });
+                    inner_rect = inner.inner_rect;
+                    ui.add_space(120.0);
+                });
+            assert_eq!(outer.state.offset.y, 0.0);
+        });
+        output.drop_without_applying_deltas();
+
+        let point = inner_rect.center();
+        let horizontal = ctx
+            .scroll_hit_test_last_pass(ViewportId::ROOT, point, &[], spatial_scroll(-1.0, 0.0))
+            .expect("the final pass completed");
+        assert_eq!(horizontal.hit(), WidgetScrollHit::Blocked);
+
+        let saturated_up = ctx
+            .scroll_hit_test_last_pass(ViewportId::ROOT, point, &[], spatial_scroll(0.0, 1.0))
+            .expect("the final pass completed");
+        assert_eq!(saturated_up.hit(), WidgetScrollHit::NoReceiver);
+
+        let down = ctx
+            .scroll_hit_test_last_pass(ViewportId::ROOT, point, &[], spatial_scroll(0.0, -1.0))
+            .expect("the final pass completed");
+        assert_eq!(down.hit(), WidgetScrollHit::Blocked);
+    }
+
+    #[test]
+    fn smooth_scroll_begin_is_blocked_by_any_scroll_area_capacity() {
+        let ctx = Context::default();
+        let mut scroll_rect = Rect::NOTHING;
+        let output = ctx.run_ui(test_input(), |ui| {
+            let scroll = ScrollArea::vertical()
+                .id_salt("smooth-begin-scroll-hit")
+                .max_height(64.0)
+                .auto_shrink([false, false])
+                .show(ui, |ui| ui.set_min_height(192.0));
+            scroll_rect = scroll.inner_rect;
+        });
+        output.drop_without_applying_deltas();
+
+        let snapshot = ctx
+            .scroll_hit_test_last_pass(
+                ViewportId::ROOT,
+                scroll_rect.center(),
+                &[],
+                WidgetScrollHitChallenge::Spatial {
+                    projected_delta: None,
+                },
+            )
+            .expect("the final pass completed");
+        assert_eq!(snapshot.hit(), WidgetScrollHit::Blocked);
+    }
+
+    #[test]
+    fn locked_scroll_hit_does_not_retarget_and_framework_scroll_blocks() {
+        let ctx = Context::default();
+        let candidate_rect = Rect::from_min_size(Pos2::new(8.0, 8.0), Vec2::splat(32.0));
+        let framework_rect = Rect::from_min_size(Pos2::new(64.0, 8.0), Vec2::new(48.0, 64.0));
+        let locked_id = Id::new("locked-scroll-candidate");
+        let replacement_id = Id::new("replacement-scroll-candidate");
+        let mut locked = None;
+        let mut replacement = None;
+        let mut framework_scroll_rect = Rect::NOTHING;
+        let output = ctx.run_ui(test_input(), |ui| {
+            locked = Some(ui.register_scroll_hit_candidate(candidate_rect, locked_id));
+            replacement = Some(ui.register_scroll_hit_candidate(candidate_rect, replacement_id));
+
+            ui.scope_builder(UiBuilder::new().max_rect(framework_rect), |ui| {
+                let scroll = ScrollArea::vertical()
+                    .id_salt("framework-scroll-hit")
+                    .max_height(framework_rect.height())
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| ui.set_min_height(192.0));
+                framework_scroll_rect = scroll.inner_rect;
+            });
+        });
+        output.drop_without_applying_deltas();
+
+        let locked = locked.expect("locked candidate was registered");
+        let replacement = replacement.expect("replacement candidate was registered");
+        let candidates = [locked, replacement];
+        let challenge = WidgetScrollHitChallenge::Locked {
+            receiver: locked,
+            projected_delta: Some(scroll_delta(0.0, -1.0)),
+        };
+
+        let replacement_hit = ctx
+            .scroll_hit_test_last_pass(
+                ViewportId::ROOT,
+                candidate_rect.center(),
+                &candidates,
+                challenge,
+            )
+            .expect("the final pass completed");
+        assert_eq!(replacement_hit.hit(), WidgetScrollHit::NoReceiver);
+
+        let framework_hit = ctx
+            .scroll_hit_test_last_pass(
+                ViewportId::ROOT,
+                framework_scroll_rect.center(),
+                &candidates,
+                challenge,
+            )
+            .expect("the final pass completed");
+        assert_eq!(framework_hit.hit(), WidgetScrollHit::Blocked);
     }
 
     #[test]
