@@ -205,15 +205,15 @@ pub use native::run::EframeWinitApplication;
 #[cfg(feature = "native-host-seam")]
 pub use native::host_seam::{
     NativeDisplayId, NativeEventOrdinal, NativeGlobalFocus, NativeGlobalFocusObservation,
-    NativeHostHandler, NativeHostWake, NativeOutputOrdinal, NativeOutputResult, NativeOutputStatus,
-    NativeOutputToken, NativePhysicalRect, NativeViewportCloseRequest,
-    NativeViewportCreateAdmission, NativeViewportCreateAttempt, NativeViewportCreateFailure,
-    NativeViewportCreateFailureKind, NativeViewportFocusResult, NativeViewportFocusStatus,
-    NativeViewportPointerPassthroughCommandToken, NativeViewportPointerPassthroughResult,
-    NativeViewportPointerPassthroughStatus, NativeViewportRecord, NativeViewportRoster,
-    NativeViewportVisibilityResult, NativeViewportVisibilityStatus, NativeWindowEvent,
-    NativeWindowSnapshot, NativeWorkAreaRecord, NativeWorkAreaRoster, current_native_output_token,
-    queue_native_viewport_pointer_passthrough,
+    NativeHostAttachment, NativeHostHandler, NativeHostWake, NativeOutputOrdinal,
+    NativeOutputResult, NativeOutputStatus, NativeOutputToken, NativePhysicalRect,
+    NativeViewportCloseRequest, NativeViewportCreateAdmission, NativeViewportCreateAttempt,
+    NativeViewportCreateFailure, NativeViewportCreateFailureKind, NativeViewportFocusResult,
+    NativeViewportFocusStatus, NativeViewportPointerPassthroughCommandToken,
+    NativeViewportPointerPassthroughResult, NativeViewportPointerPassthroughStatus,
+    NativeViewportRecord, NativeViewportRoster, NativeViewportVisibilityResult,
+    NativeViewportVisibilityStatus, NativeWindowEvent, NativeWindowSnapshot, NativeWorkAreaRecord,
+    NativeWorkAreaRoster, current_native_output_token, queue_native_viewport_pointer_passthrough,
 };
 
 #[cfg(not(any(target_arch = "wasm32", target_os = "ios")))]

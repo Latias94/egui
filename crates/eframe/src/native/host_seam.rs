@@ -75,6 +75,22 @@ pub struct NativeOutputToken {
     create_attempt: Option<NativeViewportCreateAttempt>,
 }
 
+/// Opaque ownership identity for one eframe native-host attachment.
+///
+/// Eframe acquires this identity before it publishes any native callback and
+/// releases it after every clone of the matching native host state is gone.
+/// Handlers may use equality only to enforce exclusive attachment.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct NativeHostAttachment {
+    context: NonZeroU64,
+}
+
+impl core::fmt::Debug for NativeHostAttachment {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter.write_str("NativeHostAttachment(..)")
+    }
+}
+
 impl NativeOutputToken {
     /// Returns whether two output tokens were minted by the same native context.
     ///
@@ -722,6 +738,18 @@ fn take_native_viewport_pointer_passthrough_commands(
 /// viewports so native side effects remain outside application UI recursion. Callbacks run on the
 /// native event-loop thread and must not re-enter eframe.
 pub trait NativeHostHandler: Send + Sync + 'static {
+    /// Acquires exclusive ownership for one eframe native context.
+    ///
+    /// This runs before any native event, viewport, or output callback for the
+    /// context. Returning `false` rejects construction of that native host
+    /// state before the handler can observe or mutate callback state.
+    fn try_attach(&self, _attachment: NativeHostAttachment) -> bool {
+        true
+    }
+
+    /// Releases an attachment after every clone of its native host state is gone.
+    fn detach(&self, _attachment: NativeHostAttachment) {}
+
     /// Decides whether one exact deferred native-window attempt may proceed.
     ///
     /// The admission callback runs immediately before native window creation.
@@ -820,7 +848,7 @@ pub(crate) struct NativeHostState {
 
 struct NativeHostStateInner {
     handler: Arc<dyn NativeHostHandler>,
-    context: NonZeroU64,
+    attachment: NativeHostAttachment,
     next_token: AtomicU64,
     next_output: AtomicU64,
     next_create_attempt: AtomicU64,
@@ -855,10 +883,17 @@ impl NativeHostState {
         let Some(handler) = handler else {
             return Self::default();
         };
+        let attachment = NativeHostAttachment {
+            context: next_non_zero(&NEXT_CONTEXT_ID, "native context identity exhausted"),
+        };
+        assert!(
+            handler.try_attach(attachment),
+            "the native host is already attached to another eframe context"
+        );
         Self {
             inner: Some(Arc::new(NativeHostStateInner {
                 handler,
-                context: next_non_zero(&NEXT_CONTEXT_ID, "native context identity exhausted"),
+                attachment,
                 next_token: AtomicU64::new(1),
                 next_output: AtomicU64::new(1),
                 next_create_attempt: AtomicU64::new(1),
@@ -978,12 +1013,12 @@ impl NativeHostState {
         let inner = Arc::clone(self.inner.as_ref()?);
         debug_assert!(
             create_attempt.is_none_or(|attempt| {
-                attempt.context == inner.context && attempt.viewport_id == viewport_id
+                attempt.context == inner.attachment.context && attempt.viewport_id == viewport_id
             }),
             "native output attempt must belong to the producing context and viewport"
         );
         let token = NativeOutputToken {
-            context: inner.context,
+            context: inner.attachment.context,
             nonce: next_non_zero(&inner.next_token, "native output token exhausted"),
             viewport_id,
             window_id,
@@ -1038,7 +1073,7 @@ impl NativeHostState {
         }
 
         let create_attempt = NativeViewportCreateAttempt {
-            context: inner.context,
+            context: inner.attachment.context,
             nonce: next_non_zero(
                 &inner.next_create_attempt,
                 "native viewport create attempt exhausted",
@@ -1246,6 +1281,12 @@ impl NativeHostState {
         if inner.handler.on_viewport_pointer_passthrough(result) == NativeHostWake::RepaintRoot {
             ctx.request_repaint_of(ViewportId::ROOT);
         }
+    }
+}
+
+impl Drop for NativeHostStateInner {
+    fn drop(&mut self) {
+        self.handler.detach(self.attachment);
     }
 }
 
@@ -1518,6 +1559,33 @@ mod tests {
         wake: NativeHostWake,
     }
 
+    #[derive(Default)]
+    struct ExclusiveAttachmentHost {
+        attachment: Mutex<Option<NativeHostAttachment>>,
+        detachments: AtomicUsize,
+    }
+
+    impl NativeHostHandler for ExclusiveAttachmentHost {
+        fn try_attach(&self, attachment: NativeHostAttachment) -> bool {
+            let mut current = self.attachment.lock();
+            if current.is_some() {
+                return false;
+            }
+            *current = Some(attachment);
+            true
+        }
+
+        fn detach(&self, attachment: NativeHostAttachment) {
+            let mut current = self.attachment.lock();
+            if *current != Some(attachment) {
+                return;
+            }
+            *current = None;
+            self.detachments
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
     impl NativeHostHandler for RecordingHost {
         fn begin_deferred_viewport_create(
             &self,
@@ -1613,6 +1681,34 @@ mod tests {
             self.viewport_close_cancellations.lock().push(request);
             self.wake
         }
+    }
+
+    #[test]
+    fn native_host_attachment_is_exclusive_and_released_on_drop() {
+        let host = Arc::new(ExclusiveAttachmentHost::default());
+        let first_handler: Arc<dyn NativeHostHandler> =
+            Arc::<ExclusiveAttachmentHost>::clone(&host);
+        let first = NativeHostState::new(Some(first_handler));
+
+        let second_handler: Arc<dyn NativeHostHandler> =
+            Arc::<ExclusiveAttachmentHost>::clone(&host);
+        let rejected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = NativeHostState::new(Some(second_handler));
+        }));
+        assert!(
+            rejected.is_err(),
+            "a second live attachment must be rejected"
+        );
+        assert_eq!(host.detachments.load(Ordering::Relaxed), 0);
+
+        drop(first);
+        assert_eq!(host.detachments.load(Ordering::Relaxed), 1);
+
+        let third_handler: Arc<dyn NativeHostHandler> =
+            Arc::<ExclusiveAttachmentHost>::clone(&host);
+        let third = NativeHostState::new(Some(third_handler));
+        drop(third);
+        assert_eq!(host.detachments.load(Ordering::Relaxed), 2);
     }
 
     #[test]
