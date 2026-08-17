@@ -378,6 +378,28 @@ impl NativeViewportRecord {
 pub struct NativeViewportRoster<'a> {
     records: &'a [NativeViewportRecord],
     work_areas: NativeWorkAreaRoster<'a>,
+    backend: NativeWindowingBackend,
+}
+
+/// Native window-system backend which produced one exact root roster.
+///
+/// The value identifies the active windowing contract only. It does not imply
+/// that every optional geometry, input, or window-management operation is
+/// available; hosts must still treat absent facts and terminal unsupported
+/// results as authoritative.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum NativeWindowingBackend {
+    /// Microsoft Windows desktop windowing.
+    Windows,
+    /// Apple macOS desktop windowing.
+    MacOs,
+    /// The X11 window system.
+    X11,
+    /// The Wayland window system.
+    Wayland,
+    /// A backend not classified by this host seam.
+    Other,
 }
 
 impl<'a> NativeViewportRoster<'a> {
@@ -385,10 +407,12 @@ impl<'a> NativeViewportRoster<'a> {
     pub(crate) const fn new(
         records: &'a [NativeViewportRecord],
         work_areas: NativeWorkAreaRoster<'a>,
+        backend: NativeWindowingBackend,
     ) -> Self {
         Self {
             records,
             work_areas,
+            backend,
         }
     }
 
@@ -401,11 +425,17 @@ impl<'a> NativeViewportRoster<'a> {
     pub const fn work_areas(self) -> NativeWorkAreaRoster<'a> {
         self.work_areas
     }
+
+    /// Returns the active native windowing backend for this exact roster.
+    pub const fn backend(self) -> NativeWindowingBackend {
+        self.backend
+    }
 }
 
 pub(crate) struct NativeViewportRosterCapture {
     records: Vec<NativeViewportRecord>,
     work_areas: OwnedNativeWorkAreaRoster,
+    backend: NativeWindowingBackend,
 }
 
 impl NativeViewportRosterCapture {
@@ -416,12 +446,42 @@ impl NativeViewportRosterCapture {
         Self {
             records,
             work_areas: OwnedNativeWorkAreaRoster::capture(event_loop),
+            backend: native_windowing_backend(event_loop),
         }
     }
 
     pub(crate) fn as_borrowed(&self) -> NativeViewportRoster<'_> {
-        NativeViewportRoster::new(&self.records, self.work_areas.as_borrowed())
+        NativeViewportRoster::new(&self.records, self.work_areas.as_borrowed(), self.backend)
     }
+}
+
+#[cfg(target_os = "windows")]
+fn native_windowing_backend(_event_loop: &ActiveEventLoop) -> NativeWindowingBackend {
+    NativeWindowingBackend::Windows
+}
+
+#[cfg(target_os = "macos")]
+fn native_windowing_backend(_event_loop: &ActiveEventLoop) -> NativeWindowingBackend {
+    NativeWindowingBackend::MacOs
+}
+
+#[cfg(target_os = "linux")]
+fn native_windowing_backend(event_loop: &ActiveEventLoop) -> NativeWindowingBackend {
+    event_loop
+        .display_handle()
+        .map_or(NativeWindowingBackend::Other, |handle| {
+            match handle.as_raw() {
+                raw_window_handle::RawDisplayHandle::Xlib(_)
+                | raw_window_handle::RawDisplayHandle::Xcb(_) => NativeWindowingBackend::X11,
+                raw_window_handle::RawDisplayHandle::Wayland(_) => NativeWindowingBackend::Wayland,
+                _ => NativeWindowingBackend::Other,
+            }
+        })
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+fn native_windowing_backend(_event_loop: &ActiveEventLoop) -> NativeWindowingBackend {
+    NativeWindowingBackend::Other
 }
 
 impl NativeWindowSnapshot {
@@ -1513,6 +1573,7 @@ mod tests {
     struct RecordedNativeViewportRoster {
         records: Vec<NativeViewportRecord>,
         work_areas: Option<Vec<NativeWorkAreaRecord>>,
+        backend: NativeWindowingBackend,
     }
 
     impl From<NativeViewportRoster<'_>> for RecordedNativeViewportRoster {
@@ -1524,6 +1585,7 @@ mod tests {
             Self {
                 records: roster.records().to_vec(),
                 work_areas,
+                backend: roster.backend(),
             }
         }
     }
@@ -2177,6 +2239,7 @@ mod tests {
                 Some(NativeViewportRoster::new(
                     &roster,
                     NativeWorkAreaRoster::Exact(&work_areas),
+                    NativeWindowingBackend::Windows,
                 )),
             )
             .expect("root output scope exists");
@@ -2191,6 +2254,7 @@ mod tests {
             Some(RecordedNativeViewportRoster {
                 records: roster.to_vec(),
                 work_areas: Some(work_areas.to_vec()),
+                backend: NativeWindowingBackend::Windows,
             })
         );
         drop(output_begins);

@@ -212,8 +212,9 @@ pub use native::host_seam::{
     NativeViewportFocusStatus, NativeViewportPointerPassthroughCommandToken,
     NativeViewportPointerPassthroughResult, NativeViewportPointerPassthroughStatus,
     NativeViewportRecord, NativeViewportRoster, NativeViewportVisibilityResult,
-    NativeViewportVisibilityStatus, NativeWindowEvent, NativeWindowSnapshot, NativeWorkAreaRecord,
-    NativeWorkAreaRoster, current_native_output_token, queue_native_viewport_pointer_passthrough,
+    NativeViewportVisibilityStatus, NativeWindowEvent, NativeWindowSnapshot,
+    NativeWindowingBackend, NativeWorkAreaRecord, NativeWorkAreaRoster,
+    current_native_output_token, queue_native_viewport_pointer_passthrough,
 };
 
 #[cfg(not(any(target_arch = "wasm32", target_os = "ios")))]
