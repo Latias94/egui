@@ -25,7 +25,13 @@ static NEXT_CONTEXT_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_POINTER_PASSTHROUGH_COMMAND: AtomicU64 = AtomicU64::new(1);
 
 thread_local! {
-    static ACTIVE_OUTPUTS: RefCell<Vec<NativeOutputToken>> = const { RefCell::new(Vec::new()) };
+    static ACTIVE_OUTPUTS: RefCell<Vec<ActiveNativeOutput>> = const { RefCell::new(Vec::new()) };
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ActiveNativeOutput {
+    token: NativeOutputToken,
+    retain_previous: bool,
 }
 
 /// Monotonic order assigned to one native window event before egui translates it.
@@ -898,7 +904,30 @@ pub trait NativeHostHandler: Send + Sync + 'static {
 /// The token is available only while eframe is running root or deferred viewport UI. It is never
 /// stored in [`egui::FullOutput`] or application-owned user data.
 pub fn current_native_output_token() -> Option<NativeOutputToken> {
-    ACTIVE_OUTPUTS.with(|outputs| outputs.borrow().last().copied())
+    ACTIVE_OUTPUTS.with(|outputs| outputs.borrow().last().map(|output| output.token))
+}
+
+/// Keeps a deferred viewport's currently presented framebuffer instead of presenting this output.
+///
+/// This is available only while a native-host viewport callback is running. Eframe still owns
+/// and forwards the generated context-global texture commands, but it skips painting and swapping
+/// this viewport and reports [`NativeOutputStatus::NotPresented`] to the host. The previous native
+/// framebuffer therefore remains visible while the host waits for an ordered input boundary.
+///
+/// Returns `false` when no deferred native output callback is active. Root outputs cannot be
+/// retained because some renderers may clear their sole root framebuffer before the UI callback.
+pub fn retain_current_native_output() -> bool {
+    ACTIVE_OUTPUTS.with(|outputs| {
+        let mut outputs = outputs.borrow_mut();
+        let Some(output) = outputs.last_mut() else {
+            return false;
+        };
+        if output.token.viewport_id() == ViewportId::ROOT {
+            return false;
+        }
+        output.retain_previous = true;
+        true
+    })
 }
 
 #[derive(Clone, Default)]
@@ -1085,7 +1114,12 @@ impl NativeHostState {
             create_attempt,
         };
         inner.handler.on_output_begin(token, snapshot, root_roster);
-        ACTIVE_OUTPUTS.with(|outputs| outputs.borrow_mut().push(token));
+        ACTIVE_OUTPUTS.with(|outputs| {
+            outputs.borrow_mut().push(ActiveNativeOutput {
+                token,
+                retain_previous: false,
+            });
+        });
         Some(NativeOutputScope {
             inner,
             ctx: ctx.clone(),
@@ -1454,7 +1488,7 @@ pub(crate) struct NativeOutputScope {
 
 impl NativeOutputScope {
     pub(crate) fn finish(mut self) -> NativeOutputSettlement {
-        self.leave();
+        let retain_previous = self.leave();
         NativeOutputSettlement {
             inner: Arc::clone(&self.inner),
             ctx: self.ctx.clone(),
@@ -1464,22 +1498,25 @@ impl NativeOutputScope {
                 "native output ordinal exhausted",
             )),
             settled: false,
+            retain_previous,
         }
     }
 
-    fn leave(&mut self) {
+    fn leave(&mut self) -> bool {
         if !self.active {
-            return;
+            return false;
         }
-        ACTIVE_OUTPUTS.with(|outputs| {
+        let retain_previous = ACTIVE_OUTPUTS.with(|outputs| {
             let popped = outputs.borrow_mut().pop();
             debug_assert_eq!(
-                popped,
+                popped.map(|output| output.token),
                 Some(self.token),
                 "native output scopes must leave in stack order"
             );
+            popped.is_some_and(|output| output.retain_previous)
         });
         self.active = false;
+        retain_previous
     }
 }
 
@@ -1517,11 +1554,21 @@ pub(crate) struct NativeOutputSettlement {
     token: NativeOutputToken,
     ordinal: NativeOutputOrdinal,
     settled: bool,
+    retain_previous: bool,
 }
 
 impl NativeOutputSettlement {
+    pub(crate) const fn should_present(&self) -> bool {
+        !self.retain_previous
+    }
+
     pub(crate) fn present(mut self) {
-        self.settle(NativeOutputStatus::Presented);
+        let status = if self.should_present() {
+            NativeOutputStatus::Presented
+        } else {
+            NativeOutputStatus::NotPresented
+        };
+        self.settle(status);
     }
 
     fn settle(&mut self, status: NativeOutputStatus) {
@@ -2183,6 +2230,37 @@ mod tests {
         assert_eq!(outputs[1].ordinal().get(), 2);
         assert_eq!(outputs[1].status(), NativeOutputStatus::NotPresented);
         assert_eq!(repaint_count.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn retained_output_reports_not_presented_and_leaves_the_previous_framebuffer() {
+        let host = Arc::new(RecordingHost::default());
+        let handler: Arc<dyn NativeHostHandler> = Arc::<RecordingHost>::clone(&host);
+        let state = NativeHostState::new(Some(handler));
+        let ctx = egui::Context::default();
+        let child = ViewportId::from_hash_of("retained-output-child");
+
+        assert!(!retain_current_native_output());
+        let root = state
+            .begin_output_for_test(&ctx, ViewportId::ROOT, WindowId::from(11))
+            .expect("the root output scope exists");
+        assert!(!retain_current_native_output());
+        drop(root);
+        host.outputs.lock().clear();
+        let scope = state
+            .begin_output_for_test(&ctx, child, WindowId::from(22))
+            .expect("the native output scope exists");
+        let token = current_native_output_token().expect("the child token is active");
+        assert!(retain_current_native_output());
+
+        let settlement = scope.finish();
+        assert!(!settlement.should_present());
+        settlement.present();
+
+        let outputs = host.outputs.lock();
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].token(), token);
+        assert_eq!(outputs[0].status(), NativeOutputStatus::NotPresented);
     }
 
     #[test]

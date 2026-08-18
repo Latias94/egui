@@ -949,7 +949,10 @@ impl WgpuWinitRunning<'_> {
 
         egui_winit.handle_platform_output_with_event_loop(window, event_loop, platform_output);
 
-        let vsync_secs = if is_visible || render_hidden {
+        let should_present = output_settlement
+            .as_ref()
+            .is_none_or(|settlement| settlement.should_present());
+        let vsync_secs = if (is_visible || render_hidden) && should_present {
             let clipped_primitives = egui_ctx.tessellate(shapes, pixels_per_point);
 
             let mut screenshot_commands = vec![];

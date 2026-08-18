@@ -215,6 +215,7 @@ pub use native::host_seam::{
     NativeViewportVisibilityStatus, NativeWindowEvent, NativeWindowSnapshot,
     NativeWindowingBackend, NativeWorkAreaRecord, NativeWorkAreaRoster,
     current_native_output_token, queue_native_viewport_pointer_passthrough,
+    retain_current_native_output,
 };
 
 #[cfg(not(any(target_arch = "wasm32", target_os = "ios")))]

@@ -933,7 +933,10 @@ impl GlowWinitRunning<'_> {
 
         egui_winit.handle_platform_output_with_event_loop(&window, event_loop, platform_output);
 
-        if is_visible || render_hidden {
+        let should_present = output_settlement
+            .as_ref()
+            .is_none_or(|settlement| settlement.should_present());
+        if (is_visible || render_hidden) && should_present {
             let clipped_primitives = integration.egui_ctx.tessellate(shapes, pixels_per_point);
 
             {
