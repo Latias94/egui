@@ -39,6 +39,21 @@ pub enum Request {
     /// Servicing this triggers one repaint so the reply reflects the current frame.
     GetTree,
 
+    /// Enumerate the active egui viewports. Reply: [`Response::Viewports`].
+    ///
+    /// The returned [`ViewportDescriptor::id`] values are stable for the lifetime of the
+    /// viewport and can be passed to [`Self::GetViewportTree`]. Servicing this triggers one
+    /// repaint so removed viewports are not returned from a stale cache.
+    ListViewports,
+
+    /// Read the current AccessKit tree for one active egui viewport. Reply:
+    /// [`Response::ViewportTree`].
+    ///
+    /// The selector should come from [`Self::ListViewports`]. Unknown or removed viewports
+    /// produce [`Response::ViewportError`]. This is a read-only selector: it does not route
+    /// input or construct a semantic target.
+    GetViewportTree { viewport: egui::ViewportId },
+
     /// Capture the current framebuffer as PNG. Reply: [`Response::Screenshot`].
     ///
     /// The peer issues an [`egui::ViewportCommand::Screenshot`] and replies once the
@@ -97,6 +112,37 @@ pub enum Response {
         accesskit: Option<accesskit::TreeUpdate>,
     },
 
+    /// Reply to [`Request::ListViewports`].
+    Viewports {
+        /// Active egui viewports in stable [`egui::ViewportId`] order.
+        viewports: Vec<ViewportDescriptor>,
+    },
+
+    /// Reply to [`Request::GetViewportTree`].
+    ViewportTree {
+        /// The selected viewport.
+        viewport: egui::ViewportId,
+
+        /// Monotonically increasing frame counter for the frame that produced this tree.
+        step: u64,
+
+        /// `physical_pixel = logical_point * pixels_per_point` for this viewport.
+        pixels_per_point: f32,
+
+        /// The selected viewport's current full AccessKit tree. `None` if AccessKit has not
+        /// produced a tree yet.
+        accesskit: Option<accesskit::TreeUpdate>,
+    },
+
+    /// The viewport selected by [`Request::GetViewportTree`] is unavailable.
+    ViewportError {
+        /// The requested viewport identity.
+        viewport: egui::ViewportId,
+
+        /// Whether the selector was never active or disappeared while the request was pending.
+        reason: ViewportErrorReason,
+    },
+
     /// Reply to [`Request::GetScreenshot`].
     Screenshot(EncodedPng),
 
@@ -115,6 +161,57 @@ pub enum Response {
 
     /// The peer failed to service the request (recoverable; the connection stays open).
     Error { message: String },
+}
+
+/// Read-only identity and hierarchy facts for one active egui viewport.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ViewportDescriptor {
+    /// Stable identity for the lifetime of this viewport.
+    pub id: egui::ViewportId,
+
+    /// Parent viewport identity. The root viewport is its own parent.
+    pub parent: egui::ViewportId,
+
+    /// How egui renders this viewport.
+    pub class: ViewportClass,
+
+    /// Current native-window title requested by egui, when one is set.
+    pub title: Option<String>,
+
+    /// Last inspection frame that cached an AccessKit result for this viewport.
+    ///
+    /// `None` means the viewport is active but has not completed an inspected frame yet.
+    pub tree_step: Option<u64>,
+}
+
+/// Rendering class of an inspected egui viewport.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum ViewportClass {
+    Root,
+    Deferred,
+    Immediate,
+    EmbeddedWindow,
+}
+
+impl From<egui::ViewportClass> for ViewportClass {
+    fn from(class: egui::ViewportClass) -> Self {
+        match class {
+            egui::ViewportClass::Root => Self::Root,
+            egui::ViewportClass::Deferred => Self::Deferred,
+            egui::ViewportClass::Immediate => Self::Immediate,
+            egui::ViewportClass::EmbeddedWindow => Self::EmbeddedWindow,
+        }
+    }
+}
+
+/// Typed failure from an exact viewport tree lookup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum ViewportErrorReason {
+    /// The selector was not present in the current viewport inventory.
+    Unknown,
+
+    /// The selector was active when accepted but disappeared before producing its next tree.
+    Removed,
 }
 
 /// A PNG-encoded image with its pixel dimensions.

@@ -7,7 +7,7 @@ pub mod protocol;
 
 pub use protocol::{
     EncodedPng, MAX_MESSAGE_BYTES, PROTOCOL_MAGIC, PROTOCOL_VERSION, Request, Response,
-    read_message, write_message,
+    ViewportClass, ViewportDescriptor, ViewportErrorReason, read_message, write_message,
 };
 
 /// The single environment variable that controls inspection.

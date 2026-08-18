@@ -25,20 +25,23 @@
 //!
 //! Requests advance through a small per-request state machine across one or two frames:
 //! `GetInfo` replies immediately; `GetTree` replies with the current frame's tree;
-//! `Resize` / `ApplyEvents` apply their effect and reply [`Response::Done`] *after* the frame
-//! has processed them (so a following `GetTree` reflects them); `GetScreenshot` dispatches a
-//! viewport screenshot and replies once the resulting [`egui::Event::Screenshot`] arrives,
-//! matched back to the request by a `user_data` id.
+//! `ListViewports` refreshes the active viewport inventory; `GetViewportTree` requests a repaint
+//! of the exact selected viewport and replies only from that viewport's output; `Resize` /
+//! `ApplyEvents` apply their effect and reply [`Response::Done`] *after* the frame has processed
+//! them (so a following `GetTree` reflects them); `GetScreenshot` dispatches a viewport screenshot
+//! and replies once the resulting [`egui::Event::Screenshot`] arrives, matched back to the request
+//! by a `user_data` id.
 //!
 //! Note that [`serve`]'s threads hold an [`egui::Context`] clone, so the context stays alive
 //! for as long as the listener runs (the lifetime of the process, for a debug attach).
 
 use core::time::Duration;
+use std::collections::BTreeMap;
 use std::sync::mpsc;
 
-use egui::{Context, FullOutput, RawInput};
+use egui::{Context, FullOutput, RawInput, ViewportId, ViewportIdSet};
 
-use crate::protocol::{EncodedPng, Request, Response};
+use crate::protocol::{EncodedPng, Request, Response, ViewportDescriptor, ViewportErrorReason};
 
 /// How long [`serve`]'s connection threads wait for the UI thread before giving up. Generous:
 /// a backgrounded window may not paint (and thus not service requests) for a while.
@@ -52,6 +55,12 @@ enum Phase {
 
     /// Effect applied (or nothing to apply); reply at the end of this frame.
     AwaitOutput,
+
+    /// Waiting for one output to refresh the active viewport inventory.
+    AwaitViewportList,
+
+    /// Waiting for the selected viewport to complete a frame.
+    AwaitViewportTree { viewport: ViewportId },
 
     /// A screenshot was dispatched with this `user_data` id; reply when the matching
     /// [`egui::Event::Screenshot`] arrives.
@@ -70,12 +79,29 @@ struct InFlight {
     phase: Phase,
 }
 
+struct CachedViewport {
+    parent: ViewportId,
+    class: egui::ViewportClass,
+    title: Option<String>,
+    step: Option<u64>,
+    pixels_per_point: Option<f32>,
+    accesskit: Option<egui::accesskit::TreeUpdate>,
+}
+
 /// An [`egui::Plugin`] that serves the inspection protocol. See the module docs.
 pub struct InspectionPlugin {
     /// Requests we haven't responded to yet.
     in_flight: Vec<InFlight>,
 
     step: u64,
+
+    /// Active viewport inventory and the latest AccessKit output produced by each viewport.
+    /// The ordered map gives the protocol deterministic enumeration.
+    viewports: BTreeMap<ViewportId, CachedViewport>,
+
+    /// `input_hook` runs before egui enters a viewport pass, while `output_hook` runs after it
+    /// leaves. A stack preserves the identity across nested immediate viewport passes.
+    viewport_passes: Vec<ViewportId>,
 
     /// Counter for screenshot `user_data` ids, so each [`egui::Event::Screenshot`] maps back
     /// to the request that asked for it.
@@ -92,6 +118,8 @@ impl InspectionPlugin {
         Self {
             in_flight: Vec::new(),
             step: 0,
+            viewports: BTreeMap::new(),
+            viewport_passes: Vec::new(),
             next_screenshot_id: 0,
             label,
         }
@@ -128,6 +156,51 @@ impl InspectionPlugin {
             ctx.request_repaint();
         }
     }
+
+    fn cache_viewport_output(&mut self, current_viewport: Option<ViewportId>, output: &FullOutput) {
+        self.viewports
+            .retain(|viewport, _| output.viewport_output.contains_key(viewport));
+
+        for (&viewport, viewport_output) in &output.viewport_output {
+            let cached = self
+                .viewports
+                .entry(viewport)
+                .or_insert_with(|| CachedViewport {
+                    parent: viewport_output.parent,
+                    class: viewport_output.class,
+                    title: viewport_output.builder.title.clone(),
+                    step: None,
+                    pixels_per_point: None,
+                    accesskit: None,
+                });
+            cached.parent = viewport_output.parent;
+            cached.class = viewport_output.class;
+            cached.title.clone_from(&viewport_output.builder.title);
+        }
+
+        let Some(current_viewport) = current_viewport else {
+            return;
+        };
+        let Some(cached) = self.viewports.get_mut(&current_viewport) else {
+            return;
+        };
+        cached.step = Some(self.step);
+        cached.pixels_per_point = Some(output.pixels_per_point);
+        cached.accesskit = output.platform_output.accesskit_update.clone();
+    }
+
+    fn viewport_descriptors(&self) -> Vec<ViewportDescriptor> {
+        self.viewports
+            .iter()
+            .map(|(&id, cached)| ViewportDescriptor {
+                id,
+                parent: cached.parent,
+                class: cached.class.into(),
+                title: cached.title.clone(),
+                tree_step: cached.step,
+            })
+            .collect()
+    }
 }
 
 impl egui::Plugin for InspectionPlugin {
@@ -141,6 +214,8 @@ impl egui::Plugin for InspectionPlugin {
     }
 
     fn input_hook(&mut self, ctx: &Context, input: &mut RawInput) {
+        self.viewport_passes.push(input.viewport_id);
+
         // Nothing in flight → idle frame, do no work.
         if self.in_flight.is_empty() {
             return;
@@ -198,6 +273,12 @@ impl egui::Plugin for InspectionPlugin {
         // `retain_mut` borrow of `in_flight`.
         let label = self.label.clone();
         let mut next_id = self.next_screenshot_id;
+        let known_viewports = self
+            .viewports
+            .keys()
+            .copied()
+            .chain(input.viewports.keys().copied())
+            .collect::<ViewportIdSet>();
         self.in_flight.retain_mut(|item| {
             if item.phase != Phase::New {
                 return true;
@@ -214,6 +295,26 @@ impl egui::Plugin for InspectionPlugin {
                 }
                 Request::GetTree => {
                     item.phase = Phase::AwaitOutput;
+                    true
+                }
+                Request::ListViewports => {
+                    item.phase = Phase::AwaitViewportList;
+                    true
+                }
+                Request::GetViewportTree { viewport } => {
+                    if !known_viewports.contains(viewport) {
+                        if let Some(reply) = item.reply.take() {
+                            reply(Response::ViewportError {
+                                viewport: *viewport,
+                                reason: ViewportErrorReason::Unknown,
+                            });
+                        }
+                        return false;
+                    }
+                    ctx.request_repaint_of(*viewport);
+                    item.phase = Phase::AwaitViewportTree {
+                        viewport: *viewport,
+                    };
                     true
                 }
                 Request::ApplyEvents { events } => {
@@ -260,6 +361,9 @@ impl egui::Plugin for InspectionPlugin {
 
     fn output_hook(&mut self, ctx: &Context, output: &mut FullOutput) {
         self.step = self.step.saturating_add(1);
+        let current_viewport = self.viewport_passes.pop();
+        self.cache_viewport_output(current_viewport, output);
+
         if self.in_flight.is_empty() {
             return;
         }
@@ -270,6 +374,8 @@ impl egui::Plugin for InspectionPlugin {
             .any(|viewport| viewport.repaint_delay == Duration::ZERO);
 
         let step = self.step;
+        let viewport_descriptors = self.viewport_descriptors();
+        let viewports = &self.viewports;
         self.in_flight
             .retain_mut(|item| match (&mut item.phase, &item.req) {
                 (Phase::AwaitOutput, Request::GetTree) => {
@@ -278,6 +384,42 @@ impl egui::Plugin for InspectionPlugin {
                             step,
                             pixels_per_point: output.pixels_per_point,
                             accesskit: output.platform_output.accesskit_update.clone(),
+                        });
+                    }
+                    false
+                }
+                (Phase::AwaitViewportList, Request::ListViewports) => {
+                    if let Some(reply) = item.reply.take() {
+                        reply(Response::Viewports {
+                            viewports: viewport_descriptors.clone(),
+                        });
+                    }
+                    false
+                }
+                (Phase::AwaitViewportTree { viewport }, Request::GetViewportTree { .. }) => {
+                    let Some(cached) = viewports.get(viewport) else {
+                        if let Some(reply) = item.reply.take() {
+                            reply(Response::ViewportError {
+                                viewport: *viewport,
+                                reason: ViewportErrorReason::Removed,
+                            });
+                        }
+                        return false;
+                    };
+                    if current_viewport != Some(*viewport) {
+                        return true;
+                    }
+                    let (Some(step), Some(pixels_per_point)) =
+                        (cached.step, cached.pixels_per_point)
+                    else {
+                        return true;
+                    };
+                    if let Some(reply) = item.reply.take() {
+                        reply(Response::ViewportTree {
+                            viewport: *viewport,
+                            step,
+                            pixels_per_point,
+                            accesskit: cached.accesskit.clone(),
                         });
                     }
                     false
@@ -438,5 +580,206 @@ fn serve_connection(stream: std::net::TcpStream, ctx: &Context) -> std::io::Resu
             }
         });
         write_message(&mut writer, &resp)?;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::mpsc::{self, Receiver, TryRecvError};
+
+    use egui::accesskit::{NodeId, TreeId, TreeUpdate};
+    use egui::{
+        FullOutput, Plugin as _, RawInput, ViewportBuilder, ViewportClass, ViewportId,
+        ViewportInfo, ViewportOutput,
+    };
+
+    use super::InspectionPlugin;
+    use crate::{Request, Response, ViewportErrorReason};
+
+    struct TestViewport {
+        id: ViewportId,
+        parent: ViewportId,
+        class: ViewportClass,
+        title: &'static str,
+    }
+
+    fn root() -> TestViewport {
+        TestViewport {
+            id: ViewportId::ROOT,
+            parent: ViewportId::ROOT,
+            class: ViewportClass::Root,
+            title: "Root",
+        }
+    }
+
+    fn child() -> TestViewport {
+        TestViewport {
+            id: ViewportId::from_hash_of("inspection-child"),
+            parent: ViewportId::ROOT,
+            class: ViewportClass::Deferred,
+            title: "Child",
+        }
+    }
+
+    fn tree(focus: u64) -> TreeUpdate {
+        TreeUpdate {
+            nodes: Vec::new(),
+            tree: None,
+            tree_id: TreeId::ROOT,
+            focus: NodeId(focus),
+        }
+    }
+
+    fn input(current: ViewportId, active: &[TestViewport]) -> RawInput {
+        RawInput {
+            viewport_id: current,
+            viewports: active
+                .iter()
+                .map(|viewport| (viewport.id, ViewportInfo::default()))
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    fn output(active: &[TestViewport], pixels_per_point: f32, focus: u64) -> FullOutput {
+        let mut output = FullOutput {
+            pixels_per_point,
+            ..Default::default()
+        };
+        output.platform_output.accesskit_update = Some(tree(focus));
+        output.viewport_output = active
+            .iter()
+            .map(|viewport| {
+                let builder = ViewportBuilder {
+                    title: Some(viewport.title.to_owned()),
+                    ..Default::default()
+                };
+                (
+                    viewport.id,
+                    ViewportOutput {
+                        parent: viewport.parent,
+                        class: viewport.class,
+                        builder,
+                        viewport_ui_cb: None,
+                        commands: Vec::new(),
+                        repaint_delay: core::time::Duration::MAX,
+                    },
+                )
+            })
+            .collect();
+        output
+    }
+
+    fn run_frame(
+        plugin: &mut InspectionPlugin,
+        ctx: &egui::Context,
+        current: ViewportId,
+        active: &[TestViewport],
+        pixels_per_point: f32,
+        focus: u64,
+    ) {
+        plugin.input_hook(ctx, &mut input(current, active));
+        plugin.output_hook(ctx, &mut output(active, pixels_per_point, focus));
+    }
+
+    fn submit(plugin: &mut InspectionPlugin, request: Request) -> Receiver<Response> {
+        let (sender, receiver) = mpsc::channel();
+        plugin.submit(request, move |response| {
+            sender.send(response).expect("test receiver must be live");
+        });
+        receiver
+    }
+
+    #[test]
+    fn lists_and_selects_independent_viewport_trees() {
+        let ctx = egui::Context::default();
+        let mut plugin = InspectionPlugin::new(None);
+        let active = [root(), child()];
+        let child_id = active[1].id;
+
+        run_frame(&mut plugin, &ctx, ViewportId::ROOT, &active, 1.0, 10);
+        run_frame(&mut plugin, &ctx, child_id, &active, 2.0, 20);
+
+        let list_reply = submit(&mut plugin, Request::ListViewports);
+        run_frame(&mut plugin, &ctx, ViewportId::ROOT, &active, 1.5, 11);
+        let Response::Viewports { viewports } = list_reply.recv().unwrap() else {
+            panic!("expected viewport inventory");
+        };
+        assert_eq!(viewports.len(), 2);
+        let child = viewports
+            .iter()
+            .find(|viewport| viewport.id == child_id)
+            .unwrap();
+        assert_eq!(child.parent, ViewportId::ROOT);
+        assert_eq!(child.title.as_deref(), Some("Child"));
+        assert_eq!(child.tree_step, Some(2));
+
+        let tree_reply = submit(&mut plugin, Request::GetViewportTree { viewport: child_id });
+        run_frame(&mut plugin, &ctx, ViewportId::ROOT, &active, 1.5, 12);
+        assert!(matches!(tree_reply.try_recv(), Err(TryRecvError::Empty)));
+        run_frame(&mut plugin, &ctx, child_id, &active, 2.5, 21);
+
+        let Response::ViewportTree {
+            viewport,
+            step,
+            pixels_per_point,
+            accesskit,
+        } = tree_reply.recv().unwrap()
+        else {
+            panic!("expected selected viewport tree");
+        };
+        assert_eq!(viewport, child_id);
+        assert_eq!(step, 5);
+        assert_eq!(pixels_per_point, 2.5);
+        assert_eq!(accesskit.unwrap().focus, NodeId(21));
+    }
+
+    #[test]
+    fn unknown_viewport_returns_typed_error() {
+        let ctx = egui::Context::default();
+        let mut plugin = InspectionPlugin::new(None);
+        let active = [root()];
+        run_frame(&mut plugin, &ctx, ViewportId::ROOT, &active, 1.0, 10);
+
+        let unknown = ViewportId::from_hash_of("unknown-inspection-viewport");
+        let reply = submit(&mut plugin, Request::GetViewportTree { viewport: unknown });
+        run_frame(&mut plugin, &ctx, ViewportId::ROOT, &active, 1.0, 11);
+
+        assert!(matches!(
+            reply.recv().unwrap(),
+            Response::ViewportError {
+                viewport,
+                reason: ViewportErrorReason::Unknown,
+            } if viewport == unknown
+        ));
+    }
+
+    #[test]
+    fn removed_viewport_drops_its_cache_and_returns_typed_error() {
+        let ctx = egui::Context::default();
+        let mut plugin = InspectionPlugin::new(None);
+        let active = [root(), child()];
+        let child_id = active[1].id;
+        run_frame(&mut plugin, &ctx, ViewportId::ROOT, &active, 1.0, 10);
+        run_frame(&mut plugin, &ctx, child_id, &active, 2.0, 20);
+
+        let tree_reply = submit(&mut plugin, Request::GetViewportTree { viewport: child_id });
+        let root_only = [root()];
+        run_frame(&mut plugin, &ctx, ViewportId::ROOT, &root_only, 1.0, 11);
+        assert!(matches!(
+            tree_reply.recv().unwrap(),
+            Response::ViewportError {
+                viewport,
+                reason: ViewportErrorReason::Removed,
+            } if viewport == child_id
+        ));
+
+        let list_reply = submit(&mut plugin, Request::ListViewports);
+        run_frame(&mut plugin, &ctx, ViewportId::ROOT, &root_only, 1.0, 12);
+        let Response::Viewports { viewports } = list_reply.recv().unwrap() else {
+            panic!("expected viewport inventory");
+        };
+        assert_eq!(viewports.len(), 1);
+        assert_eq!(viewports[0].id, ViewportId::ROOT);
     }
 }
