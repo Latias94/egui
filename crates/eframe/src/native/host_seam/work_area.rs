@@ -26,6 +26,12 @@ pub struct NativeWorkAreaRecord {
 }
 
 impl NativeWorkAreaRecord {
+    #[cfg(any(
+        test,
+        target_os = "windows",
+        target_os = "macos",
+        all(target_os = "linux", feature = "x11")
+    ))]
     pub(super) const fn new(
         display_id: u64,
         display_bounds: NativePhysicalRect,
@@ -383,7 +389,133 @@ mod platform {
     }
 }
 
-#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+#[cfg(any(test, all(target_os = "linux", feature = "x11")))]
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct X11WorkAreaFacts {
+    display_id: u64,
+    display_bounds: NativePhysicalRect,
+    work_area_bounds: NativePhysicalRect,
+    scale_factor: f64,
+}
+
+#[cfg(any(test, all(target_os = "linux", feature = "x11")))]
+fn compile_x11_snapshot(
+    generation: u64,
+    facts: impl IntoIterator<Item = X11WorkAreaFacts>,
+) -> Option<Vec<NativeWorkAreaRecord>> {
+    if generation == 0 {
+        return None;
+    }
+
+    let mut records = facts
+        .into_iter()
+        .map(|fact| {
+            (fact.display_id != 0
+                && fact.scale_factor.is_finite()
+                && fact.scale_factor > 0.0
+                && valid_x11_rect(fact.display_bounds)
+                && valid_x11_rect(fact.work_area_bounds)
+                && x11_rect_contains(fact.display_bounds, fact.work_area_bounds))
+            .then_some(NativeWorkAreaRecord::new(
+                fact.display_id,
+                fact.display_bounds,
+                fact.work_area_bounds,
+                fact.scale_factor,
+            ))
+        })
+        .collect::<Option<Vec<_>>>()?;
+    records.sort_by_key(|record| record.display_id());
+    (!records.is_empty()
+        && records
+            .windows(2)
+            .all(|pair| pair[0].display_id() != pair[1].display_id())
+        && records.iter().enumerate().all(|(index, record)| {
+            records[index + 1..]
+                .iter()
+                .all(|other| !x11_rects_overlap(record.display_bounds(), other.display_bounds()))
+        }))
+    .then_some(records)
+}
+
+#[cfg(any(test, all(target_os = "linux", feature = "x11")))]
+fn valid_x11_rect(rect: NativePhysicalRect) -> bool {
+    let Ok(width) = i32::try_from(rect.width()) else {
+        return false;
+    };
+    let Ok(height) = i32::try_from(rect.height()) else {
+        return false;
+    };
+    width > 0
+        && height > 0
+        && rect.x().checked_add(width).is_some()
+        && rect.y().checked_add(height).is_some()
+}
+
+#[cfg(any(test, all(target_os = "linux", feature = "x11")))]
+fn x11_rect_contains(outer: NativePhysicalRect, inner: NativePhysicalRect) -> bool {
+    let outer_right = i64::from(outer.x()) + i64::from(outer.width());
+    let outer_bottom = i64::from(outer.y()) + i64::from(outer.height());
+    let inner_right = i64::from(inner.x()) + i64::from(inner.width());
+    let inner_bottom = i64::from(inner.y()) + i64::from(inner.height());
+    outer.x() <= inner.x()
+        && outer.y() <= inner.y()
+        && outer_right >= inner_right
+        && outer_bottom >= inner_bottom
+}
+
+#[cfg(any(test, all(target_os = "linux", feature = "x11")))]
+fn x11_rects_overlap(first: NativePhysicalRect, second: NativePhysicalRect) -> bool {
+    let first_right = i64::from(first.x()) + i64::from(first.width());
+    let first_bottom = i64::from(first.y()) + i64::from(first.height());
+    let second_right = i64::from(second.x()) + i64::from(second.width());
+    let second_bottom = i64::from(second.y()) + i64::from(second.height());
+    i64::from(first.x()) < second_right
+        && i64::from(second.x()) < first_right
+        && i64::from(first.y()) < second_bottom
+        && i64::from(second.y()) < first_bottom
+}
+
+#[cfg(all(target_os = "linux", feature = "x11"))]
+mod platform {
+    use winit::event_loop::ActiveEventLoop;
+    use winit::platform::x11::ActiveEventLoopExtX11 as _;
+
+    use super::{NativePhysicalRect, NativeWorkAreaRecord, X11WorkAreaFacts, compile_x11_snapshot};
+
+    pub(super) fn capture(event_loop: &ActiveEventLoop) -> Option<Vec<NativeWorkAreaRecord>> {
+        let snapshot = event_loop.work_area_authority_snapshot()?;
+        compile_x11_snapshot(
+            snapshot.generation(),
+            snapshot.records().iter().map(|record| {
+                let monitor_position = record.monitor_position();
+                let monitor_size = record.monitor_size();
+                let work_area_position = record.work_area_position();
+                let work_area_size = record.work_area_size();
+                X11WorkAreaFacts {
+                    display_id: u64::from(record.crtc_id()),
+                    display_bounds: NativePhysicalRect::new(
+                        monitor_position.x,
+                        monitor_position.y,
+                        monitor_size.width,
+                        monitor_size.height,
+                    ),
+                    work_area_bounds: NativePhysicalRect::new(
+                        work_area_position.x,
+                        work_area_position.y,
+                        work_area_size.width,
+                        work_area_size.height,
+                    ),
+                    scale_factor: record.scale_factor(),
+                }
+            }),
+        )
+    }
+}
+
+#[cfg(any(
+    all(target_os = "linux", not(feature = "x11")),
+    not(any(target_os = "windows", target_os = "macos", target_os = "linux"))
+))]
 mod platform {
     use winit::event_loop::ActiveEventLoop;
 
@@ -391,5 +523,108 @@ mod platform {
 
     pub(super) fn capture(_event_loop: &ActiveEventLoop) -> Option<Vec<NativeWorkAreaRecord>> {
         None
+    }
+}
+
+#[cfg(test)]
+mod x11_tests {
+    use super::*;
+
+    fn facts(
+        display_id: u64,
+        display_bounds: NativePhysicalRect,
+        work_area_bounds: NativePhysicalRect,
+        scale_factor: f64,
+    ) -> X11WorkAreaFacts {
+        X11WorkAreaFacts {
+            display_id,
+            display_bounds,
+            work_area_bounds,
+            scale_factor,
+        }
+    }
+
+    #[test]
+    fn exact_x11_snapshot_preserves_sorted_mixed_scale_records() {
+        let records = compile_x11_snapshot(
+            7,
+            [
+                facts(
+                    20,
+                    NativePhysicalRect::new(1_920, 0, 1_920, 1_080),
+                    NativePhysicalRect::new(1_920, 24, 1_920, 1_056),
+                    1.5,
+                ),
+                facts(
+                    10,
+                    NativePhysicalRect::new(0, 0, 1_920, 1_080),
+                    NativePhysicalRect::new(0, 24, 1_920, 1_056),
+                    1.0,
+                ),
+            ],
+        )
+        .expect("the validated X11 authority should map exactly");
+
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].display_id(), NativeDisplayId(10));
+        assert_eq!(records[1].display_id(), NativeDisplayId(20));
+        assert_eq!(records[1].scale_factor(), 1.5);
+    }
+
+    #[test]
+    fn invalid_x11_authority_never_becomes_an_exact_roster() {
+        let display = NativePhysicalRect::new(0, 0, 1_920, 1_080);
+        let usable = NativePhysicalRect::new(0, 24, 1_920, 1_056);
+
+        assert_eq!(
+            compile_x11_snapshot(0, [facts(1, display, usable, 1.0)]),
+            None
+        );
+        assert_eq!(compile_x11_snapshot(1, []), None);
+        assert_eq!(
+            compile_x11_snapshot(1, [facts(0, display, usable, 1.0)]),
+            None
+        );
+        assert_eq!(
+            compile_x11_snapshot(
+                1,
+                [
+                    facts(1, display, usable, 1.0),
+                    facts(1, display, usable, 1.0)
+                ],
+            ),
+            None
+        );
+        assert_eq!(
+            compile_x11_snapshot(
+                1,
+                [
+                    facts(1, display, usable, 1.0),
+                    facts(
+                        2,
+                        NativePhysicalRect::new(1_000, 0, 1_920, 1_080),
+                        NativePhysicalRect::new(1_000, 24, 1_920, 1_056),
+                        1.0,
+                    ),
+                ],
+            ),
+            None
+        );
+        assert_eq!(
+            compile_x11_snapshot(
+                1,
+                [facts(
+                    1,
+                    display,
+                    NativePhysicalRect::new(1_900, 24, 100, 100),
+                    1.0,
+                )],
+            ),
+            None
+        );
+        assert_eq!(
+            compile_x11_snapshot(1, [facts(1, display, usable, f64::NAN)]),
+            None
+        );
     }
 }

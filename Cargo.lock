@@ -1238,7 +1238,7 @@ checksum = "75b325c5dbd37f80359721ad39aca5a29fb04c89279657cffdda8736d0c0b9d2"
 [[package]]
 name = "dpi"
 version = "0.1.1"
-source = "git+https://github.com/Latias94/winit.git?rev=6105ef864c93c231cad2d76be94054eaf707375a#6105ef864c93c231cad2d76be94054eaf707375a"
+source = "git+https://github.com/Latias94/winit.git?rev=c3fe740e090543e7afba525c111874d36e68948f#c3fe740e090543e7afba525c111874d36e68948f"
 
 [[package]]
 name = "ecolor"
@@ -5761,7 +5761,7 @@ checksum = "589f6da84c646204747d1270a2a5661ea66ed1cced2631d546fdfb155959f9ec"
 [[package]]
 name = "winit"
 version = "0.30.13"
-source = "git+https://github.com/Latias94/winit.git?rev=6105ef864c93c231cad2d76be94054eaf707375a#6105ef864c93c231cad2d76be94054eaf707375a"
+source = "git+https://github.com/Latias94/winit.git?rev=c3fe740e090543e7afba525c111874d36e68948f#c3fe740e090543e7afba525c111874d36e68948f"
 dependencies = [
  "ahash",
  "android-activity",
@@ -5776,6 +5776,7 @@ dependencies = [
  "core-graphics",
  "cursor-icon",
  "dpi",
+ "gethostname",
  "js-sys",
  "libc",
  "memmap2",
