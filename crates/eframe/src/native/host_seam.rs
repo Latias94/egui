@@ -32,6 +32,14 @@ thread_local! {
 struct ActiveNativeOutput {
     token: NativeOutputToken,
     retain_previous: bool,
+    retain_eligible: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PresentedNativeOutputFrame {
+    window_id: WindowId,
+    inner_size: Option<(u32, u32)>,
+    generation: u64,
 }
 
 /// Monotonic order assigned to one native window event before egui translates it.
@@ -914,13 +922,17 @@ pub fn current_native_output_token() -> Option<NativeOutputToken> {
 /// this viewport and reports [`NativeOutputStatus::NotPresented`] to the host. The previous native
 /// framebuffer therefore remains visible while the host waits for an ordered input boundary.
 ///
-/// Returns `false` when no native output callback is active.
+/// Returns `false` when no native output callback is active, or when the exact native viewport
+/// has not successfully presented a framebuffer for this window identity yet.
 pub fn retain_current_native_output() -> bool {
     ACTIVE_OUTPUTS.with(|outputs| {
         let mut outputs = outputs.borrow_mut();
         let Some(output) = outputs.last_mut() else {
             return false;
         };
+        if !output.retain_eligible {
+            return false;
+        }
         output.retain_previous = true;
         true
     })
@@ -938,6 +950,8 @@ struct NativeHostStateInner {
     next_output: AtomicU64,
     next_create_attempt: AtomicU64,
     pending_viewport_closes: Mutex<BTreeMap<ViewportId, NativeViewportCloseRequest>>,
+    presented_outputs: Mutex<BTreeMap<ViewportId, PresentedNativeOutputFrame>>,
+    presentation_generations: Mutex<BTreeMap<ViewportId, u64>>,
 }
 
 /// Single-threaded event ordinal source owned by the outer winit dispatcher.
@@ -983,6 +997,8 @@ impl NativeHostState {
                 next_output: AtomicU64::new(1),
                 next_create_attempt: AtomicU64::new(1),
                 pending_viewport_closes: Mutex::new(BTreeMap::new()),
+                presented_outputs: Mutex::new(BTreeMap::new()),
+                presentation_generations: Mutex::new(BTreeMap::new()),
             })),
         }
     }
@@ -1109,17 +1125,21 @@ impl NativeHostState {
             window_id,
             create_attempt,
         };
+        let frame = inner.output_frame(viewport_id, window_id, snapshot);
+        let retain_eligible = inner.has_presented_output(viewport_id, frame);
         inner.handler.on_output_begin(token, snapshot, root_roster);
         ACTIVE_OUTPUTS.with(|outputs| {
             outputs.borrow_mut().push(ActiveNativeOutput {
                 token,
                 retain_previous: false,
+                retain_eligible,
             });
         });
         Some(NativeOutputScope {
             inner,
             ctx: ctx.clone(),
             token,
+            frame,
             active: true,
         })
     }
@@ -1146,6 +1166,27 @@ impl NativeHostState {
             },
             None,
         )
+    }
+
+    pub(crate) fn forget_presented_window(&self, viewport_id: ViewportId, window_id: WindowId) {
+        let Some(inner) = &self.inner else {
+            return;
+        };
+        inner.forget_presented_window(viewport_id, window_id);
+    }
+
+    pub(crate) fn forget_presented_viewport(&self, viewport_id: ViewportId) {
+        let Some(inner) = &self.inner else {
+            return;
+        };
+        inner.forget_presented_viewport(viewport_id);
+    }
+
+    pub(crate) fn invalidate_presented_viewport(&self, viewport_id: ViewportId) {
+        let Some(inner) = &self.inner else {
+            return;
+        };
+        inner.invalidate_presented_viewport(viewport_id);
     }
 
     pub(crate) fn prepare_deferred_window(
@@ -1479,6 +1520,7 @@ pub(crate) struct NativeOutputScope {
     inner: Arc<NativeHostStateInner>,
     ctx: egui::Context,
     token: NativeOutputToken,
+    frame: PresentedNativeOutputFrame,
     active: bool,
 }
 
@@ -1489,6 +1531,7 @@ impl NativeOutputScope {
             inner: Arc::clone(&self.inner),
             ctx: self.ctx.clone(),
             token: self.token,
+            frame: self.frame,
             ordinal: NativeOutputOrdinal(next_non_zero(
                 &self.inner.next_output,
                 "native output ordinal exhausted",
@@ -1540,6 +1583,7 @@ impl Drop for NativeOutputScope {
                 ordinal,
                 status: NativeOutputStatus::NotPresented,
             },
+            self.frame,
         );
     }
 }
@@ -1548,6 +1592,7 @@ pub(crate) struct NativeOutputSettlement {
     inner: Arc<NativeHostStateInner>,
     ctx: egui::Context,
     token: NativeOutputToken,
+    frame: PresentedNativeOutputFrame,
     ordinal: NativeOutputOrdinal,
     settled: bool,
     retain_previous: bool,
@@ -1580,6 +1625,7 @@ impl NativeOutputSettlement {
                 ordinal: self.ordinal,
                 status,
             },
+            self.frame,
         );
     }
 }
@@ -1590,7 +1636,105 @@ impl Drop for NativeOutputSettlement {
     }
 }
 
-fn notify_output(inner: &NativeHostStateInner, ctx: &egui::Context, result: NativeOutputResult) {
+impl NativeHostStateInner {
+    fn output_frame(
+        &self,
+        viewport_id: ViewportId,
+        window_id: WindowId,
+        snapshot: NativeWindowSnapshot,
+    ) -> PresentedNativeOutputFrame {
+        PresentedNativeOutputFrame {
+            window_id,
+            inner_size: snapshot
+                .inner_rect()
+                .map(|rect| (rect.width(), rect.height())),
+            generation: self.current_presentation_generation(viewport_id),
+        }
+    }
+
+    fn current_presentation_generation(&self, viewport_id: ViewportId) -> u64 {
+        *self
+            .presentation_generations
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&viewport_id)
+            .unwrap_or(&0)
+    }
+
+    fn has_presented_output(
+        &self,
+        viewport_id: ViewportId,
+        frame: PresentedNativeOutputFrame,
+    ) -> bool {
+        self.presented_outputs
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&viewport_id)
+            .is_some_and(|presented_frame| *presented_frame == frame)
+    }
+
+    fn record_output_result(&self, result: NativeOutputResult, frame: PresentedNativeOutputFrame) {
+        if result.status != NativeOutputStatus::Presented {
+            return;
+        }
+        self.presented_outputs
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(result.token.viewport_id, frame);
+    }
+
+    fn forget_presented_window(&self, viewport_id: ViewportId, window_id: WindowId) {
+        let mut presented_outputs = self
+            .presented_outputs
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if presented_outputs
+            .get(&viewport_id)
+            .is_some_and(|presented_frame| presented_frame.window_id == window_id)
+        {
+            presented_outputs.remove(&viewport_id);
+        }
+        drop(presented_outputs);
+        self.bump_presentation_generation(viewport_id);
+    }
+
+    fn forget_presented_viewport(&self, viewport_id: ViewportId) {
+        self.presented_outputs
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&viewport_id);
+        self.bump_presentation_generation(viewport_id);
+    }
+
+    fn invalidate_presented_viewport(&self, viewport_id: ViewportId) {
+        self.presented_outputs
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&viewport_id);
+        self.bump_presentation_generation(viewport_id);
+    }
+
+    fn bump_presentation_generation(&self, viewport_id: ViewportId) {
+        let mut generations = self
+            .presentation_generations
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let next_generation = generations
+            .get(&viewport_id)
+            .copied()
+            .unwrap_or(0)
+            .saturating_add(1);
+        generations.insert(viewport_id, next_generation);
+    }
+}
+
+fn notify_output(
+    inner: &NativeHostStateInner,
+    ctx: &egui::Context,
+    result: NativeOutputResult,
+    frame: PresentedNativeOutputFrame,
+) {
+    inner.record_output_result(result, frame);
     if inner.handler.on_output(result) == NativeHostWake::RepaintRoot {
         ctx.request_repaint_of(ViewportId::ROOT);
     }
@@ -2229,44 +2373,154 @@ mod tests {
     }
 
     #[test]
-    fn retained_output_reports_not_presented_and_leaves_the_previous_framebuffer() {
+    fn retained_output_requires_a_previous_exact_presentation() {
         let host = Arc::new(RecordingHost::default());
         let handler: Arc<dyn NativeHostHandler> = Arc::<RecordingHost>::clone(&host);
         let state = NativeHostState::new(Some(handler));
         let ctx = egui::Context::default();
         let child = ViewportId::from_hash_of("retained-output-child");
+        let root_window = WindowId::from(11);
+        let next_root_window = WindowId::from(12);
+        let child_window = WindowId::from(22);
 
         assert!(!retain_current_native_output());
         let root = state
-            .begin_output_for_test(&ctx, ViewportId::ROOT, WindowId::from(11))
+            .begin_output_for_test(&ctx, ViewportId::ROOT, root_window)
             .expect("the root output scope exists");
-        let root_token = current_native_output_token().expect("the root token is active");
-        assert!(retain_current_native_output());
+        assert!(!retain_current_native_output());
+        root.finish().present();
 
-        let settlement = root.finish();
-        assert!(!settlement.should_present());
-        settlement.present();
+        let retained_root = state
+            .begin_output_for_test(&ctx, ViewportId::ROOT, root_window)
+            .expect("the retained root output scope exists");
+        assert!(retain_current_native_output());
+        let retained_root = retained_root.finish();
+        assert!(!retained_root.should_present());
+        retained_root.present();
+
+        let replaced_root = state
+            .begin_output_for_test(&ctx, ViewportId::ROOT, next_root_window)
+            .expect("the replacement root output scope exists");
+        assert!(!retain_current_native_output());
+        replaced_root.finish().present();
+
+        let first_child = state
+            .begin_output_for_test(&ctx, child, child_window)
+            .expect("the first child output scope exists");
+        assert!(!retain_current_native_output());
+        first_child.finish().present();
+
+        let retained_child = state
+            .begin_output_for_test(&ctx, child, child_window)
+            .expect("the retained child output scope exists");
+        let child_token = current_native_output_token().expect("the child token is active");
+        assert!(retain_current_native_output());
+        let retained_child = retained_child.finish();
+        assert!(!retained_child.should_present());
+        retained_child.present();
 
         let outputs = host.outputs.lock();
-        assert_eq!(outputs.len(), 1);
-        assert_eq!(outputs[0].token(), root_token);
-        assert_eq!(outputs[0].status(), NativeOutputStatus::NotPresented);
-        drop(outputs);
-        host.outputs.lock().clear();
-        let scope = state
-            .begin_output_for_test(&ctx, child, WindowId::from(22))
-            .expect("the native output scope exists");
-        let token = current_native_output_token().expect("the child token is active");
+        assert_eq!(outputs.len(), 5);
+        assert_eq!(outputs[1].status(), NativeOutputStatus::NotPresented);
+        assert_eq!(outputs[4].token(), child_token);
+        assert_eq!(outputs[4].status(), NativeOutputStatus::NotPresented);
+    }
+
+    #[test]
+    fn forgetting_presented_frames_clears_retain_eligibility() {
+        let host = Arc::new(RecordingHost::default());
+        let handler: Arc<dyn NativeHostHandler> = Arc::<RecordingHost>::clone(&host);
+        let state = NativeHostState::new(Some(handler));
+        let ctx = egui::Context::default();
+        let child = ViewportId::from_hash_of("forget-retained-output-child");
+        let child_window = WindowId::from(42);
+
+        state
+            .begin_output_for_test(&ctx, child, child_window)
+            .expect("the child output scope exists")
+            .finish()
+            .present();
+
+        let retained_child = state
+            .begin_output_for_test(&ctx, child, child_window)
+            .expect("the retained child output scope exists");
         assert!(retain_current_native_output());
+        retained_child.finish().present();
 
-        let settlement = scope.finish();
-        assert!(!settlement.should_present());
-        settlement.present();
+        let retained_child_again = state
+            .begin_output_for_test(&ctx, child, child_window)
+            .expect("not presented does not clear the child framebuffer ledger");
+        assert!(retain_current_native_output());
+        drop(retained_child_again);
 
-        let outputs = host.outputs.lock();
-        assert_eq!(outputs.len(), 1);
-        assert_eq!(outputs[0].token(), token);
-        assert_eq!(outputs[0].status(), NativeOutputStatus::NotPresented);
+        state.forget_presented_window(child, child_window);
+
+        let forgotten_window = state
+            .begin_output_for_test(&ctx, child, child_window)
+            .expect("the forgotten child output scope exists");
+        assert!(!retain_current_native_output());
+        forgotten_window.finish().present();
+
+        state
+            .begin_output_for_test(&ctx, child, child_window)
+            .expect("the child output scope exists again")
+            .finish()
+            .present();
+        state.forget_presented_viewport(child);
+
+        let forgotten_viewport = state
+            .begin_output_for_test(&ctx, child, child_window)
+            .expect("the forgotten viewport output scope exists");
+        assert!(!retain_current_native_output());
+        forgotten_viewport.finish().present();
+    }
+
+    #[test]
+    fn retained_output_requires_matching_inner_size_and_generation() {
+        let host = Arc::new(RecordingHost::default());
+        let handler: Arc<dyn NativeHostHandler> = Arc::<RecordingHost>::clone(&host);
+        let state = NativeHostState::new(Some(handler));
+        let ctx = egui::Context::default();
+        let viewport_id = ViewportId::ROOT;
+        let window_id = WindowId::from(77);
+        let initial_snapshot = NativeWindowSnapshot {
+            inner_rect: Some(NativePhysicalRect::new(0, 0, 800, 600)),
+            outer_rect: None,
+            native_scale_factor: 1.0,
+            presentation_scale_factor: 1.0,
+            visible: Some(true),
+            minimized: Some(false),
+        };
+        let resized_snapshot = NativeWindowSnapshot {
+            inner_rect: Some(NativePhysicalRect::new(0, 0, 801, 600)),
+            ..initial_snapshot
+        };
+
+        state
+            .begin_output(&ctx, viewport_id, window_id, None, initial_snapshot, None)
+            .expect("the initial output scope exists")
+            .finish()
+            .present();
+
+        let retained_same_size = state
+            .begin_output(&ctx, viewport_id, window_id, None, initial_snapshot, None)
+            .expect("the retained output scope exists");
+        assert!(retain_current_native_output());
+        retained_same_size.finish().present();
+
+        let resized_output = state
+            .begin_output(&ctx, viewport_id, window_id, None, resized_snapshot, None)
+            .expect("the resized output scope exists");
+        assert!(!retain_current_native_output());
+        resized_output.finish().present();
+
+        state.invalidate_presented_viewport(viewport_id);
+
+        let invalidated_generation = state
+            .begin_output(&ctx, viewport_id, window_id, None, resized_snapshot, None)
+            .expect("the invalidated output scope exists");
+        assert!(!retain_current_native_output());
+        invalidated_generation.finish().present();
     }
 
     #[test]

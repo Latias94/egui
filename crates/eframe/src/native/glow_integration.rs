@@ -1116,6 +1116,15 @@ impl GlowWinitRunning<'_> {
                 }
             }
 
+            winit::event::WindowEvent::ScaleFactorChanged { .. } => {
+                if let Some(viewport_id) = viewport_id {
+                    #[cfg(feature = "native-host-seam")]
+                    glutin
+                        .native_host
+                        .invalidate_presented_viewport(viewport_id);
+                }
+            }
+
             winit::event::WindowEvent::Occluded(is_occluded) => {
                 if let Some(viewport_id) = viewport_id
                     && let Some(viewport) = glutin.viewports.get_mut(&viewport_id)
@@ -1551,6 +1560,8 @@ impl GlutinWindowContext {
                         failed_window,
                         &mut self.viewport_from_window,
                         &mut self.window_from_viewport,
+                        #[cfg(feature = "native-host-seam")]
+                        &self.native_host,
                     );
                     #[cfg(feature = "native-host-seam")]
                     if let Some(create_attempt) = native_create_attempt {
@@ -1589,6 +1600,8 @@ impl GlutinWindowContext {
                         failed_window,
                         &mut self.viewport_from_window,
                         &mut self.window_from_viewport,
+                        #[cfg(feature = "native-host-seam")]
+                        &self.native_host,
                     );
                     #[cfg(feature = "native-host-seam")]
                     {
@@ -1626,6 +1639,8 @@ impl GlutinWindowContext {
                         failed_window,
                         &mut self.viewport_from_window,
                         &mut self.window_from_viewport,
+                        #[cfg(feature = "native-host-seam")]
+                        &self.native_host,
                     );
                     #[cfg(feature = "native-host-seam")]
                     {
@@ -1656,8 +1671,15 @@ impl GlutinWindowContext {
             self.current_gl_context = Some(current_gl_context);
         }
 
+        if let Some(previous_window) = self.window_from_viewport.insert(viewport_id, window.id())
+            && previous_window != window.id()
+        {
+            self.viewport_from_window.remove(&previous_window);
+            #[cfg(feature = "native-host-seam")]
+            self.native_host
+                .forget_presented_window(viewport_id, previous_window);
+        }
         self.viewport_from_window.insert(window.id(), viewport_id);
-        self.window_from_viewport.insert(viewport_id, window.id());
 
         Ok(())
     }
@@ -1667,6 +1689,9 @@ impl GlutinWindowContext {
         log::debug!("received suspend event. dropping window and surface");
         for viewport in self.viewports.values_mut() {
             viewport.gl_surface = None;
+            #[cfg(feature = "native-host-seam")]
+            self.native_host
+                .forget_presented_viewport(viewport.ids.this);
             viewport.window = None;
             #[cfg(feature = "native-host-seam")]
             {
@@ -1700,6 +1725,8 @@ impl GlutinWindowContext {
     fn resize(&mut self, viewport_id: ViewportId, physical_size: winit::dpi::PhysicalSize<u32>) {
         let width_px = NonZeroU32::new(physical_size.width).unwrap_or(NonZeroU32::MIN);
         let height_px = NonZeroU32::new(physical_size.height).unwrap_or(NonZeroU32::MIN);
+        #[cfg(feature = "native-host-seam")]
+        self.native_host.invalidate_presented_viewport(viewport_id);
 
         if let Some(viewport) = self.viewports.get(&viewport_id)
             && let Some(gl_surface) = &viewport.gl_surface
@@ -1727,6 +1754,14 @@ impl GlutinWindowContext {
         &mut self,
         viewport_output: &OrderedViewportIdMap<ViewportOutput>,
     ) {
+        #[cfg(feature = "native-host-seam")]
+        let removed_viewports = self
+            .viewports
+            .keys()
+            .copied()
+            .filter(|viewport_id| !viewport_output.contains_key(viewport_id))
+            .collect::<Vec<_>>();
+
         // GC old viewports
         self.viewports
             .retain(|id, _| viewport_output.contains_key(id));
@@ -1734,6 +1769,10 @@ impl GlutinWindowContext {
             .retain(|_, id| viewport_output.contains_key(id));
         self.window_from_viewport
             .retain(|id, _| viewport_output.contains_key(id));
+        #[cfg(feature = "native-host-seam")]
+        for viewport_id in removed_viewports {
+            self.native_host.forget_presented_viewport(viewport_id);
+        }
     }
 
     fn handle_viewport_output(
@@ -1800,6 +1839,7 @@ fn clear_failed_window(
     window_id: WindowId,
     viewport_from_window: &mut HashMap<WindowId, ViewportId>,
     window_from_viewport: &mut OrderedViewportIdMap<WindowId>,
+    #[cfg(feature = "native-host-seam")] native_host: &NativeHostState,
 ) {
     viewport.gl_surface = None;
     viewport.window = None;
@@ -1807,6 +1847,7 @@ fn clear_failed_window(
     #[cfg(feature = "native-host-seam")]
     {
         viewport.native_create_attempt = None;
+        native_host.forget_presented_window(viewport_id, window_id);
     }
     viewport_from_window.remove(&window_id);
     window_from_viewport.remove(&viewport_id);

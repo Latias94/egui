@@ -131,6 +131,21 @@ pub struct Viewport {
     native_create_attempt: Option<NativeViewportCreateAttempt>,
 }
 
+struct ViewportRecreateCleanup<'a> {
+    viewport_from_window: &'a mut HashMap<WindowId, ViewportId>,
+    #[cfg(feature = "native-host-seam")]
+    native_host: &'a NativeHostState,
+}
+
+impl ViewportRecreateCleanup<'_> {
+    fn forget_replaced_window(&mut self, viewport_id: ViewportId, window_id: WindowId) {
+        self.viewport_from_window.remove(&window_id);
+        #[cfg(feature = "native-host-seam")]
+        self.native_host
+            .forget_presented_window(viewport_id, window_id);
+    }
+}
+
 impl Drop for Viewport {
     fn drop(&mut self) {
         // Avoid debug panic when dropping unapplied deltas on teardown
@@ -214,6 +229,11 @@ impl<'app> WgpuWinitApp<'app> {
             ..
         } = &mut *running.shared.borrow_mut();
 
+        let mut recreate_cleanup = ViewportRecreateCleanup {
+            viewport_from_window,
+            #[cfg(feature = "native-host-seam")]
+            native_host,
+        };
         initialize_or_update_viewport(
             viewports,
             ViewportIdPair::ROOT,
@@ -221,6 +241,7 @@ impl<'app> WgpuWinitApp<'app> {
             self.native_options.viewport.clone(),
             None,
             painter,
+            &mut recreate_cleanup,
         )
         .initialize_window(
             event_loop,
@@ -237,7 +258,15 @@ impl<'app> WgpuWinitApp<'app> {
     fn drop_window(&mut self) -> Result<(), egui_wgpu::WgpuError> {
         if let Some(running) = &mut self.running {
             let mut shared = running.shared.borrow_mut();
-            shared.viewports.remove(&ViewportId::ROOT);
+            if let Some(viewport) = shared.viewports.remove(&ViewportId::ROOT)
+                && let Some(window) = viewport.window
+            {
+                shared.viewport_from_window.remove(&window.id());
+                #[cfg(feature = "native-host-seam")]
+                shared
+                    .native_host
+                    .forget_presented_window(ViewportId::ROOT, window.id());
+            }
             pollster::block_on(shared.painter.set_window(ViewportId::ROOT, None))?;
         }
         Ok(())
@@ -846,7 +875,7 @@ impl WgpuWinitRunning<'_> {
                             &integration.egui_ctx,
                             commands,
                             #[cfg(feature = "native-host-seam")]
-                            &native_host,
+                            native_host,
                         );
                     }
                 }
@@ -930,7 +959,14 @@ impl WgpuWinitRunning<'_> {
 
         pending_deltas.append(textures_delta);
 
-        remove_viewports_not_in(viewports, painter, viewport_from_window, &viewport_output);
+        remove_viewports_not_in(
+            viewports,
+            painter,
+            viewport_from_window,
+            &viewport_output,
+            #[cfg(feature = "native-host-seam")]
+            native_host,
+        );
 
         let Some(viewport) = viewports.get_mut(&viewport_id) else {
             return Ok(EventResult::Wait);
@@ -1145,8 +1181,17 @@ impl WgpuWinitRunning<'_> {
                         shared.resized_viewport = viewport_id;
                         shared.painter.on_window_resize_state_change(id, true);
                     }
+                    #[cfg(feature = "native-host-seam")]
+                    shared.native_host.invalidate_presented_viewport(id);
                     shared.painter.on_window_resized(id, width, height);
                     repaint_asap = true;
+                }
+            }
+
+            winit::event::WindowEvent::ScaleFactorChanged { .. } => {
+                if let Some(id) = viewport_id {
+                    #[cfg(feature = "native-host-seam")]
+                    shared.native_host.invalidate_presented_viewport(id);
                 }
             }
 
@@ -1419,6 +1464,11 @@ fn render_immediate_viewport(
             ..
         } = &mut *shared.borrow_mut();
 
+        let mut recreate_cleanup = ViewportRecreateCleanup {
+            viewport_from_window,
+            #[cfg(feature = "native-host-seam")]
+            native_host,
+        };
         let viewport = initialize_or_update_viewport(
             viewports,
             ids,
@@ -1426,6 +1476,7 @@ fn render_immediate_viewport(
             builder,
             None,
             painter,
+            &mut recreate_cleanup,
         );
         if viewport.window.is_none() {
             event_loop_context::with_current_event_loop(|event_loop| {
@@ -1538,13 +1589,24 @@ pub(crate) fn remove_viewports_not_in(
     painter: &mut egui_wgpu::winit::Painter,
     viewport_from_window: &mut HashMap<WindowId, ViewportId>,
     viewport_output: &OrderedViewportIdMap<ViewportOutput>,
+    #[cfg(feature = "native-host-seam")] native_host: &NativeHostState,
 ) {
     let active_viewports_ids: ViewportIdSet = viewport_output.keys().copied().collect();
+    #[cfg(feature = "native-host-seam")]
+    let removed_viewports = viewports
+        .keys()
+        .copied()
+        .filter(|viewport_id| !active_viewports_ids.contains(viewport_id))
+        .collect::<Vec<_>>();
 
     // Prune dead viewports:
     viewports.retain(|id, _| active_viewports_ids.contains(id));
     viewport_from_window.retain(|_, id| active_viewports_ids.contains(id));
     painter.gc_viewports(&active_viewports_ids);
+    #[cfg(feature = "native-host-seam")]
+    for viewport_id in removed_viewports {
+        native_host.forget_presented_viewport(viewport_id);
+    }
 }
 
 /// Add new viewports, and update existing ones:
@@ -1570,8 +1632,20 @@ fn handle_viewport_output(
     {
         let ids = ViewportIdPair::from_self_and_parent(viewport_id, parent);
 
-        let viewport =
-            initialize_or_update_viewport(viewports, ids, class, builder, viewport_ui_cb, painter);
+        let mut recreate_cleanup = ViewportRecreateCleanup {
+            viewport_from_window,
+            #[cfg(feature = "native-host-seam")]
+            native_host,
+        };
+        let viewport = initialize_or_update_viewport(
+            viewports,
+            ids,
+            class,
+            builder,
+            viewport_ui_cb,
+            painter,
+            &mut recreate_cleanup,
+        );
 
         let old_inner_size = viewport.window.as_ref().map(|window| window.inner_size());
 
@@ -1594,12 +1668,21 @@ fn handle_viewport_output(
                     NonZeroU32::new(new_inner_size.height),
                 )
             {
+                #[cfg(feature = "native-host-seam")]
+                native_host.invalidate_presented_viewport(viewport_id);
                 painter.on_window_resized(viewport_id, width, height);
             }
         }
     }
 
-    remove_viewports_not_in(viewports, painter, viewport_from_window, viewport_output);
+    remove_viewports_not_in(
+        viewports,
+        painter,
+        viewport_from_window,
+        viewport_output,
+        #[cfg(feature = "native-host-seam")]
+        native_host,
+    );
 }
 
 fn initialize_or_update_viewport<'a>(
@@ -1609,6 +1692,7 @@ fn initialize_or_update_viewport<'a>(
     mut builder: ViewportBuilder,
     viewport_ui_cb: Option<Arc<dyn Fn(&mut egui::Ui) + Send + Sync>>,
     painter: &mut egui_wgpu::winit::Painter,
+    recreate_cleanup: &mut ViewportRecreateCleanup<'_>,
 ) -> &'a mut Viewport {
     use std::collections::btree_map::Entry;
 
@@ -1657,7 +1741,9 @@ fn initialize_or_update_viewport<'a>(
                     ids.this,
                     viewport.builder.title
                 );
-                viewport.window = None;
+                if let Some(window) = viewport.window.take() {
+                    recreate_cleanup.forget_replaced_window(viewport.ids.this, window.id());
+                }
                 viewport.egui_winit = None;
                 #[cfg(feature = "native-host-seam")]
                 {
