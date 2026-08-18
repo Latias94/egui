@@ -156,6 +156,20 @@ struct Viewport {
     native_create_attempt: Option<NativeViewportCreateAttempt>,
 }
 
+const fn should_clear_before_viewport_update(
+    clear_before_update: bool,
+    has_native_output_scope: bool,
+) -> bool {
+    clear_before_update && !has_native_output_scope
+}
+
+const fn should_clear_after_viewport_update(
+    cleared_before_update: bool,
+    render_hidden: bool,
+) -> bool {
+    !cleared_before_update || render_hidden
+}
+
 impl Viewport {
     /// Apply the commands, or defer them until we have a window.
     fn process_commands(
@@ -815,7 +829,40 @@ impl GlowWinitRunning<'_> {
         let has_many_viewports = self.glutin.borrow().viewports.len() > 1;
         let clear_before_update = !has_many_viewports; // HACK: for some reason, an early clear doesn't "take" on Mac with multiple viewports.
 
-        if is_visible && clear_before_update {
+        #[cfg(feature = "native-host-seam")]
+        let root_roster = (viewport_id == ViewportId::ROOT).then(|| {
+            let records = self
+                .glutin
+                .borrow()
+                .viewports
+                .iter()
+                .filter_map(|(id, viewport)| {
+                    viewport.window.as_deref().map(|window| {
+                        NativeViewportRecord::capture(*id, &self.integration.egui_ctx, window)
+                    })
+                })
+                .collect::<Vec<_>>();
+            NativeViewportRosterCapture::capture(event_loop, records)
+        });
+        #[cfg(feature = "native-host-seam")]
+        let output_scope = self.native_host.begin_output(
+            &self.integration.egui_ctx,
+            viewport_id,
+            window_id,
+            _create_attempt,
+            _output_snapshot,
+            root_roster
+                .as_ref()
+                .map(NativeViewportRosterCapture::as_borrowed),
+        );
+        #[cfg(feature = "native-host-seam")]
+        let has_native_output_scope = output_scope.is_some();
+        #[cfg(not(feature = "native-host-seam"))]
+        let has_native_output_scope = false;
+        let cleared_before_update =
+            should_clear_before_viewport_update(clear_before_update, has_native_output_scope);
+
+        if is_visible && cleared_before_update {
             // clear before we call update, so users can paint between clear-color and egui windows:
 
             let mut glutin = self.glutin.borrow_mut();
@@ -850,32 +897,6 @@ impl GlowWinitRunning<'_> {
         // The update function, which could call immediate viewports,
         // so make sure we don't hold any locks here required by the immediate viewports rendeer.
 
-        #[cfg(feature = "native-host-seam")]
-        let root_roster = (viewport_id == ViewportId::ROOT).then(|| {
-            let records = self
-                .glutin
-                .borrow()
-                .viewports
-                .iter()
-                .filter_map(|(id, viewport)| {
-                    viewport.window.as_deref().map(|window| {
-                        NativeViewportRecord::capture(*id, &self.integration.egui_ctx, window)
-                    })
-                })
-                .collect::<Vec<_>>();
-            NativeViewportRosterCapture::capture(event_loop, records)
-        });
-        #[cfg(feature = "native-host-seam")]
-        let output_scope = self.native_host.begin_output(
-            &self.integration.egui_ctx,
-            viewport_id,
-            window_id,
-            _create_attempt,
-            _output_snapshot,
-            root_roster
-                .as_ref()
-                .map(NativeViewportRosterCapture::as_borrowed),
-        );
         let full_output =
             self.integration
                 .update(self.app.as_mut(), viewport_ui_cb.as_deref(), raw_input);
@@ -948,7 +969,7 @@ impl GlowWinitRunning<'_> {
 
             let screen_size_in_pixels: [u32; 2] = window.inner_size().into();
 
-            if !clear_before_update || render_hidden {
+            if should_clear_after_viewport_update(cleared_before_update, render_hidden) {
                 painter.clear(screen_size_in_pixels, clear_color);
             }
 
@@ -2056,4 +2077,25 @@ fn save_screenshot_and_exit(
 
     #[expect(clippy::exit)]
     std::process::exit(0);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{should_clear_after_viewport_update, should_clear_before_viewport_update};
+
+    #[test]
+    fn native_output_scope_disables_early_clear() {
+        assert!(should_clear_before_viewport_update(true, false));
+        assert!(!should_clear_before_viewport_update(true, true));
+        assert!(!should_clear_before_viewport_update(false, false));
+        assert!(!should_clear_before_viewport_update(false, true));
+    }
+
+    #[test]
+    fn deferred_clear_runs_when_early_clear_was_skipped_or_hidden() {
+        assert!(should_clear_after_viewport_update(false, false));
+        assert!(should_clear_after_viewport_update(false, true));
+        assert!(!should_clear_after_viewport_update(true, false));
+        assert!(should_clear_after_viewport_update(true, true));
+    }
 }

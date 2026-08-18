@@ -914,17 +914,13 @@ pub fn current_native_output_token() -> Option<NativeOutputToken> {
 /// this viewport and reports [`NativeOutputStatus::NotPresented`] to the host. The previous native
 /// framebuffer therefore remains visible while the host waits for an ordered input boundary.
 ///
-/// Returns `false` when no deferred native output callback is active. Root outputs cannot be
-/// retained because some renderers may clear their sole root framebuffer before the UI callback.
+/// Returns `false` when no native output callback is active.
 pub fn retain_current_native_output() -> bool {
     ACTIVE_OUTPUTS.with(|outputs| {
         let mut outputs = outputs.borrow_mut();
         let Some(output) = outputs.last_mut() else {
             return false;
         };
-        if output.token.viewport_id() == ViewportId::ROOT {
-            return false;
-        }
         output.retain_previous = true;
         true
     })
@@ -2244,8 +2240,18 @@ mod tests {
         let root = state
             .begin_output_for_test(&ctx, ViewportId::ROOT, WindowId::from(11))
             .expect("the root output scope exists");
-        assert!(!retain_current_native_output());
-        drop(root);
+        let root_token = current_native_output_token().expect("the root token is active");
+        assert!(retain_current_native_output());
+
+        let settlement = root.finish();
+        assert!(!settlement.should_present());
+        settlement.present();
+
+        let outputs = host.outputs.lock();
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].token(), root_token);
+        assert_eq!(outputs[0].status(), NativeOutputStatus::NotPresented);
+        drop(outputs);
         host.outputs.lock().clear();
         let scope = state
             .begin_output_for_test(&ctx, child, WindowId::from(22))
