@@ -155,6 +155,7 @@ mod platform {
 
 #[cfg(target_os = "macos")]
 mod platform {
+    use objc2::rc::Retained;
     use objc2_app_kit::NSScreen;
     use objc2_foundation::NSRect;
     use winit::event_loop::ActiveEventLoop;
@@ -165,8 +166,12 @@ mod platform {
     #[expect(unsafe_code)]
     pub(super) fn capture(event_loop: &ActiveEventLoop) -> Option<Vec<NativeWorkAreaRecord>> {
         let mut records = Vec::new();
+        let mut common_scale_factor = None;
         for monitor in event_loop.available_monitors() {
             let scale_factor = monitor.scale_factor();
+            if !record_uniform_scale_factor(&mut common_scale_factor, scale_factor) {
+                return None;
+            }
             let display_position = monitor.position();
             let display_size = monitor.size();
             if display_size.width == 0 || display_size.height == 0 {
@@ -177,9 +182,10 @@ mod platform {
             if screen.is_null() {
                 return None;
             }
-            // SAFETY: `MonitorHandleExtMacOS::ns_screen` returns the live `NSScreen`
-            // corresponding to this monitor. The pointer is used only for this capture.
-            let screen = unsafe { &*screen };
+            // SAFETY: The pointer comes from a live `NSScreen`. Retaining it here
+            // establishes ownership for the complete frame/visible-frame read instead
+            // of relying on the temporary owner inside winit's extension method.
+            let screen = unsafe { Retained::retain(screen) }?;
             let display_bounds = NativePhysicalRect::new(
                 display_position.x,
                 display_position.y,
@@ -216,6 +222,11 @@ mod platform {
             || frame.size.height <= 0.0
             || visible.size.width <= 0.0
             || visible.size.height <= 0.0
+        {
+            return None;
+        }
+        if !physical_extent_matches(frame.size.width, scale_factor, display.width())
+            || !physical_extent_matches(frame.size.height, scale_factor, display.height())
         {
             return None;
         }
@@ -265,13 +276,48 @@ mod platform {
         (physical.is_finite() && physical <= f64::from(u32::MAX)).then(|| physical.round() as u32)
     }
 
+    fn physical_extent_matches(logical: f64, scale_factor: f64, physical: u32) -> bool {
+        let expected = logical * scale_factor;
+        expected.is_finite() && (expected - f64::from(physical)).abs() <= 1.0
+    }
+
+    fn record_uniform_scale_factor(expected: &mut Option<f64>, scale_factor: f64) -> bool {
+        const SCALE_EPSILON: f64 = 1.0e-6;
+
+        if !scale_factor.is_finite() || scale_factor <= 0.0 {
+            return false;
+        }
+        if let Some(current) = *expected {
+            (current - scale_factor).abs() <= SCALE_EPSILON
+        } else {
+            *expected = Some(scale_factor);
+            true
+        }
+    }
+
     fn complete(mut records: Vec<NativeWorkAreaRecord>) -> Option<Vec<NativeWorkAreaRecord>> {
         records.sort_by_key(|record| record.display_id());
         (!records.is_empty()
             && records
                 .windows(2)
-                .all(|pair| pair[0].display_id() != pair[1].display_id()))
+                .all(|pair| pair[0].display_id() != pair[1].display_id())
+            && records.iter().enumerate().all(|(index, record)| {
+                records[index + 1..]
+                    .iter()
+                    .all(|other| !rects_overlap(record.display_bounds(), other.display_bounds()))
+            }))
         .then_some(records)
+    }
+
+    fn rects_overlap(first: NativePhysicalRect, second: NativePhysicalRect) -> bool {
+        let first_right = i64::from(first.x()) + i64::from(first.width());
+        let first_bottom = i64::from(first.y()) + i64::from(first.height());
+        let second_right = i64::from(second.x()) + i64::from(second.width());
+        let second_bottom = i64::from(second.y()) + i64::from(second.height());
+        i64::from(first.x()) < second_right
+            && i64::from(second.x()) < first_right
+            && i64::from(first.y()) < second_bottom
+            && i64::from(second.y()) < first_bottom
     }
 
     #[cfg(test)]
@@ -299,6 +345,40 @@ mod platform {
             let visible = NSRect::new(NSPoint::new(-1.0, 0.0), NSSize::new(1_441.0, 900.0));
 
             assert_eq!(physical_work_area(display, 1.0, frame, visible), None);
+        }
+
+        #[test]
+        fn mismatched_backing_extent_is_rejected() {
+            let display = NativePhysicalRect::new(0, 0, 2_880, 1_800);
+            let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(1_440.0, 900.0));
+
+            assert_eq!(physical_work_area(display, 1.0, frame, frame), None);
+        }
+
+        #[test]
+        fn mixed_display_scales_are_not_published_as_one_exact_roster() {
+            let mut common = None;
+
+            assert!(record_uniform_scale_factor(&mut common, 2.0));
+            assert!(!record_uniform_scale_factor(&mut common, 1.0));
+        }
+
+        #[test]
+        fn overlapping_display_records_are_rejected() {
+            let first = NativeWorkAreaRecord::new(
+                1,
+                NativePhysicalRect::new(0, 0, 1_920, 1_080),
+                NativePhysicalRect::new(0, 24, 1_920, 1_056),
+                1.0,
+            );
+            let mirrored = NativeWorkAreaRecord::new(
+                2,
+                NativePhysicalRect::new(0, 0, 1_920, 1_080),
+                NativePhysicalRect::new(0, 24, 1_920, 1_056),
+                1.0,
+            );
+
+            assert_eq!(complete(vec![first, mirrored]), None);
         }
     }
 }
