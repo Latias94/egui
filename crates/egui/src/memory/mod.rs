@@ -829,6 +829,10 @@ impl Memory {
             .expect("Memory broken: no area for the current viewport")
     }
 
+    pub(crate) fn areas_for(&self, viewport_id: ViewportId) -> Option<&Areas> {
+        self.areas.get(&viewport_id)
+    }
+
     /// Access memory of the [`Area`](crate::containers::area::Area)s, such as `Window`s.
     pub fn areas_mut(&mut self) -> &mut Areas {
         self.areas.entry(self.viewport_id).or_default()
@@ -994,6 +998,12 @@ impl Memory {
     /// Get the top modal layer (from the previous frame).
     pub fn top_modal_layer(&self) -> Option<LayerId> {
         self.focus()?.top_modal_layer()
+    }
+
+    pub(crate) fn top_modal_layer_for(&self, viewport_id: ViewportId) -> Option<LayerId> {
+        self.focus
+            .get(&viewport_id)
+            .and_then(Focus::top_modal_layer)
     }
 
     /// Stop editing the active [`TextEdit`](crate::TextEdit) (if any).

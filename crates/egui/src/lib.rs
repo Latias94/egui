@@ -475,8 +475,8 @@ pub use self::{
     epaint::text::TextWrapMode,
     grid::Grid,
     hit_test::{
-        WidgetHitIdentity, WidgetHitSnapshot, WidgetScrollDelta, WidgetScrollHit,
-        WidgetScrollHitChallenge, WidgetScrollHitSnapshot,
+        CompletedPassHitAuthority, WidgetHitIdentity, WidgetHitSnapshot, WidgetScrollDelta,
+        WidgetScrollHit, WidgetScrollHitChallenge, WidgetScrollHitSnapshot,
     },
     id::{AsId, Id, IdMap, IdSet},
     id_salt::{AsIdSalt, IdSalt},

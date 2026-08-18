@@ -2,7 +2,227 @@ use ahash::HashMap;
 
 use emath::TSTransform;
 
-use crate::{LayerId, Pos2, Rect, Sense, Vec2, Vec2b, WidgetRect, WidgetRects, emath, id::IdSet};
+use crate::{
+    LayerId, Pos2, Rect, Sense, Vec2, Vec2b, WidgetRect, WidgetRects, emath, id::IdSet,
+    memory::Areas,
+};
+
+/// Immutable hit-test authority captured from one completed viewport pass.
+///
+/// This freezes every egui fact used by [`crate::Context::hit_test_last_pass`] and
+/// [`crate::Context::scroll_hit_test_last_pass`]. Later passes may replace widgets, reorder or
+/// disable areas, change layer transforms, or adjust the interaction radius without changing this
+/// authority's answers.
+///
+/// The type intentionally exposes only point and scroll queries. Its retained widget graph, layer
+/// state, transforms, and scroll records remain implementation details.
+#[derive(Clone)]
+pub struct CompletedPassHitAuthority {
+    cumulative_pass_nr: u64,
+    widgets: WidgetRects,
+    scroll_hits: WidgetScrollHitRecords,
+    areas: Areas,
+    layer_to_global: HashMap<LayerId, TSTransform>,
+    interaction_radius: f32,
+    top_modal_layer: Option<LayerId>,
+}
+
+impl core::fmt::Debug for CompletedPassHitAuthority {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter
+            .debug_struct("CompletedPassHitAuthority")
+            .field("cumulative_pass_nr", &self.cumulative_pass_nr)
+            .finish_non_exhaustive()
+    }
+}
+
+impl CompletedPassHitAuthority {
+    pub(crate) fn new(
+        cumulative_pass_nr: u64,
+        widgets: WidgetRects,
+        scroll_hits: WidgetScrollHitRecords,
+        areas: Areas,
+        layer_to_global: HashMap<LayerId, TSTransform>,
+        interaction_radius: f32,
+        top_modal_layer: Option<LayerId>,
+    ) -> Self {
+        Self {
+            cumulative_pass_nr,
+            widgets,
+            scroll_hits,
+            areas,
+            layer_to_global,
+            interaction_radius,
+            top_modal_layer,
+        }
+    }
+
+    /// Returns the exact completed-pass generation represented by this authority.
+    #[must_use]
+    pub const fn cumulative_pass_nr(&self) -> u64 {
+        self.cumulative_pass_nr
+    }
+
+    /// Hit-tests one point against the frozen completed pass.
+    ///
+    /// Returns `None` only when the point is not finite. A snapshot with empty lanes is
+    /// authoritative evidence that no widget in this completed pass owns those lanes.
+    #[must_use]
+    pub fn hit_test(&self, position: Pos2) -> Option<WidgetHitSnapshot> {
+        self.as_state().hit_test(position)
+    }
+
+    /// Resolves one scroll edge against the frozen completed pass.
+    ///
+    /// `presented_candidates` must contain only identities bound to the exact product output being
+    /// queried. Framework scroll areas and unrecognized frontmost candidates remain blockers.
+    #[must_use]
+    pub fn scroll_hit_test(
+        &self,
+        position: Pos2,
+        presented_candidates: &[WidgetHitIdentity],
+        challenge: WidgetScrollHitChallenge,
+    ) -> Option<WidgetScrollHitSnapshot> {
+        self.as_state()
+            .scroll_hit_test(position, presented_candidates, challenge)
+    }
+
+    fn as_state(&self) -> CompletedPassHitState<'_> {
+        CompletedPassHitState::new(
+            self.cumulative_pass_nr,
+            &self.widgets,
+            &self.scroll_hits,
+            &self.areas,
+            &self.layer_to_global,
+            self.interaction_radius,
+            self.top_modal_layer,
+        )
+    }
+}
+
+pub(crate) struct CompletedPassHitState<'a> {
+    cumulative_pass_nr: u64,
+    widgets: &'a WidgetRects,
+    scroll_hits: &'a WidgetScrollHitRecords,
+    areas: &'a Areas,
+    layer_to_global: &'a HashMap<LayerId, TSTransform>,
+    interaction_radius: f32,
+    top_modal_layer: Option<LayerId>,
+}
+
+impl<'a> CompletedPassHitState<'a> {
+    pub(crate) fn new(
+        cumulative_pass_nr: u64,
+        widgets: &'a WidgetRects,
+        scroll_hits: &'a WidgetScrollHitRecords,
+        areas: &'a Areas,
+        layer_to_global: &'a HashMap<LayerId, TSTransform>,
+        interaction_radius: f32,
+        top_modal_layer: Option<LayerId>,
+    ) -> Self {
+        Self {
+            cumulative_pass_nr,
+            widgets,
+            scroll_hits,
+            areas,
+            layer_to_global,
+            interaction_radius,
+            top_modal_layer,
+        }
+    }
+
+    pub(crate) fn hit_test(&self, position: Pos2) -> Option<WidgetHitSnapshot> {
+        if self.cumulative_pass_nr == 0 || !position.is_finite() {
+            return None;
+        }
+
+        let mut layers: Vec<LayerId> = self
+            .widgets
+            .layer_ids()
+            .filter(|layer_id| self.areas.is_interactable(*layer_id))
+            .collect();
+        layers.sort_by(|&a, &b| self.areas.compare_order(a, b));
+
+        let hits = hit_test(
+            self.widgets,
+            &layers,
+            self.layer_to_global,
+            position,
+            self.interaction_radius,
+        );
+        Some(WidgetHitSnapshot::from_hits(self.cumulative_pass_nr, &hits))
+    }
+
+    pub(crate) fn scroll_hit_test(
+        &self,
+        position: Pos2,
+        presented_candidates: &[WidgetHitIdentity],
+        challenge: WidgetScrollHitChallenge,
+    ) -> Option<WidgetScrollHitSnapshot> {
+        if self.cumulative_pass_nr == 0 || !position.is_finite() {
+            return None;
+        }
+
+        let top_layer = self.layer_id_at(position);
+        let projected_delta = challenge.projected_delta();
+        let mut selected_route = None;
+        let mut eligible_route_was_occluded = false;
+
+        for record in self.scroll_hits.front_to_back() {
+            let layer_id = record.layer_id();
+            if !layer_id.order.allow_interaction() || !self.areas.is_interactable(layer_id) {
+                continue;
+            }
+
+            let to_global = self.layer_to_global.get(&layer_id).copied();
+            if !record.contains_global_position(position, to_global) {
+                continue;
+            }
+            let Some(route) = record.route(projected_delta) else {
+                continue;
+            };
+
+            if top_layer == Some(layer_id) {
+                selected_route = Some(route);
+                break;
+            }
+
+            if let Some(top_layer) = top_layer
+                && matches!(
+                    self.areas.compare_order(layer_id, top_layer),
+                    core::cmp::Ordering::Less
+                )
+            {
+                eligible_route_was_occluded = true;
+            }
+        }
+
+        let hit = match selected_route {
+            Some(WidgetScrollHitRoute::Candidate(candidate)) => {
+                challenge.classify_candidate(candidate, presented_candidates)
+            }
+            Some(WidgetScrollHitRoute::Framework) => WidgetScrollHit::Blocked,
+            None if eligible_route_was_occluded => WidgetScrollHit::Blocked,
+            None => WidgetScrollHit::NoReceiver,
+        };
+
+        Some(WidgetScrollHitSnapshot::new(self.cumulative_pass_nr, hit))
+    }
+
+    fn layer_id_at(&self, position: Pos2) -> Option<LayerId> {
+        let layer_id = self.areas.layer_id_at(position, self.layer_to_global)?;
+        if let Some(modal_layer) = self.top_modal_layer
+            && matches!(
+                self.areas.compare_order(layer_id, modal_layer),
+                core::cmp::Ordering::Less
+            )
+        {
+            Some(modal_layer)
+        } else {
+            Some(layer_id)
+        }
+    }
+}
 
 /// Opaque identity of one widget selected by a completed-pass hit test.
 ///
