@@ -30,8 +30,7 @@ use winit_integration::UserEvent;
 #[cfg(feature = "native-host-seam")]
 use crate::native::host_seam::{
     NativeDeferredWindowPreparation, NativeHostState, NativeViewportCreateAttempt,
-    NativeViewportCreateFailureKind, NativeViewportRecord, NativeViewportRosterCapture,
-    NativeWindowSnapshot,
+    NativeViewportCreateFailureKind, NativeViewportRosterCapture,
 };
 use crate::{
     App, AppCreator, CreationContext, NativeOptions, Result, Storage,
@@ -787,7 +786,8 @@ impl WgpuWinitRunning<'_> {
             #[cfg(not(feature = "native-host-seam"))]
             let render_hidden = false;
             #[cfg(feature = "native-host-seam")]
-            let output_snapshot = NativeWindowSnapshot::capture(&integration.egui_ctx, window);
+            let output_snapshot =
+                native_host.capture_window_snapshot(&integration.egui_ctx, viewport_id, window);
             #[cfg(not(feature = "native-host-seam"))]
             let output_snapshot = ();
             #[cfg(feature = "native-host-seam")]
@@ -908,7 +908,7 @@ impl WgpuWinitRunning<'_> {
                 .iter()
                 .filter_map(|(id, viewport)| {
                     viewport.window.as_deref().map(|window| {
-                        NativeViewportRecord::capture(*id, &integration.egui_ctx, window)
+                        native_host.capture_viewport_record(*id, &integration.egui_ctx, window)
                     })
                 })
                 .collect::<Vec<_>>();
@@ -1355,6 +1355,9 @@ impl Viewport {
                 return Err(err);
             }
         };
+        #[cfg(feature = "native-host-seam")]
+        native_host.apply_viewport_builder_to_window(egui_ctx, viewport_id, &window, &self.builder);
+        #[cfg(not(feature = "native-host-seam"))]
         egui_winit::apply_viewport_builder_to_window(egui_ctx, &window, &self.builder);
         #[cfg(feature = "native-host-seam")]
         if let Some(native_override) = native_override {

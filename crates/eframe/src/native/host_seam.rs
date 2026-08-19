@@ -348,6 +348,22 @@ pub struct NativeWindowSnapshot {
     presentation_scale_factor: f64,
     visible: Option<bool>,
     minimized: Option<bool>,
+    input_state: NativeWindowInputState,
+}
+
+/// Exact cursor hit-test state of one live native window.
+///
+/// A newly observed window starts in [`Self::ReceivesInput`], matching winit's
+/// default window configuration. Eframe records a change only after the
+/// matching native window accepts a cursor hit-test operation. The fact is
+/// scoped to the exact `(viewport, window)` incarnation and resets when that
+/// viewport acquires a replacement window.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum NativeWindowInputState {
+    /// The native window participates in pointer hit testing.
+    ReceivesInput,
+    /// Pointer hit testing passes through the native window.
+    PassThrough,
 }
 
 /// One native window in a root-output roster captured from live backend windows.
@@ -378,11 +394,12 @@ impl NativeViewportRecord {
         viewport_id: ViewportId,
         egui_ctx: &egui::Context,
         window: &Window,
+        input_state: NativeWindowInputState,
     ) -> Self {
         Self {
             viewport_id,
             window_id: window.id(),
-            window: NativeWindowSnapshot::capture(egui_ctx, window),
+            window: NativeWindowSnapshot::capture(egui_ctx, window, input_state),
         }
     }
 }
@@ -536,7 +553,16 @@ impl NativeWindowSnapshot {
         self.minimized
     }
 
-    pub(crate) fn capture(egui_ctx: &egui::Context, window: &Window) -> Self {
+    /// Returns the exact cursor hit-test state for this window incarnation.
+    pub const fn input_state(self) -> NativeWindowInputState {
+        self.input_state
+    }
+
+    pub(crate) fn capture(
+        egui_ctx: &egui::Context,
+        window: &Window,
+        input_state: NativeWindowInputState,
+    ) -> Self {
         let inner_rect = window
             .inner_position()
             .ok()
@@ -564,6 +590,7 @@ impl NativeWindowSnapshot {
             presentation_scale_factor: f64::from(egui_winit::pixels_per_point(egui_ctx, window)),
             visible,
             minimized,
+            input_state,
         }
     }
 }
@@ -943,6 +970,70 @@ pub(crate) struct NativeHostState {
     inner: Option<Arc<NativeHostStateInner>>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct NativeWindowInputRecord {
+    window_id: WindowId,
+    state: NativeWindowInputState,
+}
+
+#[derive(Debug, Default)]
+struct NativeWindowInputLedger {
+    records: BTreeMap<ViewportId, NativeWindowInputRecord>,
+}
+
+impl NativeWindowInputLedger {
+    fn capture(&mut self, viewport_id: ViewportId, window_id: WindowId) -> NativeWindowInputState {
+        let record = self
+            .records
+            .entry(viewport_id)
+            .and_modify(|record| {
+                if record.window_id != window_id {
+                    *record = NativeWindowInputRecord {
+                        window_id,
+                        state: NativeWindowInputState::ReceivesInput,
+                    };
+                }
+            })
+            .or_insert(NativeWindowInputRecord {
+                window_id,
+                state: NativeWindowInputState::ReceivesInput,
+            });
+        record.state
+    }
+
+    fn record_applied(
+        &mut self,
+        viewport_id: ViewportId,
+        window_id: WindowId,
+        state: NativeWindowInputState,
+    ) -> bool {
+        if let Some(record) = self.records.get_mut(&viewport_id) {
+            if record.window_id != window_id {
+                return false;
+            }
+            record.state = state;
+        } else {
+            self.records
+                .insert(viewport_id, NativeWindowInputRecord { window_id, state });
+        }
+        true
+    }
+
+    fn forget_window(&mut self, viewport_id: ViewportId, window_id: WindowId) {
+        if self
+            .records
+            .get(&viewport_id)
+            .is_some_and(|record| record.window_id == window_id)
+        {
+            self.records.remove(&viewport_id);
+        }
+    }
+
+    fn forget_viewport(&mut self, viewport_id: ViewportId) {
+        self.records.remove(&viewport_id);
+    }
+}
+
 struct NativeHostStateInner {
     handler: Arc<dyn NativeHostHandler>,
     attachment: NativeHostAttachment,
@@ -952,6 +1043,7 @@ struct NativeHostStateInner {
     pending_viewport_closes: Mutex<BTreeMap<ViewportId, NativeViewportCloseRequest>>,
     presented_outputs: Mutex<BTreeMap<ViewportId, PresentedNativeOutputFrame>>,
     presentation_generations: Mutex<BTreeMap<ViewportId, u64>>,
+    window_input: egui::mutex::Mutex<NativeWindowInputLedger>,
 }
 
 /// Single-threaded event ordinal source owned by the outer winit dispatcher.
@@ -999,6 +1091,7 @@ impl NativeHostState {
                 pending_viewport_closes: Mutex::new(BTreeMap::new()),
                 presented_outputs: Mutex::new(BTreeMap::new()),
                 presentation_generations: Mutex::new(BTreeMap::new()),
+                window_input: egui::mutex::Mutex::new(NativeWindowInputLedger::default()),
             })),
         }
     }
@@ -1102,6 +1195,82 @@ impl NativeHostState {
         }
     }
 
+    pub(crate) fn capture_window_snapshot(
+        &self,
+        egui_ctx: &egui::Context,
+        viewport_id: ViewportId,
+        window: &Window,
+    ) -> NativeWindowSnapshot {
+        let input_state = self
+            .inner
+            .as_ref()
+            .map_or(NativeWindowInputState::ReceivesInput, |inner| {
+                inner.capture_window_input_state(viewport_id, window.id())
+            });
+        NativeWindowSnapshot::capture(egui_ctx, window, input_state)
+    }
+
+    pub(crate) fn capture_viewport_record(
+        &self,
+        viewport_id: ViewportId,
+        egui_ctx: &egui::Context,
+        window: &Window,
+    ) -> NativeViewportRecord {
+        let input_state = self
+            .inner
+            .as_ref()
+            .map_or(NativeWindowInputState::ReceivesInput, |inner| {
+                inner.capture_window_input_state(viewport_id, window.id())
+            });
+        NativeViewportRecord::capture(viewport_id, egui_ctx, window, input_state)
+    }
+
+    pub(crate) fn apply_viewport_builder_to_window(
+        &self,
+        egui_ctx: &egui::Context,
+        viewport_id: ViewportId,
+        window: &Window,
+        builder: &ViewportBuilder,
+    ) {
+        if let Some(inner) = &self.inner {
+            let _ = inner.capture_window_input_state(viewport_id, window.id());
+        }
+        let Some(pointer_passthrough) = builder.mouse_passthrough else {
+            egui_winit::apply_viewport_builder_to_window(egui_ctx, window, builder);
+            return;
+        };
+        if self.inner.is_none() {
+            egui_winit::apply_viewport_builder_to_window(egui_ctx, window, builder);
+            return;
+        }
+
+        let mut remaining = builder.clone();
+        remaining.mouse_passthrough = None;
+        egui_winit::apply_viewport_builder_to_window(egui_ctx, window, &remaining);
+        if let Err(error) = self.apply_window_input_state(viewport_id, window, pointer_passthrough)
+        {
+            log::warn!("set_cursor_hittest failed: {error}");
+        }
+    }
+
+    pub(crate) fn apply_window_input_state(
+        &self,
+        viewport_id: ViewportId,
+        window: &Window,
+        pointer_passthrough: bool,
+    ) -> Result<NativeWindowInputState, winit::error::ExternalError> {
+        let state = apply_window_input_state(window, pointer_passthrough)?;
+        if let Some(inner) = &self.inner
+            && !inner.record_applied_window_input_state(viewport_id, window.id(), state)
+        {
+            log::warn!(
+                "discarding native input state from stale window {:?} for viewport {viewport_id:?}",
+                window.id()
+            );
+        }
+        Ok(state)
+    }
+
     pub(crate) fn begin_output(
         &self,
         ctx: &egui::Context,
@@ -1163,6 +1332,7 @@ impl NativeHostState {
                 presentation_scale_factor: 1.0,
                 visible: None,
                 minimized: None,
+                input_state: NativeWindowInputState::ReceivesInput,
             },
             None,
         )
@@ -1343,13 +1513,24 @@ impl NativeHostState {
                     NativeViewportFocusStatus::Requested
                 }
             });
-            egui_winit::process_viewport_commands(
-                ctx,
-                info,
-                std::iter::once(command),
-                window,
-                actions_requested,
-            );
+            if self.inner.is_some()
+                && let egui::ViewportCommand::MousePassthrough(enabled) = &command
+            {
+                match self.apply_window_input_state(viewport_id, window, *enabled) {
+                    Ok(_) => {}
+                    Err(error) => {
+                        log::warn!("{command:?}: {error}");
+                    }
+                }
+            } else {
+                egui_winit::process_viewport_commands(
+                    ctx,
+                    info,
+                    std::iter::once(command),
+                    window,
+                    actions_requested,
+                );
+            }
             if let Some(visible) = requested_visibility {
                 self.notify_viewport_visibility(ctx, viewport_id, window, visible);
             }
@@ -1359,8 +1540,8 @@ impl NativeHostState {
         }
 
         for command in take_native_viewport_pointer_passthrough_commands(ctx, viewport_id) {
-            let status = match window.set_cursor_hittest(!command.enabled) {
-                Ok(()) => NativeViewportPointerPassthroughStatus::Applied,
+            let status = match self.apply_window_input_state(viewport_id, window, command.enabled) {
+                Ok(_) => NativeViewportPointerPassthroughStatus::Applied,
                 Err(winit::error::ExternalError::NotSupported(_)) => {
                     NativeViewportPointerPassthroughStatus::Unsupported
                 }
@@ -1419,6 +1600,18 @@ impl Drop for NativeHostStateInner {
     fn drop(&mut self) {
         self.handler.detach(self.attachment);
     }
+}
+
+fn apply_window_input_state(
+    window: &Window,
+    pointer_passthrough: bool,
+) -> Result<NativeWindowInputState, winit::error::ExternalError> {
+    window.set_cursor_hittest(!pointer_passthrough)?;
+    Ok(if pointer_passthrough {
+        NativeWindowInputState::PassThrough
+    } else {
+        NativeWindowInputState::ReceivesInput
+    })
 }
 
 #[cfg(target_os = "linux")]
@@ -1637,6 +1830,25 @@ impl Drop for NativeOutputSettlement {
 }
 
 impl NativeHostStateInner {
+    fn capture_window_input_state(
+        &self,
+        viewport_id: ViewportId,
+        window_id: WindowId,
+    ) -> NativeWindowInputState {
+        self.window_input.lock().capture(viewport_id, window_id)
+    }
+
+    fn record_applied_window_input_state(
+        &self,
+        viewport_id: ViewportId,
+        window_id: WindowId,
+        state: NativeWindowInputState,
+    ) -> bool {
+        self.window_input
+            .lock()
+            .record_applied(viewport_id, window_id, state)
+    }
+
     fn output_frame(
         &self,
         viewport_id: ViewportId,
@@ -1695,6 +1907,9 @@ impl NativeHostStateInner {
             presented_outputs.remove(&viewport_id);
         }
         drop(presented_outputs);
+        self.window_input
+            .lock()
+            .forget_window(viewport_id, window_id);
         self.bump_presentation_generation(viewport_id);
     }
 
@@ -1703,6 +1918,7 @@ impl NativeHostStateInner {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .remove(&viewport_id);
+        self.window_input.lock().forget_viewport(viewport_id);
         self.bump_presentation_generation(viewport_id);
     }
 
@@ -2130,6 +2346,81 @@ mod tests {
     }
 
     #[test]
+    fn first_window_incarnation_defaults_to_receives_input() {
+        let mut ledger = NativeWindowInputLedger::default();
+        let viewport = ViewportId::from_hash_of("initial-input-window");
+        let window = WindowId::from(31);
+
+        assert_eq!(
+            ledger.capture(viewport, window),
+            NativeWindowInputState::ReceivesInput
+        );
+        assert_eq!(
+            ledger.capture(viewport, window),
+            NativeWindowInputState::ReceivesInput
+        );
+    }
+
+    #[test]
+    fn applied_pointer_passthrough_command_updates_the_next_snapshot() {
+        let mut ledger = NativeWindowInputLedger::default();
+        let viewport = ViewportId::from_hash_of("input-command-window");
+        let window = WindowId::from(32);
+
+        assert_eq!(
+            ledger.capture(viewport, window),
+            NativeWindowInputState::ReceivesInput
+        );
+        assert!(ledger.record_applied(viewport, window, NativeWindowInputState::PassThrough));
+        assert_eq!(
+            ledger.capture(viewport, window),
+            NativeWindowInputState::PassThrough
+        );
+        assert!(ledger.record_applied(viewport, window, NativeWindowInputState::ReceivesInput));
+        assert_eq!(
+            ledger.capture(viewport, window),
+            NativeWindowInputState::ReceivesInput
+        );
+    }
+
+    #[test]
+    fn replacement_window_resets_input_and_rejects_stale_command_state() {
+        let mut ledger = NativeWindowInputLedger::default();
+        let viewport = ViewportId::from_hash_of("replacement-input-window");
+        let first_window = WindowId::from(33);
+        let replacement_window = WindowId::from(34);
+
+        assert_eq!(
+            ledger.capture(viewport, first_window),
+            NativeWindowInputState::ReceivesInput
+        );
+        assert!(ledger.record_applied(viewport, first_window, NativeWindowInputState::PassThrough));
+        assert_eq!(
+            ledger.capture(viewport, replacement_window),
+            NativeWindowInputState::ReceivesInput
+        );
+        assert!(!ledger.record_applied(
+            viewport,
+            first_window,
+            NativeWindowInputState::PassThrough
+        ));
+        assert_eq!(
+            ledger.capture(viewport, replacement_window),
+            NativeWindowInputState::ReceivesInput
+        );
+        assert!(ledger.record_applied(
+            viewport,
+            replacement_window,
+            NativeWindowInputState::PassThrough
+        ));
+        ledger.forget_window(viewport, replacement_window);
+        assert_eq!(
+            ledger.capture(viewport, replacement_window),
+            NativeWindowInputState::ReceivesInput
+        );
+    }
+
+    #[test]
     fn hidden_rendering_is_opt_in_and_never_applies_to_root() {
         let child = ViewportId::from_hash_of("hidden-staging");
         let host = Arc::new(RecordingHost {
@@ -2361,6 +2652,7 @@ mod tests {
                 && snapshot.presentation_scale_factor() == 1.0
                 && snapshot.visible().is_none()
                 && snapshot.minimized().is_none()
+                && snapshot.input_state() == NativeWindowInputState::ReceivesInput
         }));
         assert_eq!(outputs.len(), 2);
         assert_eq!(outputs[0].token(), child_token);
@@ -2490,6 +2782,7 @@ mod tests {
             presentation_scale_factor: 1.0,
             visible: Some(true),
             minimized: Some(false),
+            input_state: NativeWindowInputState::ReceivesInput,
         };
         let resized_snapshot = NativeWindowSnapshot {
             inner_rect: Some(NativePhysicalRect::new(0, 0, 801, 600)),
@@ -2539,6 +2832,7 @@ mod tests {
             presentation_scale_factor: 2.5,
             visible: Some(true),
             minimized: Some(false),
+            input_state: NativeWindowInputState::ReceivesInput,
         };
         let child_snapshot = NativeWindowSnapshot {
             inner_rect: Some(NativePhysicalRect::new(900, 20, 640, 480)),
@@ -2547,6 +2841,7 @@ mod tests {
             presentation_scale_factor: 1.25,
             visible: None,
             minimized: None,
+            input_state: NativeWindowInputState::PassThrough,
         };
         let roster = [
             NativeViewportRecord {
@@ -2587,6 +2882,18 @@ mod tests {
         assert_eq!(output_begins.len(), 1);
         assert_eq!(output_begins[0].0, token);
         assert_eq!(output_begins[0].1, root_snapshot);
+        let recorded_roster = output_begins[0]
+            .2
+            .as_ref()
+            .expect("the root callback includes its native roster");
+        assert_eq!(
+            recorded_roster.records[0].window().input_state(),
+            NativeWindowInputState::ReceivesInput
+        );
+        assert_eq!(
+            recorded_roster.records[1].window().input_state(),
+            NativeWindowInputState::PassThrough
+        );
         assert_eq!(
             output_begins[0].2,
             Some(RecordedNativeViewportRoster {
@@ -2707,6 +3014,7 @@ mod tests {
                     presentation_scale_factor: 1.0,
                     visible: None,
                     minimized: None,
+                    input_state: NativeWindowInputState::ReceivesInput,
                 },
                 None,
             )

@@ -42,8 +42,7 @@ use crate::epaint::textures::TexturesDelta;
 #[cfg(feature = "native-host-seam")]
 use crate::native::host_seam::{
     NativeDeferredWindowPreparation, NativeHostState, NativeViewportCreateAttempt,
-    NativeViewportCreateFailureKind, NativeViewportRecord, NativeViewportRosterCapture,
-    NativeWindowSnapshot,
+    NativeViewportCreateFailureKind, NativeViewportRosterCapture,
 };
 use crate::{
     App, AppCreator, CreationContext, NativeOptions, Result, Storage,
@@ -384,6 +383,17 @@ impl<'app> GlowWinitApp<'app> {
             }
         }
 
+        #[cfg(feature = "native-host-seam")]
+        if self.native_options.viewport.mouse_passthrough == Some(true)
+            && let Err(err) = self.native_host.apply_window_input_state(
+                ViewportId::ROOT,
+                &glutin.window(ViewportId::ROOT),
+                true,
+            )
+        {
+            log::warn!("set_cursor_hittest(false) failed: {err}");
+        }
+        #[cfg(not(feature = "native-host-seam"))]
         if self
             .native_options
             .viewport
@@ -714,7 +724,9 @@ impl GlowWinitRunning<'_> {
             #[cfg(not(feature = "native-host-seam"))]
             let render_hidden = false;
             #[cfg(feature = "native-host-seam")]
-            let output_snapshot = NativeWindowSnapshot::capture(&egui_ctx, window);
+            let output_snapshot =
+                self.native_host
+                    .capture_window_snapshot(&egui_ctx, viewport_id, window);
             #[cfg(not(feature = "native-host-seam"))]
             let output_snapshot = ();
             #[cfg(feature = "native-host-seam")]
@@ -838,7 +850,11 @@ impl GlowWinitRunning<'_> {
                 .iter()
                 .filter_map(|(id, viewport)| {
                     viewport.window.as_deref().map(|window| {
-                        NativeViewportRecord::capture(*id, &self.integration.egui_ctx, window)
+                        self.native_host.capture_viewport_record(
+                            *id,
+                            &self.integration.egui_ctx,
+                            window,
+                        )
                     })
                 })
                 .collect::<Vec<_>>();
@@ -1314,6 +1330,14 @@ impl GlutinWindowContext {
                 .map_err(|e| crate::Error::NoGlutinConfigs(config_template_builder.build(), e))?
         };
         if let Some(window) = &window {
+            #[cfg(feature = "native-host-seam")]
+            native_host.apply_viewport_builder_to_window(
+                egui_ctx,
+                ViewportId::ROOT,
+                window,
+                &viewport_builder,
+            );
+            #[cfg(not(feature = "native-host-seam"))]
             egui_winit::apply_viewport_builder_to_window(egui_ctx, window, &viewport_builder);
         }
 
@@ -1513,6 +1537,14 @@ impl GlutinWindowContext {
                             );
                         }
                     })?;
+            #[cfg(feature = "native-host-seam")]
+            self.native_host.apply_viewport_builder_to_window(
+                &self.egui_ctx,
+                viewport_id,
+                &window,
+                &viewport.builder,
+            );
+            #[cfg(not(feature = "native-host-seam"))]
             egui_winit::apply_viewport_builder_to_window(
                 &self.egui_ctx,
                 &window,

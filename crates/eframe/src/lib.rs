@@ -212,8 +212,8 @@ pub use native::host_seam::{
     NativeViewportFocusStatus, NativeViewportPointerPassthroughCommandToken,
     NativeViewportPointerPassthroughResult, NativeViewportPointerPassthroughStatus,
     NativeViewportRecord, NativeViewportRoster, NativeViewportVisibilityResult,
-    NativeViewportVisibilityStatus, NativeWindowEvent, NativeWindowSnapshot,
-    NativeWindowingBackend, NativeWorkAreaRecord, NativeWorkAreaRoster,
+    NativeViewportVisibilityStatus, NativeWindowEvent, NativeWindowInputState,
+    NativeWindowSnapshot, NativeWindowingBackend, NativeWorkAreaRecord, NativeWorkAreaRoster,
     current_native_output_token, queue_native_viewport_pointer_passthrough,
     retain_current_native_output,
 };
