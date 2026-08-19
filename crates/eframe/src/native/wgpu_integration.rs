@@ -993,12 +993,20 @@ impl WgpuWinitRunning<'_> {
         let load_previous = render_mode == NativeOutputRenderMode::Overlay;
         #[cfg(not(feature = "native-host-seam"))]
         let load_previous = false;
-        if !load_previous {
+        #[cfg(feature = "native-host-seam")]
+        if load_previous {
+            egui_winit.handle_accesskit_update(platform_output.accesskit_update);
+        } else {
             egui_winit.handle_platform_output_with_event_loop(window, event_loop, platform_output);
         }
+        #[cfg(not(feature = "native-host-seam"))]
+        egui_winit.handle_platform_output_with_event_loop(window, event_loop, platform_output);
+        #[cfg(feature = "native-host-seam")]
         let should_present = output_settlement
             .as_ref()
             .is_none_or(|settlement| settlement.should_present());
+        #[cfg(not(feature = "native-host-seam"))]
+        let should_present = true;
         let vsync_secs = if (is_visible || render_hidden) && should_present {
             let clipped_primitives = egui_ctx.tessellate(shapes, pixels_per_point);
 

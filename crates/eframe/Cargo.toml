@@ -124,7 +124,7 @@ __screenshot = []
 inspection = ["dep:egui_inspection", "accesskit"]
 
 ## Expose a narrow native event and renderer-settlement seam for external host coordinators.
-native-host-seam = ["egui-wgpu?/native-host-seam"]
+native-host-seam = ["egui-wgpu?/native-host-seam", "egui-winit/native-host-seam"]
 
 ## Enables the `links` feature on `egui-winit`, allowing for links to open in browser.
 links = ["egui-winit/links"]

@@ -1100,6 +1100,32 @@ impl State {
         self.handle_platform_output_inner(window, Some(event_loop), platform_output);
     }
 
+    /// Applies only the accessibility-tree update from an egui output.
+    ///
+    /// Native integrations use this when a visual-only pass must not execute
+    /// clipboard, URL, cursor, or IME effects.
+    #[cfg(feature = "native-host-seam")]
+    #[doc(hidden)]
+    pub fn handle_accesskit_update(
+        &mut self,
+        accesskit_update: Option<egui::accesskit::TreeUpdate>,
+    ) {
+        self.apply_accesskit_update(accesskit_update);
+    }
+
+    fn apply_accesskit_update(&mut self, accesskit_update: Option<egui::accesskit::TreeUpdate>) {
+        #[cfg(feature = "accesskit")]
+        if let Some(accesskit) = self.accesskit.as_mut()
+            && let Some(update) = accesskit_update
+        {
+            profiling::scope!("accesskit");
+            accesskit.update_if_active(|| update);
+        }
+
+        #[cfg(not(feature = "accesskit"))]
+        let _ = accesskit_update;
+    }
+
     fn handle_platform_output_inner(
         &mut self,
         window: &Window,
@@ -1190,16 +1216,7 @@ impl State {
             self.ime_rect_px = None;
         }
 
-        #[cfg(feature = "accesskit")]
-        if let Some(accesskit) = self.accesskit.as_mut()
-            && let Some(update) = accesskit_update
-        {
-            profiling::scope!("accesskit");
-            accesskit.update_if_active(|| update);
-        }
-
-        #[cfg(not(feature = "accesskit"))]
-        let _ = accesskit_update;
+        self.apply_accesskit_update(accesskit_update);
     }
 
     /// Apply either a bitmap cursor (preferred when both `cursor_image`
