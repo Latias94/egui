@@ -50,6 +50,8 @@ struct PresentedNativeOutputFrame {
 pub(crate) enum NativeOutputRenderMode {
     /// Replace the framebuffer with this generated output.
     Replace,
+    /// Paint a fallback framebuffer without publishing presentation authority.
+    NoFrame,
     /// Keep the current framebuffer and skip this output's paint and swap.
     Skip,
     /// Load the exact current framebuffer and paint this output over it.
@@ -159,15 +161,16 @@ impl NativeOutputOrdinal {
     }
 }
 
-/// Terminal renderer disposition for one generated output.
+/// Terminal presentation-authority disposition for one generated output.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum NativeOutputStatus {
-    /// The renderer submitted and presented this viewport output.
+    /// The renderer presented this viewport output as semantic presentation authority.
     Presented,
-    /// This viewport output was not presented.
+    /// This viewport output did not become semantic presentation authority.
     ///
-    /// Texture commands remain owned by eframe's context-global texture batch and may be applied
-    /// by a different viewport output.
+    /// The renderer may have skipped the output, painted a no-frame fallback, or composited a
+    /// visual-only overlay. Texture commands remain owned by eframe's context-global texture batch
+    /// and may be applied by a different viewport output.
     NotPresented,
 }
 
@@ -190,7 +193,7 @@ impl NativeOutputResult {
         self.ordinal
     }
 
-    /// Returns the renderer's terminal disposition.
+    /// Returns the output's terminal presentation-authority disposition.
     pub const fn status(self) -> NativeOutputStatus {
         self.status
     }
@@ -991,6 +994,9 @@ fn request_current_native_output_mode(requested: NativeOutputRenderMode) -> bool
             return false;
         };
         if !output.retain_eligible {
+            if requested == NativeOutputRenderMode::Overlay {
+                output.render_mode = NativeOutputRenderMode::NoFrame;
+            }
             return false;
         }
         if requested == NativeOutputRenderMode::Overlay
@@ -1844,11 +1850,15 @@ impl NativeOutputSettlement {
     pub(crate) fn present(mut self) {
         let status = match self.render_mode {
             NativeOutputRenderMode::Replace => NativeOutputStatus::Presented,
-            NativeOutputRenderMode::Skip | NativeOutputRenderMode::Overlay => {
-                NativeOutputStatus::NotPresented
-            }
+            NativeOutputRenderMode::NoFrame
+            | NativeOutputRenderMode::Skip
+            | NativeOutputRenderMode::Overlay => NativeOutputStatus::NotPresented,
         };
-        self.settle(status, self.should_present());
+        let renderer_presented = matches!(
+            self.render_mode,
+            NativeOutputRenderMode::Replace | NativeOutputRenderMode::Overlay
+        );
+        self.settle(status, renderer_presented);
     }
 
     fn settle(&mut self, status: NativeOutputStatus, renderer_presented: bool) {
@@ -2932,7 +2942,21 @@ mod tests {
             .begin_output(&ctx, viewport_id, window_id, None, initial_snapshot, None)
             .expect("the first output scope exists");
         assert!(!retain_current_native_output_with_overlay());
-        first_frame.finish().present();
+        let first_frame = first_frame.finish();
+        assert_eq!(first_frame.render_mode(), NativeOutputRenderMode::NoFrame);
+        first_frame.present();
+
+        let still_unavailable = state
+            .begin_output(&ctx, viewport_id, window_id, None, initial_snapshot, None)
+            .expect("the next no-frame output scope exists");
+        assert!(!retain_current_native_output_with_overlay());
+        still_unavailable.finish().present();
+
+        state
+            .begin_output(&ctx, viewport_id, window_id, None, initial_snapshot, None)
+            .expect("the semantic output scope exists")
+            .finish()
+            .present();
 
         let overlay = state
             .begin_output(&ctx, viewport_id, window_id, None, initial_snapshot, None)
@@ -2947,7 +2971,9 @@ mod tests {
             .begin_output(&ctx, viewport_id, window_id, None, resized_snapshot, None)
             .expect("the resized output scope exists");
         assert!(!retain_current_native_output_with_overlay());
-        resized.finish().present();
+        let resized = resized.finish();
+        assert_eq!(resized.render_mode(), NativeOutputRenderMode::NoFrame);
+        resized.present();
 
         let replacement = state
             .begin_output(
@@ -2960,7 +2986,9 @@ mod tests {
             )
             .expect("the replacement-window output scope exists");
         assert!(!retain_current_native_output_with_overlay());
-        replacement.finish().present();
+        let replacement = replacement.finish();
+        assert_eq!(replacement.render_mode(), NativeOutputRenderMode::NoFrame);
+        replacement.present();
 
         state.invalidate_presented_viewport(viewport_id);
         let invalidated = state
@@ -2974,10 +3002,27 @@ mod tests {
             )
             .expect("the invalidated-generation output scope exists");
         assert!(!retain_current_native_output_with_overlay());
-        invalidated.finish().present();
+        let invalidated = invalidated.finish();
+        assert_eq!(invalidated.render_mode(), NativeOutputRenderMode::NoFrame);
+        invalidated.present();
 
         let outputs = host.outputs.lock();
-        assert_eq!(outputs[1].status(), NativeOutputStatus::NotPresented);
+        let statuses = outputs
+            .iter()
+            .map(|output| output.status())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            statuses,
+            vec![
+                NativeOutputStatus::NotPresented,
+                NativeOutputStatus::NotPresented,
+                NativeOutputStatus::Presented,
+                NativeOutputStatus::NotPresented,
+                NativeOutputStatus::NotPresented,
+                NativeOutputStatus::NotPresented,
+                NativeOutputStatus::NotPresented,
+            ]
+        );
     }
 
     #[test]
