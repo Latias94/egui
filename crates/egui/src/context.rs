@@ -127,6 +127,28 @@ impl ContextImpl {
         self.request_repaint_after(Duration::ZERO, viewport_id, cause);
     }
 
+    /// Requests one repaint without arming the extra stabilization repaint
+    /// used by the ordinary immediate repaint path.
+    fn request_repaint_once(&mut self, viewport_id: ViewportId, cause: RepaintCause) {
+        let viewport = self.viewports.entry(viewport_id).or_default();
+        viewport.repaint.causes.push(cause);
+
+        // A zero delay already means that a repaint is queued (or is being
+        // serviced). Do not add another callback to the same causal boundary.
+        if viewport.repaint.repaint_delay == Duration::ZERO {
+            return;
+        }
+
+        viewport.repaint.repaint_delay = Duration::ZERO;
+        if let Some(callback) = &self.request_repaint_callback {
+            (callback)(RequestRepaintInfo {
+                viewport_id,
+                delay: Duration::ZERO,
+                current_cumulative_pass_nr: viewport.repaint.cumulative_pass_nr,
+            });
+        }
+    }
+
     fn request_repaint_after(
         &mut self,
         mut delay: Duration,
@@ -1938,6 +1960,20 @@ impl Context {
     pub fn request_repaint_of(&self, id: ViewportId) {
         let cause = RepaintCause::new();
         self.write(|ctx| ctx.request_repaint(id, cause));
+    }
+
+    /// Request one repaint of the specified viewport without arming an extra
+    /// stabilization repaint.
+    ///
+    /// Unlike [`Self::request_repaint_of`], this does not arm egui's extra
+    /// immediate stabilization repaint. Native integrations should use this
+    /// when a completed external callback must be reduced at one causal
+    /// boundary; ordinary UI code should continue to use
+    /// [`Self::request_repaint_of`].
+    #[track_caller]
+    pub fn request_repaint_once_of(&self, id: ViewportId) {
+        let cause = RepaintCause::new();
+        self.write(|ctx| ctx.request_repaint_once(id, cause));
     }
 
     /// Request repaint after at most the specified duration elapses.

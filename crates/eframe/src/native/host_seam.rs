@@ -1952,7 +1952,7 @@ fn notify_output(
 ) {
     inner.record_output_result(result, frame);
     if inner.handler.on_output(result) == NativeHostWake::RepaintRoot {
-        ctx.request_repaint_of(ViewportId::ROOT);
+        ctx.request_repaint_once_of(ViewportId::ROOT);
     }
 }
 
@@ -2944,6 +2944,40 @@ mod tests {
 
         assert_eq!(host.outputs.lock().len(), 1);
         assert_eq!(repaint_count.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn output_wake_schedules_one_causal_root_pass() {
+        let host = Arc::new(RecordingHost {
+            wake: NativeHostWake::RepaintRoot,
+            ..Default::default()
+        });
+        let handler: Arc<dyn NativeHostHandler> = Arc::<RecordingHost>::clone(&host);
+        let state = NativeHostState::new(Some(handler));
+        let ctx = egui::Context::default();
+        for _ in 0..3 {
+            let mut warm_up = ctx.run_ui(Default::default(), |_| {});
+            warm_up.textures_delta.clear();
+        }
+        let repaint_count = Arc::new(AtomicUsize::new(0));
+        ctx.set_request_repaint_callback({
+            let repaint_count = Arc::clone(&repaint_count);
+            move |_| {
+                repaint_count.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+
+        state
+            .begin_output_for_test(&ctx, ViewportId::ROOT, WindowId::from(11))
+            .unwrap()
+            .finish()
+            .present();
+        assert_eq!(repaint_count.load(Ordering::Relaxed), 1);
+        let mut output = ctx.run_ui(Default::default(), |_| {});
+        output.textures_delta.clear();
+
+        assert_eq!(host.outputs.lock().len(), 1);
+        assert_eq!(repaint_count.load(Ordering::Relaxed), 1);
     }
 
     #[test]
