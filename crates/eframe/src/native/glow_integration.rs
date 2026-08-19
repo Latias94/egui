@@ -41,8 +41,8 @@ use super::{
 use crate::epaint::textures::TexturesDelta;
 #[cfg(feature = "native-host-seam")]
 use crate::native::host_seam::{
-    NativeDeferredWindowPreparation, NativeHostState, NativeViewportCreateAttempt,
-    NativeViewportCreateFailureKind, NativeViewportRosterCapture,
+    NativeDeferredWindowPreparation, NativeHostState, NativeOutputRenderMode,
+    NativeViewportCreateAttempt, NativeViewportCreateFailureKind, NativeViewportRosterCapture,
 };
 use crate::{
     App, AppCreator, CreationContext, NativeOptions, Result, Storage,
@@ -165,8 +165,9 @@ const fn should_clear_before_viewport_update(
 const fn should_clear_after_viewport_update(
     cleared_before_update: bool,
     render_hidden: bool,
+    load_previous: bool,
 ) -> bool {
-    !cleared_before_update || render_hidden
+    !load_previous && (!cleared_before_update || render_hidden)
 }
 
 impl Viewport {
@@ -968,8 +969,19 @@ impl GlowWinitRunning<'_> {
         let gl_surface = viewport.gl_surface.as_ref().unwrap();
         let egui_winit = viewport.egui_winit.as_mut().unwrap();
 
-        egui_winit.handle_platform_output_with_event_loop(&window, event_loop, platform_output);
-
+        #[cfg(feature = "native-host-seam")]
+        let render_mode = output_settlement
+            .as_ref()
+            .map_or(NativeOutputRenderMode::Replace, |settlement| {
+                settlement.render_mode()
+            });
+        #[cfg(feature = "native-host-seam")]
+        let load_previous = render_mode == NativeOutputRenderMode::Overlay;
+        #[cfg(not(feature = "native-host-seam"))]
+        let load_previous = false;
+        if !load_previous {
+            egui_winit.handle_platform_output_with_event_loop(&window, event_loop, platform_output);
+        }
         let should_present = output_settlement
             .as_ref()
             .is_none_or(|settlement| settlement.should_present());
@@ -985,7 +997,11 @@ impl GlowWinitRunning<'_> {
 
             let screen_size_in_pixels: [u32; 2] = window.inner_size().into();
 
-            if should_clear_after_viewport_update(cleared_before_update, render_hidden) {
+            if should_clear_after_viewport_update(
+                cleared_before_update,
+                render_hidden,
+                load_previous,
+            ) {
                 painter.clear(screen_size_in_pixels, clear_color);
             }
 
@@ -997,6 +1013,9 @@ impl GlowWinitRunning<'_> {
             );
 
             {
+                if load_previous {
+                    viewport.actions_requested.clear();
+                }
                 for action in viewport.actions_requested.drain(..) {
                     match action {
                         ActionRequested::Screenshot(user_data) => {
@@ -2166,9 +2185,10 @@ mod tests {
 
     #[test]
     fn deferred_clear_runs_when_early_clear_was_skipped_or_hidden() {
-        assert!(should_clear_after_viewport_update(false, false));
-        assert!(should_clear_after_viewport_update(false, true));
-        assert!(!should_clear_after_viewport_update(true, false));
-        assert!(should_clear_after_viewport_update(true, true));
+        assert!(should_clear_after_viewport_update(false, false, false,));
+        assert!(should_clear_after_viewport_update(false, true, false,));
+        assert!(!should_clear_after_viewport_update(true, false, false,));
+        assert!(should_clear_after_viewport_update(true, true, false,));
+        assert!(!should_clear_after_viewport_update(false, false, true,));
     }
 }

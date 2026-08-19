@@ -31,7 +31,7 @@ thread_local! {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ActiveNativeOutput {
     token: NativeOutputToken,
-    retain_previous: bool,
+    render_mode: NativeOutputRenderMode,
     retain_eligible: bool,
 }
 
@@ -40,6 +40,20 @@ struct PresentedNativeOutputFrame {
     window_id: WindowId,
     inner_size: Option<(u32, u32)>,
     generation: u64,
+}
+
+/// Renderer work allowed for one native output settlement.
+///
+/// This stays inside eframe: native hosts declare intent through the public
+/// retain functions and never receive framebuffer or renderer authority.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum NativeOutputRenderMode {
+    /// Replace the framebuffer with this generated output.
+    Replace,
+    /// Keep the current framebuffer and skip this output's paint and swap.
+    Skip,
+    /// Load the exact current framebuffer and paint this output over it.
+    Overlay,
 }
 
 /// Monotonic order assigned to one native window event before egui translates it.
@@ -952,6 +966,25 @@ pub fn current_native_output_token() -> Option<NativeOutputToken> {
 /// Returns `false` when no native output callback is active, or when the exact native viewport
 /// has not successfully presented a framebuffer for this window identity yet.
 pub fn retain_current_native_output() -> bool {
+    request_current_native_output_mode(NativeOutputRenderMode::Skip)
+}
+
+/// Keeps a native viewport's exact current framebuffer and paints this output over it.
+///
+/// This is available only while a native-host viewport callback is running. Eframe accepts the
+/// request only when both the semantic presentation ledger and the renderer ledger prove the same
+/// viewport, native window, physical inner size, and presentation generation. The renderer loads
+/// that framebuffer instead of clearing it, paints this output as a visual-only overlay, and
+/// reports [`NativeOutputStatus::NotPresented`] so the overlay cannot become semantic
+/// presentation authority.
+///
+/// Returns `false` when no output callback is active or no exact renderer presentation can be
+/// retained. Callers should then paint their ordinary no-frame fallback.
+pub fn retain_current_native_output_with_overlay() -> bool {
+    request_current_native_output_mode(NativeOutputRenderMode::Overlay)
+}
+
+fn request_current_native_output_mode(requested: NativeOutputRenderMode) -> bool {
     ACTIVE_OUTPUTS.with(|outputs| {
         let mut outputs = outputs.borrow_mut();
         let Some(output) = outputs.last_mut() else {
@@ -960,7 +993,11 @@ pub fn retain_current_native_output() -> bool {
         if !output.retain_eligible {
             return false;
         }
-        output.retain_previous = true;
+        if requested == NativeOutputRenderMode::Overlay
+            || output.render_mode == NativeOutputRenderMode::Replace
+        {
+            output.render_mode = requested;
+        }
         true
     })
 }
@@ -1042,6 +1079,7 @@ struct NativeHostStateInner {
     next_create_attempt: AtomicU64,
     pending_viewport_closes: Mutex<BTreeMap<ViewportId, NativeViewportCloseRequest>>,
     presented_outputs: Mutex<BTreeMap<ViewportId, PresentedNativeOutputFrame>>,
+    renderer_outputs: Mutex<BTreeMap<ViewportId, PresentedNativeOutputFrame>>,
     presentation_generations: Mutex<BTreeMap<ViewportId, u64>>,
     window_input: egui::mutex::Mutex<NativeWindowInputLedger>,
 }
@@ -1090,6 +1128,7 @@ impl NativeHostState {
                 next_create_attempt: AtomicU64::new(1),
                 pending_viewport_closes: Mutex::new(BTreeMap::new()),
                 presented_outputs: Mutex::new(BTreeMap::new()),
+                renderer_outputs: Mutex::new(BTreeMap::new()),
                 presentation_generations: Mutex::new(BTreeMap::new()),
                 window_input: egui::mutex::Mutex::new(NativeWindowInputLedger::default()),
             })),
@@ -1295,12 +1334,13 @@ impl NativeHostState {
             create_attempt,
         };
         let frame = inner.output_frame(viewport_id, window_id, snapshot);
-        let retain_eligible = inner.has_presented_output(viewport_id, frame);
+        let retain_eligible = inner.has_presented_output(viewport_id, frame)
+            && inner.has_renderer_output(viewport_id, frame);
         inner.handler.on_output_begin(token, snapshot, root_roster);
         ACTIVE_OUTPUTS.with(|outputs| {
             outputs.borrow_mut().push(ActiveNativeOutput {
                 token,
-                retain_previous: false,
+                render_mode: NativeOutputRenderMode::Replace,
                 retain_eligible,
             });
         });
@@ -1719,7 +1759,7 @@ pub(crate) struct NativeOutputScope {
 
 impl NativeOutputScope {
     pub(crate) fn finish(mut self) -> NativeOutputSettlement {
-        let retain_previous = self.leave();
+        let render_mode = self.leave();
         NativeOutputSettlement {
             inner: Arc::clone(&self.inner),
             ctx: self.ctx.clone(),
@@ -1730,25 +1770,25 @@ impl NativeOutputScope {
                 "native output ordinal exhausted",
             )),
             settled: false,
-            retain_previous,
+            render_mode,
         }
     }
 
-    fn leave(&mut self) -> bool {
+    fn leave(&mut self) -> NativeOutputRenderMode {
         if !self.active {
-            return false;
+            return NativeOutputRenderMode::Replace;
         }
-        let retain_previous = ACTIVE_OUTPUTS.with(|outputs| {
+        let render_mode = ACTIVE_OUTPUTS.with(|outputs| {
             let popped = outputs.borrow_mut().pop();
             debug_assert_eq!(
                 popped.map(|output| output.token),
                 Some(self.token),
                 "native output scopes must leave in stack order"
             );
-            popped.is_some_and(|output| output.retain_previous)
+            popped.map_or(NativeOutputRenderMode::Replace, |output| output.render_mode)
         });
         self.active = false;
-        retain_previous
+        render_mode
     }
 }
 
@@ -1777,6 +1817,7 @@ impl Drop for NativeOutputScope {
                 status: NativeOutputStatus::NotPresented,
             },
             self.frame,
+            false,
         );
     }
 }
@@ -1788,24 +1829,29 @@ pub(crate) struct NativeOutputSettlement {
     frame: PresentedNativeOutputFrame,
     ordinal: NativeOutputOrdinal,
     settled: bool,
-    retain_previous: bool,
+    render_mode: NativeOutputRenderMode,
 }
 
 impl NativeOutputSettlement {
     pub(crate) const fn should_present(&self) -> bool {
-        !self.retain_previous
+        !matches!(self.render_mode, NativeOutputRenderMode::Skip)
+    }
+
+    pub(crate) const fn render_mode(&self) -> NativeOutputRenderMode {
+        self.render_mode
     }
 
     pub(crate) fn present(mut self) {
-        let status = if self.should_present() {
-            NativeOutputStatus::Presented
-        } else {
-            NativeOutputStatus::NotPresented
+        let status = match self.render_mode {
+            NativeOutputRenderMode::Replace => NativeOutputStatus::Presented,
+            NativeOutputRenderMode::Skip | NativeOutputRenderMode::Overlay => {
+                NativeOutputStatus::NotPresented
+            }
         };
-        self.settle(status);
+        self.settle(status, self.should_present());
     }
 
-    fn settle(&mut self, status: NativeOutputStatus) {
+    fn settle(&mut self, status: NativeOutputStatus, renderer_presented: bool) {
         if self.settled {
             return;
         }
@@ -1819,13 +1865,14 @@ impl NativeOutputSettlement {
                 status,
             },
             self.frame,
+            renderer_presented,
         );
     }
 }
 
 impl Drop for NativeOutputSettlement {
     fn drop(&mut self) {
-        self.settle(NativeOutputStatus::NotPresented);
+        self.settle(NativeOutputStatus::NotPresented, false);
     }
 }
 
@@ -1885,6 +1932,25 @@ impl NativeHostStateInner {
             .is_some_and(|presented_frame| *presented_frame == frame)
     }
 
+    fn has_renderer_output(
+        &self,
+        viewport_id: ViewportId,
+        frame: PresentedNativeOutputFrame,
+    ) -> bool {
+        self.renderer_outputs
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&viewport_id)
+            .is_some_and(|presented_frame| *presented_frame == frame)
+    }
+
+    fn record_renderer_output(&self, viewport_id: ViewportId, frame: PresentedNativeOutputFrame) {
+        self.renderer_outputs
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(viewport_id, frame);
+    }
+
     fn record_output_result(&self, result: NativeOutputResult, frame: PresentedNativeOutputFrame) {
         if result.status != NativeOutputStatus::Presented {
             return;
@@ -1907,6 +1973,17 @@ impl NativeHostStateInner {
             presented_outputs.remove(&viewport_id);
         }
         drop(presented_outputs);
+        let mut renderer_outputs = self
+            .renderer_outputs
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if renderer_outputs
+            .get(&viewport_id)
+            .is_some_and(|presented_frame| presented_frame.window_id == window_id)
+        {
+            renderer_outputs.remove(&viewport_id);
+        }
+        drop(renderer_outputs);
         self.window_input
             .lock()
             .forget_window(viewport_id, window_id);
@@ -1918,12 +1995,20 @@ impl NativeHostStateInner {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .remove(&viewport_id);
+        self.renderer_outputs
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&viewport_id);
         self.window_input.lock().forget_viewport(viewport_id);
         self.bump_presentation_generation(viewport_id);
     }
 
     fn invalidate_presented_viewport(&self, viewport_id: ViewportId) {
         self.presented_outputs
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&viewport_id);
+        self.renderer_outputs
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .remove(&viewport_id);
@@ -1949,7 +2034,11 @@ fn notify_output(
     ctx: &egui::Context,
     result: NativeOutputResult,
     frame: PresentedNativeOutputFrame,
+    renderer_presented: bool,
 ) {
+    if renderer_presented {
+        inner.record_renderer_output(result.token.viewport_id, frame);
+    }
     inner.record_output_result(result, frame);
     if inner.handler.on_output(result) == NativeHostWake::RepaintRoot {
         ctx.request_repaint_once_of(ViewportId::ROOT);
@@ -2817,6 +2906,127 @@ mod tests {
     }
 
     #[test]
+    fn retained_overlay_requires_an_exact_renderer_presentation() {
+        let host = Arc::new(RecordingHost::default());
+        let handler: Arc<dyn NativeHostHandler> = Arc::<RecordingHost>::clone(&host);
+        let state = NativeHostState::new(Some(handler));
+        let ctx = egui::Context::default();
+        let viewport_id = ViewportId::ROOT;
+        let window_id = WindowId::from(81);
+        let replacement_window_id = WindowId::from(82);
+        let initial_snapshot = NativeWindowSnapshot {
+            inner_rect: Some(NativePhysicalRect::new(0, 0, 800, 600)),
+            outer_rect: None,
+            native_scale_factor: 1.0,
+            presentation_scale_factor: 1.0,
+            visible: Some(true),
+            minimized: Some(false),
+            input_state: NativeWindowInputState::ReceivesInput,
+        };
+        let resized_snapshot = NativeWindowSnapshot {
+            inner_rect: Some(NativePhysicalRect::new(0, 0, 801, 600)),
+            ..initial_snapshot
+        };
+
+        let first_frame = state
+            .begin_output(&ctx, viewport_id, window_id, None, initial_snapshot, None)
+            .expect("the first output scope exists");
+        assert!(!retain_current_native_output_with_overlay());
+        first_frame.finish().present();
+
+        let overlay = state
+            .begin_output(&ctx, viewport_id, window_id, None, initial_snapshot, None)
+            .expect("the overlay output scope exists");
+        assert!(retain_current_native_output_with_overlay());
+        assert!(retain_current_native_output());
+        let overlay = overlay.finish();
+        assert_eq!(overlay.render_mode(), NativeOutputRenderMode::Overlay);
+        overlay.present();
+
+        let resized = state
+            .begin_output(&ctx, viewport_id, window_id, None, resized_snapshot, None)
+            .expect("the resized output scope exists");
+        assert!(!retain_current_native_output_with_overlay());
+        resized.finish().present();
+
+        let replacement = state
+            .begin_output(
+                &ctx,
+                viewport_id,
+                replacement_window_id,
+                None,
+                resized_snapshot,
+                None,
+            )
+            .expect("the replacement-window output scope exists");
+        assert!(!retain_current_native_output_with_overlay());
+        replacement.finish().present();
+
+        state.invalidate_presented_viewport(viewport_id);
+        let invalidated = state
+            .begin_output(
+                &ctx,
+                viewport_id,
+                replacement_window_id,
+                None,
+                resized_snapshot,
+                None,
+            )
+            .expect("the invalidated-generation output scope exists");
+        assert!(!retain_current_native_output_with_overlay());
+        invalidated.finish().present();
+
+        let outputs = host.outputs.lock();
+        assert_eq!(outputs[1].status(), NativeOutputStatus::NotPresented);
+    }
+
+    #[test]
+    fn semantic_result_without_renderer_submission_cannot_enable_retention() {
+        let host = Arc::new(RecordingHost::default());
+        let handler: Arc<dyn NativeHostHandler> = Arc::<RecordingHost>::clone(&host);
+        let state = NativeHostState::new(Some(handler));
+        let ctx = egui::Context::default();
+        let window_id = WindowId::from(84);
+
+        let mut settlement = state
+            .begin_output_for_test(&ctx, ViewportId::ROOT, window_id)
+            .expect("the output scope exists")
+            .finish();
+        settlement.settle(NativeOutputStatus::Presented, false);
+
+        let next = state
+            .begin_output_for_test(&ctx, ViewportId::ROOT, window_id)
+            .expect("the next output scope exists");
+        assert!(!retain_current_native_output());
+        assert!(!retain_current_native_output_with_overlay());
+        next.finish().present();
+    }
+
+    #[test]
+    fn ordinary_retain_skips_renderer_paint() {
+        let host = Arc::new(RecordingHost::default());
+        let handler: Arc<dyn NativeHostHandler> = Arc::<RecordingHost>::clone(&host);
+        let state = NativeHostState::new(Some(handler));
+        let ctx = egui::Context::default();
+        let window_id = WindowId::from(83);
+
+        state
+            .begin_output_for_test(&ctx, ViewportId::ROOT, window_id)
+            .expect("the first output scope exists")
+            .finish()
+            .present();
+
+        let retained = state
+            .begin_output_for_test(&ctx, ViewportId::ROOT, window_id)
+            .expect("the retained output scope exists");
+        assert!(retain_current_native_output());
+        assert_eq!(
+            retained.finish().render_mode(),
+            NativeOutputRenderMode::Skip
+        );
+    }
+
+    #[test]
     fn root_output_binds_one_complete_roster_to_the_active_token() {
         let host = Arc::new(RecordingHost::default());
         let handler: Arc<dyn NativeHostHandler> = Arc::<RecordingHost>::clone(&host);
@@ -2991,8 +3201,8 @@ mod tests {
             .begin_output_for_test(&ctx, ViewportId::ROOT, WindowId::from(11))
             .unwrap()
             .finish();
-        settlement.settle(NativeOutputStatus::Presented);
-        settlement.settle(NativeOutputStatus::NotPresented);
+        settlement.settle(NativeOutputStatus::Presented, true);
+        settlement.settle(NativeOutputStatus::NotPresented, false);
 
         assert_eq!(host.outputs.lock().len(), 1);
         assert_eq!(

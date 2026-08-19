@@ -50,6 +50,21 @@ enum WinitPaintMode {
     Legacy,
     #[cfg(feature = "native-host-seam")]
     PreservePendingTextures,
+    #[cfg(feature = "native-host-seam")]
+    RetainedOverlay,
+}
+
+fn color_load_operation(mode: WinitPaintMode, clear_color: [f32; 4]) -> wgpu::LoadOp<wgpu::Color> {
+    #[cfg(feature = "native-host-seam")]
+    if mode == WinitPaintMode::RetainedOverlay {
+        return wgpu::LoadOp::Load;
+    }
+    wgpu::LoadOp::Clear(wgpu::Color {
+        r: clear_color[0] as f64,
+        g: clear_color[1] as f64,
+        b: clear_color[2] as f64,
+        a: clear_color[3] as f64,
+    })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -634,6 +649,32 @@ impl Painter {
         ))
     }
 
+    /// Paints one native-host overlay by loading the retained color attachment.
+    #[cfg(feature = "native-host-seam")]
+    #[doc(hidden)]
+    #[expect(clippy::too_many_arguments)]
+    pub fn paint_retained_overlay_and_update_textures_with_result(
+        &mut self,
+        viewport_id: ViewportId,
+        pixels_per_point: f32,
+        clear_color: [f32; 4],
+        clipped_primitives: &[epaint::ClippedPrimitive],
+        textures_delta: &mut epaint::textures::TexturesDelta,
+        capture_data: Vec<UserData>,
+        window: &Arc<winit::window::Window>,
+    ) -> WinitPaintResult {
+        WinitPaintResult(self.paint_and_update_textures_impl(
+            viewport_id,
+            pixels_per_point,
+            clear_color,
+            clipped_primitives,
+            textures_delta,
+            capture_data,
+            window,
+            WinitPaintMode::RetainedOverlay,
+        ))
+    }
+
     #[expect(clippy::too_many_arguments)]
     fn paint_and_update_textures_impl(
         &mut self,
@@ -794,12 +835,7 @@ impl Painter {
                     view,
                     resolve_target,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: clear_color[0] as f64,
-                            g: clear_color[1] as f64,
-                            b: clear_color[2] as f64,
-                            a: clear_color[3] as f64,
-                        }),
+                        load: color_load_operation(mode, clear_color),
                         store: wgpu::StoreOp::Store,
                     },
                     depth_slice: None,
@@ -934,5 +970,25 @@ impl Painter {
     #[expect(clippy::needless_pass_by_ref_mut, clippy::unused_self)]
     pub fn destroy(&mut self) {
         // TODO(emilk): something here?
+    }
+}
+
+#[cfg(all(test, feature = "native-host-seam"))]
+mod tests {
+    use super::{WinitPaintMode, color_load_operation};
+
+    #[test]
+    fn retained_overlay_loads_the_existing_color_attachment() {
+        assert!(matches!(
+            color_load_operation(WinitPaintMode::RetainedOverlay, [0.1, 0.2, 0.3, 1.0]),
+            wgpu::LoadOp::Load
+        ));
+        assert!(matches!(
+            color_load_operation(
+                WinitPaintMode::PreservePendingTextures,
+                [0.1, 0.2, 0.3, 1.0]
+            ),
+            wgpu::LoadOp::Clear(_)
+        ));
     }
 }

@@ -29,8 +29,8 @@ use winit_integration::UserEvent;
 
 #[cfg(feature = "native-host-seam")]
 use crate::native::host_seam::{
-    NativeDeferredWindowPreparation, NativeHostState, NativeViewportCreateAttempt,
-    NativeViewportCreateFailureKind, NativeViewportRosterCapture,
+    NativeDeferredWindowPreparation, NativeHostState, NativeOutputRenderMode,
+    NativeViewportCreateAttempt, NativeViewportCreateFailureKind, NativeViewportRosterCapture,
 };
 use crate::{
     App, AppCreator, CreationContext, NativeOptions, Result, Storage,
@@ -983,14 +983,28 @@ impl WgpuWinitRunning<'_> {
             return Ok(EventResult::Wait);
         };
 
-        egui_winit.handle_platform_output_with_event_loop(window, event_loop, platform_output);
-
+        #[cfg(feature = "native-host-seam")]
+        let render_mode = output_settlement
+            .as_ref()
+            .map_or(NativeOutputRenderMode::Replace, |settlement| {
+                settlement.render_mode()
+            });
+        #[cfg(feature = "native-host-seam")]
+        let load_previous = render_mode == NativeOutputRenderMode::Overlay;
+        #[cfg(not(feature = "native-host-seam"))]
+        let load_previous = false;
+        if !load_previous {
+            egui_winit.handle_platform_output_with_event_loop(window, event_loop, platform_output);
+        }
         let should_present = output_settlement
             .as_ref()
             .is_none_or(|settlement| settlement.should_present());
         let vsync_secs = if (is_visible || render_hidden) && should_present {
             let clipped_primitives = egui_ctx.tessellate(shapes, pixels_per_point);
 
+            if load_previous {
+                viewport.actions_requested.clear();
+            }
             let mut screenshot_commands = vec![];
             viewport.actions_requested.retain(|cmd| {
                 if let ActionRequested::Screenshot(info) = cmd {
@@ -1002,15 +1016,28 @@ impl WgpuWinitRunning<'_> {
             });
             #[cfg(feature = "native-host-seam")]
             let vsync_secs = {
-                let paint_result = painter.paint_and_update_textures_with_result(
-                    viewport_id,
-                    pixels_per_point,
-                    app.clear_color(&egui_ctx.global_style().visuals),
-                    &clipped_primitives,
-                    pending_deltas,
-                    screenshot_commands,
-                    window,
-                );
+                let clear_color = app.clear_color(&egui_ctx.global_style().visuals);
+                let paint_result = if load_previous {
+                    painter.paint_retained_overlay_and_update_textures_with_result(
+                        viewport_id,
+                        pixels_per_point,
+                        clear_color,
+                        &clipped_primitives,
+                        pending_deltas,
+                        screenshot_commands,
+                        window,
+                    )
+                } else {
+                    painter.paint_and_update_textures_with_result(
+                        viewport_id,
+                        pixels_per_point,
+                        clear_color,
+                        &clipped_primitives,
+                        pending_deltas,
+                        screenshot_commands,
+                        window,
+                    )
+                };
 
                 if paint_result.presented()
                     && let Some(settlement) = output_settlement.take()
