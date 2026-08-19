@@ -318,6 +318,16 @@ impl<T: WinitApp> ApplicationHandler<UserEvent> for WinitAppWrapper<T> {
 
         // Nb: Make sure this guard is dropped after this function returns.
         event_loop_context::with_event_loop_context(event_loop, move || {
+            #[cfg(feature = "native-host-seam")]
+            if self.native_host.is_enabled() && matches!(event, winit::event::DeviceEvent::Removed)
+            {
+                let ordinal = self.native_event_sequence.next();
+                self.native_host.observe_device_removal(
+                    self.winit_app.egui_ctx(),
+                    ordinal,
+                    device_id,
+                );
+            }
             let event_result = self.winit_app.device_event(event_loop, device_id, event);
             self.handle_event_result(event_loop, event_result);
         });

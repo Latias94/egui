@@ -657,6 +657,25 @@ impl NativeViewportCreateFailure {
     }
 }
 
+/// One physical-device removal observed before eframe handles it.
+#[derive(Clone, Copy, Debug)]
+pub struct NativeDeviceRemoval {
+    ordinal: NativeEventOrdinal,
+    device_id: winit::event::DeviceId,
+}
+
+impl NativeDeviceRemoval {
+    /// Returns the exact order assigned by this eframe native context.
+    pub const fn ordinal(&self) -> NativeEventOrdinal {
+        self.ordinal
+    }
+
+    /// Returns the physical device identity supplied by winit.
+    pub const fn device_id(&self) -> winit::event::DeviceId {
+        self.device_id
+    }
+}
+
 /// One immutable native window event observed before egui input translation.
 #[derive(Clone, Copy, Debug)]
 pub struct NativeWindowEvent<'a> {
@@ -924,6 +943,9 @@ pub trait NativeHostHandler: Send + Sync + 'static {
 
     /// Observes one window event before egui-winit translates it.
     fn on_window_event(&self, _event: NativeWindowEvent<'_>) {}
+
+    /// Observes one physical-device removal before eframe handles it.
+    fn on_device_removed(&self, _removal: NativeDeviceRemoval) {}
 
     /// Observes globally consistent focus after eframe applies one focus event.
     fn on_global_focus(&self, _observation: NativeGlobalFocusObservation) -> NativeHostWake {
@@ -1219,6 +1241,23 @@ impl NativeHostState {
             viewport_id,
             event,
         });
+        if let Some(ctx) = ctx {
+            ctx.request_repaint_of(ViewportId::ROOT);
+        }
+    }
+
+    pub(crate) fn observe_device_removal(
+        &self,
+        ctx: Option<&egui::Context>,
+        ordinal: NativeEventOrdinal,
+        device_id: winit::event::DeviceId,
+    ) {
+        let Some(inner) = &self.inner else {
+            return;
+        };
+        inner
+            .handler
+            .on_device_removed(NativeDeviceRemoval { ordinal, device_id });
         if let Some(ctx) = ctx {
             ctx.request_repaint_of(ViewportId::ROOT);
         }
@@ -2186,6 +2225,7 @@ mod tests {
                 winit::event::PointerEventFacts,
             )>,
         >,
+        device_removals: Mutex<Vec<(u64, winit::event::DeviceId)>>,
         output_begins: Mutex<
             Vec<(
                 NativeOutputToken,
@@ -2271,6 +2311,12 @@ mod tests {
             ));
         }
 
+        fn on_device_removed(&self, removal: NativeDeviceRemoval) {
+            self.device_removals
+                .lock()
+                .push((removal.ordinal().get(), removal.device_id()));
+        }
+
         fn on_global_focus(&self, observation: NativeGlobalFocusObservation) -> NativeHostWake {
             self.global_focus_observations.lock().push(observation);
             self.wake
@@ -2329,6 +2375,60 @@ mod tests {
             self.viewport_close_cancellations.lock().push(request);
             self.wake
         }
+    }
+
+    #[test]
+    fn device_removal_callback_preserves_global_native_event_order() {
+        use winit::event::{DeviceId, ElementState, MouseButton, PointerEventFacts};
+
+        let host = Arc::new(RecordingHost::default());
+        let handler: Arc<dyn NativeHostHandler> = Arc::<RecordingHost>::clone(&host);
+        let state = NativeHostState::new(Some(handler));
+        let mut sequencer = NativeEventSequencer::default();
+        let window = WindowId::from(31);
+        let device = DeviceId::dummy();
+        let press = winit::event::WindowEvent::MouseInput {
+            device_id: device,
+            state: ElementState::Pressed,
+            button: MouseButton::Left,
+            facts: PointerEventFacts::default(),
+        };
+        let release = winit::event::WindowEvent::MouseInput {
+            device_id: device,
+            state: ElementState::Released,
+            button: MouseButton::Left,
+            facts: PointerEventFacts::default(),
+        };
+
+        state.observe_window_event(
+            None,
+            sequencer.next(),
+            window,
+            Some(ViewportId::ROOT),
+            &press,
+        );
+        state.observe_device_removal(None, sequencer.next(), device);
+        state.observe_window_event(
+            None,
+            sequencer.next(),
+            window,
+            Some(ViewportId::ROOT),
+            &release,
+        );
+
+        assert_eq!(
+            host.events
+                .lock()
+                .iter()
+                .map(|(ordinal, ..)| *ordinal)
+                .collect::<Vec<_>>(),
+            vec![1, 3]
+        );
+        assert_eq!(
+            *host.device_removals.lock(),
+            vec![(2, device)],
+            "the typed removal keeps its exact native event order"
+        );
     }
 
     #[test]

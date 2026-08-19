@@ -204,17 +204,17 @@ pub use native::run::EframeWinitApplication;
 #[cfg(any(feature = "glow", feature = "wgpu_no_default_features"))]
 #[cfg(feature = "native-host-seam")]
 pub use native::host_seam::{
-    NativeDisplayId, NativeEventOrdinal, NativeGlobalFocus, NativeGlobalFocusObservation,
-    NativeHostAttachment, NativeHostHandler, NativeHostWake, NativeOutputOrdinal,
-    NativeOutputResult, NativeOutputStatus, NativeOutputToken, NativePhysicalRect,
-    NativeViewportCloseRequest, NativeViewportCreateAdmission, NativeViewportCreateAttempt,
-    NativeViewportCreateFailure, NativeViewportCreateFailureKind, NativeViewportFocusResult,
-    NativeViewportFocusStatus, NativeViewportPointerPassthroughCommandToken,
-    NativeViewportPointerPassthroughResult, NativeViewportPointerPassthroughStatus,
-    NativeViewportRecord, NativeViewportRoster, NativeViewportVisibilityResult,
-    NativeViewportVisibilityStatus, NativeWindowEvent, NativeWindowInputState,
-    NativeWindowSnapshot, NativeWindowingBackend, NativeWorkAreaRecord, NativeWorkAreaRoster,
-    current_native_output_token, queue_native_viewport_pointer_passthrough,
+    NativeDeviceRemoval, NativeDisplayId, NativeEventOrdinal, NativeGlobalFocus,
+    NativeGlobalFocusObservation, NativeHostAttachment, NativeHostHandler, NativeHostWake,
+    NativeOutputOrdinal, NativeOutputResult, NativeOutputStatus, NativeOutputToken,
+    NativePhysicalRect, NativeViewportCloseRequest, NativeViewportCreateAdmission,
+    NativeViewportCreateAttempt, NativeViewportCreateFailure, NativeViewportCreateFailureKind,
+    NativeViewportFocusResult, NativeViewportFocusStatus,
+    NativeViewportPointerPassthroughCommandToken, NativeViewportPointerPassthroughResult,
+    NativeViewportPointerPassthroughStatus, NativeViewportRecord, NativeViewportRoster,
+    NativeViewportVisibilityResult, NativeViewportVisibilityStatus, NativeWindowEvent,
+    NativeWindowInputState, NativeWindowSnapshot, NativeWindowingBackend, NativeWorkAreaRecord,
+    NativeWorkAreaRoster, current_native_output_token, queue_native_viewport_pointer_passthrough,
     retain_current_native_output, retain_current_native_output_with_overlay,
 };
 
