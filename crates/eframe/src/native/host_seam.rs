@@ -228,6 +228,11 @@ pub enum NativeHostWake {
     Wait,
     /// Schedule the root viewport so queued host records can be reduced.
     RepaintRoot,
+    /// Preserve one root repaint after a root pass which is already queued.
+    ///
+    /// Native output handlers should use this for lifecycle-bearing terminals
+    /// whose callback record must remain observable after the current pass.
+    RepaintRootAfterCurrent,
 }
 
 /// Backend disposition after eframe attempted to change native visibility.
@@ -2117,8 +2122,10 @@ fn notify_output(
         None => false,
     };
     inner.record_output_result(result, frame, submitted_no_frame);
-    if inner.handler.on_output(result) == NativeHostWake::RepaintRoot {
-        ctx.request_repaint_once_of(ViewportId::ROOT);
+    match inner.handler.on_output(result) {
+        NativeHostWake::Wait => {}
+        NativeHostWake::RepaintRoot => ctx.request_repaint_once_of(ViewportId::ROOT),
+        NativeHostWake::RepaintRootAfterCurrent => ctx.request_repaint_of(ViewportId::ROOT),
     }
 }
 
@@ -3497,6 +3504,56 @@ mod tests {
 
         assert_eq!(host.outputs.lock().len(), 1);
         assert_eq!(repaint_count.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn durable_output_wake_survives_an_already_queued_root_pass() {
+        let host = Arc::new(RecordingHost {
+            wake: NativeHostWake::RepaintRootAfterCurrent,
+            ..Default::default()
+        });
+        let handler: Arc<dyn NativeHostHandler> = Arc::<RecordingHost>::clone(&host);
+        let state = NativeHostState::new(Some(handler));
+        let ctx = egui::Context::default();
+        for _ in 0..8 {
+            if !ctx.has_requested_repaint_for(&ViewportId::ROOT) {
+                break;
+            }
+            let mut warm_up = ctx.run_ui(Default::default(), |_| {});
+            warm_up.textures_delta.clear();
+        }
+        assert!(!ctx.has_requested_repaint_for(&ViewportId::ROOT));
+        let repaint_count = Arc::new(AtomicUsize::new(0));
+        ctx.set_request_repaint_callback({
+            let repaint_count = Arc::clone(&repaint_count);
+            move |info| {
+                if info.viewport_id == ViewportId::ROOT {
+                    repaint_count.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        });
+
+        ctx.request_repaint_once_of(ViewportId::ROOT);
+        assert_eq!(repaint_count.load(Ordering::Relaxed), 1);
+
+        state
+            .begin_output_for_test(&ctx, ViewportId::ROOT, WindowId::from(11))
+            .expect("root output scope exists")
+            .finish()
+            .present();
+        assert_eq!(
+            repaint_count.load(Ordering::Relaxed),
+            1,
+            "the queued root callback is not duplicated immediately"
+        );
+
+        let mut output = ctx.run_ui(Default::default(), |_| {});
+        output.textures_delta.clear();
+        assert_eq!(
+            repaint_count.load(Ordering::Relaxed),
+            2,
+            "servicing the queued pass reveals the durable output obligation"
+        );
     }
 
     #[test]
