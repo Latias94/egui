@@ -176,6 +176,22 @@ impl<T: WinitApp> WinitAppWrapper<T> {
             self.return_result = Err(err);
         }
 
+        #[cfg(feature = "native-host-seam")]
+        if let Some(window_id) = self
+            .winit_app
+            .window_id_from_viewport_id(egui::ViewportId::ROOT)
+            && self.native_host.take_root_wake_after_current()
+        {
+            // Renderer terminal callbacks run after egui's pass-local repaint
+            // scheduling. Keep this wake at the outer event boundary so it
+            // cannot be consumed by the pass which produced the output.
+            let now = Instant::now();
+            self.windows_next_repaint_times
+                .entry(window_id)
+                .and_modify(|when| *when = (*when).min(now))
+                .or_insert(now);
+        }
+
         if save {
             log::debug!("Received an EventResult::Save - saving app state");
             self.winit_app.save();

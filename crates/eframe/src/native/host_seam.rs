@@ -7,7 +7,7 @@
 use std::cell::RefCell;
 use std::collections::{BTreeMap, VecDeque};
 use std::num::NonZeroU64;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use egui::{ViewportBuilder, ViewportId};
@@ -1114,6 +1114,7 @@ struct NativeHostStateInner {
     renderer_outputs: Mutex<BTreeMap<ViewportId, NativeRetentionRecord>>,
     presentation_generations: Mutex<BTreeMap<ViewportId, u64>>,
     window_input: egui::mutex::Mutex<NativeWindowInputLedger>,
+    root_wake_after_current: AtomicBool,
 }
 
 /// Single-threaded event ordinal source owned by the outer winit dispatcher.
@@ -1163,12 +1164,19 @@ impl NativeHostState {
                 renderer_outputs: Mutex::new(BTreeMap::new()),
                 presentation_generations: Mutex::new(BTreeMap::new()),
                 window_input: egui::mutex::Mutex::new(NativeWindowInputLedger::default()),
+                root_wake_after_current: AtomicBool::new(false),
             })),
         }
     }
 
     pub(crate) fn is_enabled(&self) -> bool {
         self.inner.is_some()
+    }
+
+    pub(crate) fn take_root_wake_after_current(&self) -> bool {
+        self.inner
+            .as_ref()
+            .is_some_and(|inner| inner.root_wake_after_current.swap(false, Ordering::AcqRel))
     }
 
     #[track_caller]
@@ -2125,7 +2133,9 @@ fn notify_output(
     match inner.handler.on_output(result) {
         NativeHostWake::Wait => {}
         NativeHostWake::RepaintRoot => ctx.request_repaint_once_of(ViewportId::ROOT),
-        NativeHostWake::RepaintRootAfterCurrent => ctx.request_repaint_of(ViewportId::ROOT),
+        NativeHostWake::RepaintRootAfterCurrent => {
+            inner.root_wake_after_current.store(true, Ordering::Release);
+        }
     }
 }
 
@@ -3507,7 +3517,7 @@ mod tests {
     }
 
     #[test]
-    fn durable_output_wake_survives_an_already_queued_root_pass() {
+    fn durable_output_wake_is_owned_by_the_outer_event_boundary() {
         let host = Arc::new(RecordingHost {
             wake: NativeHostWake::RepaintRootAfterCurrent,
             ..Default::default()
@@ -3515,14 +3525,6 @@ mod tests {
         let handler: Arc<dyn NativeHostHandler> = Arc::<RecordingHost>::clone(&host);
         let state = NativeHostState::new(Some(handler));
         let ctx = egui::Context::default();
-        for _ in 0..8 {
-            if !ctx.has_requested_repaint_for(&ViewportId::ROOT) {
-                break;
-            }
-            let mut warm_up = ctx.run_ui(Default::default(), |_| {});
-            warm_up.textures_delta.clear();
-        }
-        assert!(!ctx.has_requested_repaint_for(&ViewportId::ROOT));
         let repaint_count = Arc::new(AtomicUsize::new(0));
         ctx.set_request_repaint_callback({
             let repaint_count = Arc::clone(&repaint_count);
@@ -3533,9 +3535,6 @@ mod tests {
             }
         });
 
-        ctx.request_repaint_once_of(ViewportId::ROOT);
-        assert_eq!(repaint_count.load(Ordering::Relaxed), 1);
-
         state
             .begin_output_for_test(&ctx, ViewportId::ROOT, WindowId::from(11))
             .expect("root output scope exists")
@@ -3543,17 +3542,11 @@ mod tests {
             .present();
         assert_eq!(
             repaint_count.load(Ordering::Relaxed),
-            1,
-            "the queued root callback is not duplicated immediately"
+            0,
+            "the completed renderer callback must not enter egui's pass-local repaint queue"
         );
-
-        let mut output = ctx.run_ui(Default::default(), |_| {});
-        output.textures_delta.clear();
-        assert_eq!(
-            repaint_count.load(Ordering::Relaxed),
-            2,
-            "servicing the queued pass reveals the durable output obligation"
-        );
+        assert!(state.take_root_wake_after_current());
+        assert!(!state.take_root_wake_after_current());
     }
 
     #[test]
