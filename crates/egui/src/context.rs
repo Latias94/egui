@@ -35,7 +35,7 @@ use crate::{
     os::OperatingSystem,
     output::{FullOutput, LogicOutput},
     pass_state::PassState,
-    plugin::{self, TypedPluginHandle},
+    plugin::{self, OutputPassDisposition, TypedPluginHandle},
     resize, response, scroll_area,
     util::IdTypeMap,
     viewport::ViewportClass,
@@ -876,24 +876,33 @@ impl Context {
 
             self.begin_pass(new_input.take());
             run_ui(self);
-            output.append(self.end_pass());
+            let (ended_viewport, plugins, mut pass_output) = self.end_pass_before_settlement();
             debug_assert!(
-                0 < output.platform_output.num_completed_passes,
+                0 < pass_output.platform_output.num_completed_passes,
                 "Completed passes was lower than 0, was {}",
-                output.platform_output.num_completed_passes
+                pass_output.platform_output.num_completed_passes
             );
 
-            if !output.platform_output.requested_discard() {
-                break; // no need for another pass
-            }
+            let disposition = if pass_output.platform_output.requested_discard()
+                && pass_output.platform_output.num_completed_passes < max_passes
+            {
+                OutputPassDisposition::Repeat
+            } else {
+                OutputPassDisposition::Terminal
+            };
+            plugins.on_output_pass_settlement(self, ended_viewport, disposition, &mut pass_output);
+            output.append(pass_output);
 
-            if max_passes <= output.platform_output.num_completed_passes {
-                log::debug!(
-                    "Ignoring call request_discard, because max_passes={max_passes}. Requested from {:?}",
-                    output.platform_output.request_discard_reasons
-                );
-
-                break;
+            if disposition == OutputPassDisposition::Terminal {
+                if output.platform_output.requested_discard()
+                    && max_passes <= output.platform_output.num_completed_passes
+                {
+                    log::debug!(
+                        "Ignoring call request_discard, because max_passes={max_passes}. Requested from {:?}",
+                        output.platform_output.request_discard_reasons
+                    );
+                }
+                break; // no need for another pass, or the pass limit was reached
             }
         }
 
@@ -2577,6 +2586,17 @@ impl Context {
     /// Call at the end of each frame if you called [`Context::begin_pass`].
     #[must_use]
     pub fn end_pass(&self) -> FullOutput {
+        let (ended_viewport, plugins, mut output) = self.end_pass_before_settlement();
+        plugins.on_output_pass_settlement(
+            self,
+            ended_viewport,
+            OutputPassDisposition::Terminal,
+            &mut output,
+        );
+        output
+    }
+
+    fn end_pass_before_settlement(&self) -> (ViewportId, plugin::PluginsOrdered, FullOutput) {
         profiling::function_scope!();
 
         if self.options(|o| o.zoom_with_keyboard) {
@@ -2594,12 +2614,13 @@ impl Context {
         #[cfg(debug_assertions)]
         self.debug_painting();
 
+        let ended_viewport = self.viewport_id();
         let mut output = self.write(|ctx| ctx.end_pass());
 
         let plugins = self.read(|ctx| ctx.plugins.ordered_plugins());
         plugins.on_output(self, &mut output);
 
-        output
+        (ended_viewport, plugins, output)
     }
 
     /// Keep the native window theme in sync with the egui [`crate::ThemePreference`],
@@ -4515,11 +4536,80 @@ fn warn_if_rect_changes_id(
 
 #[cfg(test)]
 mod test {
+    use std::{
+        panic::{AssertUnwindSafe, catch_unwind},
+        sync::{Arc, Mutex},
+    };
+
     use super::Context;
     use crate::{
-        Area, Id, LayerId, Order, Pos2, RawInput, Rect, ScrollArea, Sense, UiBuilder, Vec2,
-        ViewportId, WidgetScrollDelta, WidgetScrollHit, WidgetScrollHitChallenge, vec2,
+        Area, FullOutput, Id, LayerId, Order, OutputPassDisposition, Pos2, RawInput, Rect,
+        ScrollArea, Sense, UiBuilder, Vec2, ViewportId, WidgetScrollDelta, WidgetScrollHit,
+        WidgetScrollHitChallenge, vec2,
     };
+
+    #[derive(Default)]
+    struct OutputPassSettlementProbe {
+        observations: Arc<Mutex<Vec<(ViewportId, OutputPassDisposition)>>>,
+    }
+
+    impl crate::plugin::Plugin for OutputPassSettlementProbe {
+        fn debug_name(&self) -> &'static str {
+            "egui::test::output_pass_settlement_probe"
+        }
+
+        fn output_pass_settlement(
+            &mut self,
+            _ctx: &Context,
+            ended_viewport: ViewportId,
+            disposition: OutputPassDisposition,
+            _output: &mut FullOutput,
+        ) {
+            self.observations
+                .lock()
+                .expect("the settlement observations are not poisoned")
+                .push((ended_viewport, disposition));
+        }
+    }
+
+    #[derive(Default)]
+    struct LateOutputHook {
+        discard_remaining: usize,
+        panic_once: bool,
+    }
+
+    impl crate::plugin::Plugin for LateOutputHook {
+        fn debug_name(&self) -> &'static str {
+            "egui::test::late_output_hook"
+        }
+
+        fn output_hook(&mut self, _ctx: &Context, output: &mut FullOutput) {
+            if self.panic_once {
+                self.panic_once = false;
+                panic!("late output hook interrupted the egui run");
+            }
+            if self.discard_remaining == 0 {
+                return;
+            }
+            self.discard_remaining -= 1;
+            output
+                .platform_output
+                .request_discard_reasons
+                .push(crate::RepaintCause::new_reason(
+                    "late output hook requested another pass",
+                ));
+        }
+    }
+
+    fn install_output_pass_settlement_probe(
+        ctx: &Context,
+    ) -> Arc<Mutex<Vec<(ViewportId, OutputPassDisposition)>>> {
+        let observations = Arc::new(Mutex::new(Vec::new()));
+        ctx.plugin_or_default::<OutputPassSettlementProbe>()
+            .lock()
+            .observations = Arc::clone(&observations);
+        observations
+    }
 
     fn test_input() -> RawInput {
         RawInput {
@@ -5240,6 +5330,129 @@ mod test {
             );
             output.drop_without_applying_deltas();
         }
+    }
+
+    #[test]
+    fn output_pass_settlement_reports_terminal_root_run() {
+        let ctx = Context::default();
+        let observations = install_output_pass_settlement_probe(&ctx);
+
+        let output = ctx.run_ui(test_input(), |_| {});
+        output.drop_without_applying_deltas();
+
+        assert_eq!(
+            *observations
+                .lock()
+                .expect("the settlement observations are not poisoned"),
+            [(ViewportId::ROOT, OutputPassDisposition::Terminal)]
+        );
+    }
+
+    #[test]
+    fn manual_end_pass_settles_once_for_the_ended_viewport() {
+        let ctx = Context::default();
+        let observations = install_output_pass_settlement_probe(&ctx);
+
+        ctx.begin_pass(test_input());
+        let output = ctx.end_pass();
+        output.drop_without_applying_deltas();
+
+        assert_eq!(
+            *observations
+                .lock()
+                .expect("the settlement observations are not poisoned"),
+            [(ViewportId::ROOT, OutputPassDisposition::Terminal)]
+        );
+    }
+
+    #[test]
+    fn non_root_run_reports_the_ended_child_viewport() {
+        let ctx = Context::default();
+        let observations = install_output_pass_settlement_probe(&ctx);
+        let child = ViewportId::from_hash_of("output-pass-settlement-child");
+        let mut input = test_input();
+        input.viewport_id = child;
+        input.viewports.insert(child, Default::default());
+
+        let output = ctx.run_ui(input, |_| {});
+        output.drop_without_applying_deltas();
+
+        assert_eq!(
+            *observations
+                .lock()
+                .expect("the settlement observations are not poisoned"),
+            [(child, OutputPassDisposition::Terminal)]
+        );
+    }
+
+    #[test]
+    fn late_discard_is_frozen_before_output_pass_settlement() {
+        let ctx = Context::default();
+        ctx.options_mut(|options| {
+            options.max_passes = 3.try_into().expect("three is non-zero");
+        });
+        let observations = install_output_pass_settlement_probe(&ctx);
+        ctx.plugin_or_default::<LateOutputHook>()
+            .lock()
+            .discard_remaining = 1;
+
+        let output = ctx.run_ui(test_input(), |_| {});
+        output.drop_without_applying_deltas();
+
+        assert_eq!(
+            *observations
+                .lock()
+                .expect("the settlement observations are not poisoned"),
+            [
+                (ViewportId::ROOT, OutputPassDisposition::Repeat),
+                (ViewportId::ROOT, OutputPassDisposition::Terminal),
+            ]
+        );
+    }
+
+    #[test]
+    fn late_output_hook_panic_skips_output_pass_settlement() {
+        let ctx = Context::default();
+        let warm_up = ctx.run_ui(test_input(), |_| {});
+        warm_up.drop_without_applying_deltas();
+        let observations = install_output_pass_settlement_probe(&ctx);
+        ctx.plugin_or_default::<LateOutputHook>().lock().panic_once = true;
+
+        let interrupted = catch_unwind(AssertUnwindSafe(|| {
+            let output = ctx.run_ui(test_input(), |_| {});
+            output.drop_without_applying_deltas();
+        }));
+
+        assert!(interrupted.is_err());
+        assert!(
+            observations
+                .lock()
+                .expect("the settlement observations are not poisoned")
+                .is_empty(),
+            "settlement must not run after an earlier output hook unwinds"
+        );
+    }
+
+    #[test]
+    fn denied_late_discard_settles_the_max_pass_as_terminal() {
+        let ctx = Context::default();
+        ctx.options_mut(|options| {
+            options.max_passes = 1.try_into().expect("one is non-zero");
+        });
+        let observations = install_output_pass_settlement_probe(&ctx);
+        ctx.plugin_or_default::<LateOutputHook>()
+            .lock()
+            .discard_remaining = 1;
+
+        let output = ctx.run_ui(test_input(), |_| {});
+        output.drop_without_applying_deltas();
+
+        assert_eq!(
+            *observations
+                .lock()
+                .expect("the settlement observations are not poisoned"),
+            [(ViewportId::ROOT, OutputPassDisposition::Terminal)]
+        );
     }
 
     #[test]

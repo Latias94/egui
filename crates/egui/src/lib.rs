@@ -486,7 +486,7 @@ pub use self::{
     load::SizeHint,
     memory::{FocusDirection, Memory, Options, Theme, ThemePreference},
     painter::Painter,
-    plugin::Plugin,
+    plugin::{OutputPassDisposition, Plugin},
     response::{InnerResponse, Response},
     sense::Sense,
     style::{FontSelection, Spacing, Style, TextStyle, Visuals},
