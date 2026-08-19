@@ -177,19 +177,15 @@ impl<T: WinitApp> WinitAppWrapper<T> {
         }
 
         #[cfg(feature = "native-host-seam")]
-        if let Some(window_id) = self
-            .winit_app
-            .window_id_from_viewport_id(egui::ViewportId::ROOT)
-            && self.native_host.take_root_wake_after_current()
+        if self.native_host.take_root_wake_after_current()
+            && let Some(ctx) = self.winit_app.egui_ctx()
         {
+            log::trace!("native host durable root wake queued after the current event");
             // Renderer terminal callbacks run after egui's pass-local repaint
-            // scheduling. Keep this wake at the outer event boundary so it
-            // cannot be consumed by the pass which produced the output.
-            let now = Instant::now();
-            self.windows_next_repaint_times
-                .entry(window_id)
-                .and_modify(|when| *when = (*when).min(now))
-                .or_insert(now);
+            // scheduling. Re-enter through egui's EventLoopProxy-backed
+            // repaint callback so X11 cannot coalesce the request with the
+            // RedrawRequested event which produced this terminal.
+            ctx.request_repaint_of(egui::ViewportId::ROOT);
         }
 
         if save {

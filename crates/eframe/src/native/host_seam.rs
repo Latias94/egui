@@ -3546,6 +3546,12 @@ mod tests {
             "the completed renderer callback must not enter egui's pass-local repaint queue"
         );
         assert!(state.take_root_wake_after_current());
+        ctx.request_repaint_of(ViewportId::ROOT);
+        assert_eq!(
+            repaint_count.load(Ordering::Relaxed),
+            1,
+            "the outer event boundary must re-enter through the repaint callback"
+        );
         assert!(!state.take_root_wake_after_current());
     }
 
