@@ -42,6 +42,27 @@ struct PresentedNativeOutputFrame {
     generation: u64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NativeRetentionKind {
+    Retainable,
+    NoFrame,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct NativeRetentionRecord {
+    /// Completion order protects a newer output fact from stale settlement.
+    ordinal: NativeOutputOrdinal,
+    frame: PresentedNativeOutputFrame,
+    /// `NoFrame` is an exact tombstone for a fallback that replaced the framebuffer.
+    kind: NativeRetentionKind,
+}
+
+impl NativeRetentionRecord {
+    fn retains(self, frame: PresentedNativeOutputFrame) -> bool {
+        self.kind == NativeRetentionKind::Retainable && self.frame == frame
+    }
+}
+
 /// Renderer work allowed for one native output settlement.
 ///
 /// This stays inside eframe: native hosts declare intent through the public
@@ -1084,8 +1105,8 @@ struct NativeHostStateInner {
     next_output: AtomicU64,
     next_create_attempt: AtomicU64,
     pending_viewport_closes: Mutex<BTreeMap<ViewportId, NativeViewportCloseRequest>>,
-    presented_outputs: Mutex<BTreeMap<ViewportId, PresentedNativeOutputFrame>>,
-    renderer_outputs: Mutex<BTreeMap<ViewportId, PresentedNativeOutputFrame>>,
+    presented_outputs: Mutex<BTreeMap<ViewportId, NativeRetentionRecord>>,
+    renderer_outputs: Mutex<BTreeMap<ViewportId, NativeRetentionRecord>>,
     presentation_generations: Mutex<BTreeMap<ViewportId, u64>>,
     window_input: egui::mutex::Mutex<NativeWindowInputLedger>,
 }
@@ -1823,7 +1844,7 @@ impl Drop for NativeOutputScope {
                 status: NativeOutputStatus::NotPresented,
             },
             self.frame,
-            false,
+            None,
         );
     }
 }
@@ -1854,14 +1875,17 @@ impl NativeOutputSettlement {
             | NativeOutputRenderMode::Skip
             | NativeOutputRenderMode::Overlay => NativeOutputStatus::NotPresented,
         };
-        let renderer_presented = matches!(
-            self.render_mode,
-            NativeOutputRenderMode::Replace | NativeOutputRenderMode::Overlay
-        );
-        self.settle(status, renderer_presented);
+        let renderer_output = match self.render_mode {
+            NativeOutputRenderMode::Replace | NativeOutputRenderMode::Overlay => {
+                Some(NativeRetentionKind::Retainable)
+            }
+            NativeOutputRenderMode::NoFrame => Some(NativeRetentionKind::NoFrame),
+            NativeOutputRenderMode::Skip => None,
+        };
+        self.settle(status, renderer_output);
     }
 
-    fn settle(&mut self, status: NativeOutputStatus, renderer_presented: bool) {
+    fn settle(&mut self, status: NativeOutputStatus, renderer_output: Option<NativeRetentionKind>) {
         if self.settled {
             return;
         }
@@ -1875,14 +1899,14 @@ impl NativeOutputSettlement {
                 status,
             },
             self.frame,
-            renderer_presented,
+            renderer_output,
         );
     }
 }
 
 impl Drop for NativeOutputSettlement {
     fn drop(&mut self) {
-        self.settle(NativeOutputStatus::NotPresented, false);
+        self.settle(NativeOutputStatus::NotPresented, None);
     }
 }
 
@@ -1939,7 +1963,7 @@ impl NativeHostStateInner {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .get(&viewport_id)
-            .is_some_and(|presented_frame| *presented_frame == frame)
+            .is_some_and(|output| output.retains(frame))
     }
 
     fn has_renderer_output(
@@ -1951,24 +1975,37 @@ impl NativeHostStateInner {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .get(&viewport_id)
-            .is_some_and(|presented_frame| *presented_frame == frame)
+            .is_some_and(|output| output.retains(frame))
     }
 
-    fn record_renderer_output(&self, viewport_id: ViewportId, frame: PresentedNativeOutputFrame) {
-        self.renderer_outputs
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .insert(viewport_id, frame);
+    fn record_renderer_output(
+        &self,
+        viewport_id: ViewportId,
+        ordinal: NativeOutputOrdinal,
+        frame: PresentedNativeOutputFrame,
+        kind: NativeRetentionKind,
+    ) -> bool {
+        record_newer_retention(&self.renderer_outputs, viewport_id, ordinal, frame, kind)
     }
 
-    fn record_output_result(&self, result: NativeOutputResult, frame: PresentedNativeOutputFrame) {
-        if result.status != NativeOutputStatus::Presented {
-            return;
-        }
-        self.presented_outputs
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .insert(result.token.viewport_id, frame);
+    fn record_output_result(
+        &self,
+        result: NativeOutputResult,
+        frame: PresentedNativeOutputFrame,
+        submitted_no_frame: bool,
+    ) {
+        let kind = match result.status {
+            NativeOutputStatus::Presented => NativeRetentionKind::Retainable,
+            NativeOutputStatus::NotPresented if submitted_no_frame => NativeRetentionKind::NoFrame,
+            NativeOutputStatus::NotPresented => return,
+        };
+        let _ = record_newer_retention(
+            &self.presented_outputs,
+            result.token.viewport_id,
+            result.ordinal,
+            frame,
+            kind,
+        );
     }
 
     fn forget_presented_window(&self, viewport_id: ViewportId, window_id: WindowId) {
@@ -1978,7 +2015,7 @@ impl NativeHostStateInner {
             .unwrap_or_else(PoisonError::into_inner);
         if presented_outputs
             .get(&viewport_id)
-            .is_some_and(|presented_frame| presented_frame.window_id == window_id)
+            .is_some_and(|output| output.frame.window_id == window_id)
         {
             presented_outputs.remove(&viewport_id);
         }
@@ -1989,7 +2026,7 @@ impl NativeHostStateInner {
             .unwrap_or_else(PoisonError::into_inner);
         if renderer_outputs
             .get(&viewport_id)
-            .is_some_and(|presented_frame| presented_frame.window_id == window_id)
+            .is_some_and(|output| output.frame.window_id == window_id)
         {
             renderer_outputs.remove(&viewport_id);
         }
@@ -2039,17 +2076,47 @@ impl NativeHostStateInner {
     }
 }
 
+fn record_newer_retention(
+    outputs: &Mutex<BTreeMap<ViewportId, NativeRetentionRecord>>,
+    viewport_id: ViewportId,
+    ordinal: NativeOutputOrdinal,
+    frame: PresentedNativeOutputFrame,
+    kind: NativeRetentionKind,
+) -> bool {
+    let mut outputs = outputs.lock().unwrap_or_else(PoisonError::into_inner);
+    if outputs
+        .get(&viewport_id)
+        .is_some_and(|current| current.ordinal >= ordinal)
+    {
+        return false;
+    }
+    outputs.insert(
+        viewport_id,
+        NativeRetentionRecord {
+            ordinal,
+            frame,
+            kind,
+        },
+    );
+    true
+}
+
 fn notify_output(
     inner: &NativeHostStateInner,
     ctx: &egui::Context,
     result: NativeOutputResult,
     frame: PresentedNativeOutputFrame,
-    renderer_presented: bool,
+    renderer_output: Option<NativeRetentionKind>,
 ) {
-    if renderer_presented {
-        inner.record_renderer_output(result.token.viewport_id, frame);
-    }
-    inner.record_output_result(result, frame);
+    let submitted_no_frame = match renderer_output {
+        Some(kind) => {
+            let recorded =
+                inner.record_renderer_output(result.token.viewport_id, result.ordinal, frame, kind);
+            recorded && kind == NativeRetentionKind::NoFrame
+        }
+        None => false,
+    };
+    inner.record_output_result(result, frame, submitted_no_frame);
     if inner.handler.on_output(result) == NativeHostWake::RepaintRoot {
         ctx.request_repaint_once_of(ViewportId::ROOT);
     }
@@ -3026,6 +3093,203 @@ mod tests {
     }
 
     #[test]
+    fn presented_no_frame_revokes_a_prior_renderer_frame() {
+        let host = Arc::new(RecordingHost::default());
+        let handler: Arc<dyn NativeHostHandler> = Arc::<RecordingHost>::clone(&host);
+        let state = NativeHostState::new(Some(handler));
+        let ctx = egui::Context::default();
+        let viewport_id = ViewportId::ROOT;
+        let window_id = WindowId::from(86);
+        let initial_snapshot = NativeWindowSnapshot {
+            inner_rect: Some(NativePhysicalRect::new(0, 0, 800, 600)),
+            outer_rect: None,
+            native_scale_factor: 1.0,
+            presentation_scale_factor: 1.0,
+            visible: Some(true),
+            minimized: Some(false),
+            input_state: NativeWindowInputState::ReceivesInput,
+        };
+        let resized_snapshot = NativeWindowSnapshot {
+            inner_rect: Some(NativePhysicalRect::new(0, 0, 801, 600)),
+            ..initial_snapshot
+        };
+
+        state
+            .begin_output(&ctx, viewport_id, window_id, None, initial_snapshot, None)
+            .expect("the semantic output scope exists")
+            .finish()
+            .present();
+
+        let no_frame = state
+            .begin_output(&ctx, viewport_id, window_id, None, resized_snapshot, None)
+            .expect("the resized output scope exists");
+        assert!(!retain_current_native_output_with_overlay());
+        let no_frame = no_frame.finish();
+        assert_eq!(no_frame.render_mode(), NativeOutputRenderMode::NoFrame);
+        no_frame.present();
+
+        let restored_size = state
+            .begin_output(&ctx, viewport_id, window_id, None, initial_snapshot, None)
+            .expect("the restored-size output scope exists");
+        assert!(
+            !retain_current_native_output_with_overlay(),
+            "the submitted no-frame fallback replaced the prior framebuffer"
+        );
+        drop(restored_size);
+    }
+
+    #[test]
+    fn unsubmitted_no_frame_does_not_revoke_a_prior_renderer_frame() {
+        let host = Arc::new(RecordingHost::default());
+        let handler: Arc<dyn NativeHostHandler> = Arc::<RecordingHost>::clone(&host);
+        let state = NativeHostState::new(Some(handler));
+        let ctx = egui::Context::default();
+        let viewport_id = ViewportId::ROOT;
+        let window_id = WindowId::from(88);
+        let initial_snapshot = NativeWindowSnapshot {
+            inner_rect: Some(NativePhysicalRect::new(0, 0, 800, 600)),
+            outer_rect: None,
+            native_scale_factor: 1.0,
+            presentation_scale_factor: 1.0,
+            visible: Some(true),
+            minimized: Some(false),
+            input_state: NativeWindowInputState::ReceivesInput,
+        };
+        let resized_snapshot = NativeWindowSnapshot {
+            inner_rect: Some(NativePhysicalRect::new(0, 0, 801, 600)),
+            ..initial_snapshot
+        };
+
+        state
+            .begin_output(&ctx, viewport_id, window_id, None, initial_snapshot, None)
+            .expect("the semantic output scope exists")
+            .finish()
+            .present();
+
+        let no_frame = state
+            .begin_output(&ctx, viewport_id, window_id, None, resized_snapshot, None)
+            .expect("the resized output scope exists");
+        assert!(!retain_current_native_output_with_overlay());
+        let no_frame = no_frame.finish();
+        assert_eq!(no_frame.render_mode(), NativeOutputRenderMode::NoFrame);
+        drop(no_frame);
+
+        let restored_size = state
+            .begin_output(&ctx, viewport_id, window_id, None, initial_snapshot, None)
+            .expect("the restored-size output scope exists");
+        assert!(
+            retain_current_native_output_with_overlay(),
+            "an unsubmitted fallback never replaced the retained framebuffer"
+        );
+        drop(restored_size);
+    }
+
+    #[test]
+    fn late_no_frame_predecessor_cannot_revoke_a_presented_successor() {
+        let host = Arc::new(RecordingHost::default());
+        let handler: Arc<dyn NativeHostHandler> = Arc::<RecordingHost>::clone(&host);
+        let state = NativeHostState::new(Some(handler));
+        let ctx = egui::Context::default();
+        let viewport_id = ViewportId::ROOT;
+        let window_id = WindowId::from(87);
+        let initial_snapshot = NativeWindowSnapshot {
+            inner_rect: Some(NativePhysicalRect::new(0, 0, 800, 600)),
+            outer_rect: None,
+            native_scale_factor: 1.0,
+            presentation_scale_factor: 1.0,
+            visible: Some(true),
+            minimized: Some(false),
+            input_state: NativeWindowInputState::ReceivesInput,
+        };
+        let resized_snapshot = NativeWindowSnapshot {
+            inner_rect: Some(NativePhysicalRect::new(0, 0, 801, 600)),
+            ..initial_snapshot
+        };
+
+        state
+            .begin_output(&ctx, viewport_id, window_id, None, initial_snapshot, None)
+            .expect("the initial semantic output scope exists")
+            .finish()
+            .present();
+
+        let predecessor = state
+            .begin_output(&ctx, viewport_id, window_id, None, resized_snapshot, None)
+            .expect("the no-frame predecessor scope exists");
+        assert!(!retain_current_native_output_with_overlay());
+        let predecessor = predecessor.finish();
+        assert_eq!(predecessor.render_mode(), NativeOutputRenderMode::NoFrame);
+
+        state
+            .begin_output(&ctx, viewport_id, window_id, None, initial_snapshot, None)
+            .expect("the semantic successor scope exists")
+            .finish()
+            .present();
+        predecessor.present();
+
+        let after_late_predecessor = state
+            .begin_output(&ctx, viewport_id, window_id, None, initial_snapshot, None)
+            .expect("the post-settlement output scope exists");
+        assert!(
+            retain_current_native_output_with_overlay(),
+            "a late no-frame predecessor must not revoke the newer submitted framebuffer"
+        );
+        drop(after_late_predecessor);
+    }
+
+    #[test]
+    fn renderer_only_successor_cannot_resurrect_no_frame_semantics() {
+        let host = Arc::new(RecordingHost::default());
+        let handler: Arc<dyn NativeHostHandler> = Arc::<RecordingHost>::clone(&host);
+        let state = NativeHostState::new(Some(handler));
+        let ctx = egui::Context::default();
+        let viewport_id = ViewportId::ROOT;
+        let window_id = WindowId::from(89);
+        let initial_snapshot = NativeWindowSnapshot {
+            inner_rect: Some(NativePhysicalRect::new(0, 0, 800, 600)),
+            outer_rect: None,
+            native_scale_factor: 1.0,
+            presentation_scale_factor: 1.0,
+            visible: Some(true),
+            minimized: Some(false),
+            input_state: NativeWindowInputState::ReceivesInput,
+        };
+        let resized_snapshot = NativeWindowSnapshot {
+            inner_rect: Some(NativePhysicalRect::new(0, 0, 801, 600)),
+            ..initial_snapshot
+        };
+
+        state
+            .begin_output(&ctx, viewport_id, window_id, None, initial_snapshot, None)
+            .expect("the initial semantic output scope exists")
+            .finish()
+            .present();
+
+        let no_frame = state
+            .begin_output(&ctx, viewport_id, window_id, None, resized_snapshot, None)
+            .expect("the no-frame output scope exists");
+        assert!(!retain_current_native_output_with_overlay());
+        let no_frame = no_frame.finish();
+
+        let overlay = state
+            .begin_output(&ctx, viewport_id, window_id, None, initial_snapshot, None)
+            .expect("the renderer-only successor scope exists");
+        assert!(retain_current_native_output_with_overlay());
+        let overlay = overlay.finish();
+
+        no_frame.present();
+        overlay.present();
+
+        let after_overlay = state
+            .begin_output(&ctx, viewport_id, window_id, None, initial_snapshot, None)
+            .expect("the output after the renderer-only successor exists");
+        assert!(
+            !retain_current_native_output_with_overlay(),
+            "a visual-only overlay cannot restore semantic presentation authority"
+        );
+        drop(after_overlay);
+    }
+
+    #[test]
     fn semantic_result_without_renderer_submission_cannot_enable_retention() {
         let host = Arc::new(RecordingHost::default());
         let handler: Arc<dyn NativeHostHandler> = Arc::<RecordingHost>::clone(&host);
@@ -3037,7 +3301,7 @@ mod tests {
             .begin_output_for_test(&ctx, ViewportId::ROOT, window_id)
             .expect("the output scope exists")
             .finish();
-        settlement.settle(NativeOutputStatus::Presented, false);
+        settlement.settle(NativeOutputStatus::Presented, None);
 
         let next = state
             .begin_output_for_test(&ctx, ViewportId::ROOT, window_id)
@@ -3246,8 +3510,11 @@ mod tests {
             .begin_output_for_test(&ctx, ViewportId::ROOT, WindowId::from(11))
             .unwrap()
             .finish();
-        settlement.settle(NativeOutputStatus::Presented, true);
-        settlement.settle(NativeOutputStatus::NotPresented, false);
+        settlement.settle(
+            NativeOutputStatus::Presented,
+            Some(NativeRetentionKind::Retainable),
+        );
+        settlement.settle(NativeOutputStatus::NotPresented, None);
 
         assert_eq!(host.outputs.lock().len(), 1);
         assert_eq!(
