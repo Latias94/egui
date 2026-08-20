@@ -914,9 +914,13 @@ impl GlowWinitRunning<'_> {
         // The update function, which could call immediate viewports,
         // so make sure we don't hold any locks here required by the immediate viewports rendeer.
 
-        let full_output =
-            self.integration
-                .update(self.app.as_mut(), viewport_ui_cb.as_deref(), raw_input);
+        let full_output = self.integration.update(
+            self.app.as_mut(),
+            viewport_ui_cb.as_deref(),
+            raw_input,
+            #[cfg(feature = "native-host-seam")]
+            &self.native_host,
+        );
         #[cfg(feature = "native-host-seam")]
         if let Some((viewport_id, cancelled)) = self.integration.take_viewport_close_result() {
             self.native_host.finish_viewport_close_request(

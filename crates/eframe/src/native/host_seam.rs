@@ -220,6 +220,47 @@ impl NativeOutputResult {
     }
 }
 
+/// Exact egui pass output finalized by the native host which owns its output token.
+///
+/// Eframe creates this value only after every ordinary egui output hook has
+/// returned successfully and the repeat/terminal disposition is frozen. The
+/// borrowed output belongs to the active native output scope and cannot be
+/// retained beyond this callback.
+pub struct NativeOutputPassFinalization<'a> {
+    context: &'a egui::Context,
+    token: NativeOutputToken,
+    ended_viewport: ViewportId,
+    disposition: egui::OutputPassDisposition,
+    output: &'a mut egui::FullOutput,
+}
+
+impl<'a> NativeOutputPassFinalization<'a> {
+    /// Decomposes the finalization into its exact host-owned facts.
+    pub fn into_parts(
+        self,
+    ) -> (
+        &'a egui::Context,
+        NativeOutputToken,
+        ViewportId,
+        egui::OutputPassDisposition,
+        &'a mut egui::FullOutput,
+    ) {
+        (
+            self.context,
+            self.token,
+            self.ended_viewport,
+            self.disposition,
+            self.output,
+        )
+    }
+}
+
+/// Host-owned callback installed before eframe attaches a native context.
+pub trait NativeOutputPassFinalizer: Send + Sync + 'static {
+    /// Settles one exact pass output at eframe's final output boundary.
+    fn finalize(&self, finalization: NativeOutputPassFinalization<'_>) -> NativeHostWake;
+}
+
 /// Optional wake requested after a terminal host callback.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum NativeHostWake {
@@ -900,6 +941,17 @@ fn take_native_viewport_pointer_passthrough_commands(
 /// viewports so native side effects remain outside application UI recursion. Callbacks run on the
 /// native event-loop thread and must not re-enter eframe.
 pub trait NativeHostHandler: Send + Sync + 'static {
+    /// Installs the one finalizer which owns egui pass settlement for this host.
+    ///
+    /// The default rejects installation. Implementations which support this
+    /// seam should accept at most one finalizer before [`Self::try_attach`].
+    fn install_output_pass_finalizer(
+        &self,
+        _finalizer: Arc<dyn NativeOutputPassFinalizer>,
+    ) -> bool {
+        false
+    }
+
     /// Acquires exclusive ownership for one eframe native context.
     ///
     /// This runs before any native event, viewport, or output callback for the
@@ -975,6 +1027,20 @@ pub trait NativeHostHandler: Send + Sync + 'static {
         _window: NativeWindowSnapshot,
         _root_roster: Option<NativeViewportRoster<'_>>,
     ) {
+    }
+
+    /// Finalizes one egui pass while its exact native output token is active.
+    ///
+    /// This runs after all ordinary egui output hooks completed successfully
+    /// and before eframe exposes the accumulated [`egui::FullOutput`] to the
+    /// renderer. No egui plugin runs after this callback. An unwind before or
+    /// during this callback terminates the token through [`Self::on_output`]
+    /// with [`NativeOutputStatus::NotPresented`].
+    fn on_output_pass_finalized(
+        &self,
+        _finalization: NativeOutputPassFinalization<'_>,
+    ) -> NativeHostWake {
+        NativeHostWake::Wait
     }
 
     /// Receives one terminal output result and decides whether queued work needs another frame.
@@ -1430,6 +1496,33 @@ impl NativeHostState {
         })
     }
 
+    pub(crate) fn finalize_output_pass(
+        &self,
+        context: &egui::Context,
+        ended_viewport: ViewportId,
+        disposition: egui::OutputPassDisposition,
+        output: &mut egui::FullOutput,
+    ) {
+        let Some(inner) = &self.inner else {
+            return;
+        };
+        let token =
+            ACTIVE_OUTPUTS.with(|outputs| outputs.borrow().last().map(|active| active.token));
+        let Some(token) = token else {
+            return;
+        };
+        let wake = inner
+            .handler
+            .on_output_pass_finalized(NativeOutputPassFinalization {
+                context,
+                token,
+                ended_viewport,
+                disposition,
+                output,
+            });
+        apply_host_wake(inner, context, wake);
+    }
+
     #[cfg(test)]
     fn begin_output_for_test(
         &self,
@@ -1875,27 +1968,32 @@ impl Drop for NativeOutputScope {
             return;
         }
         self.leave();
-        if std::thread::panicking() {
-            log::error!(
-                "native output generation unwound; skipping the external settlement callback"
-            );
-            return;
-        }
         let ordinal = NativeOutputOrdinal(next_non_zero(
             &self.inner.next_output,
             "native output ordinal exhausted",
         ));
-        notify_output(
-            &self.inner,
-            &self.ctx,
-            NativeOutputResult {
-                token: self.token,
-                ordinal,
-                status: NativeOutputStatus::NotPresented,
-            },
-            self.frame,
-            None,
-        );
+        let notify = || {
+            notify_output(
+                &self.inner,
+                &self.ctx,
+                NativeOutputResult {
+                    token: self.token,
+                    ordinal,
+                    status: NativeOutputStatus::NotPresented,
+                },
+                self.frame,
+                None,
+            );
+        };
+        if std::thread::panicking() {
+            if std::panic::catch_unwind(std::panic::AssertUnwindSafe(notify)).is_err() {
+                log::error!(
+                    "native output abandonment callback also unwound; suppressing the secondary panic"
+                );
+            }
+        } else {
+            notify();
+        }
     }
 }
 
@@ -2167,7 +2265,11 @@ fn notify_output(
         None => false,
     };
     inner.record_output_result(result, frame, submitted_no_frame);
-    match inner.handler.on_output(result) {
+    apply_host_wake(inner, ctx, inner.handler.on_output(result));
+}
+
+fn apply_host_wake(inner: &NativeHostStateInner, ctx: &egui::Context, wake: NativeHostWake) {
+    match wake {
         NativeHostWake::Wait => {}
         NativeHostWake::RepaintRoot => ctx.request_repaint_once_of(ViewportId::ROOT),
         NativeHostWake::RepaintRootAfterCurrent => {
@@ -3552,6 +3654,117 @@ mod tests {
             .present();
 
         assert!(host.output_begins.lock()[0].2.is_none());
+    }
+
+    #[test]
+    fn host_pass_finalizer_receives_the_active_output_token() {
+        #[derive(Default)]
+        struct LateDiscard {
+            remaining: usize,
+        }
+
+        impl egui::plugin::Plugin for LateDiscard {
+            fn debug_name(&self) -> &'static str {
+                "eframe::test::late_output_discard"
+            }
+
+            fn output_hook(&mut self, _context: &egui::Context, output: &mut egui::FullOutput) {
+                if self.remaining == 0 {
+                    return;
+                }
+                self.remaining -= 1;
+                output
+                    .platform_output
+                    .request_discard_reasons
+                    .push(egui::RepaintCause::new_reason("late host-seam discard"));
+            }
+        }
+
+        #[derive(Default)]
+        struct FinalizingHost {
+            finalizations: Mutex<Vec<(NativeOutputToken, ViewportId, egui::OutputPassDisposition)>>,
+        }
+
+        impl NativeHostHandler for FinalizingHost {
+            fn on_output_pass_finalized(
+                &self,
+                finalization: NativeOutputPassFinalization<'_>,
+            ) -> NativeHostWake {
+                let (_context, token, ended_viewport, disposition, _output) =
+                    finalization.into_parts();
+                self.finalizations
+                    .lock()
+                    .push((token, ended_viewport, disposition));
+                NativeHostWake::Wait
+            }
+        }
+
+        let host = Arc::new(FinalizingHost::default());
+        let handler: Arc<dyn NativeHostHandler> = Arc::<FinalizingHost>::clone(&host);
+        let state = NativeHostState::new(Some(handler));
+        let context = egui::Context::default();
+        context.options_mut(|options| {
+            options.max_passes = 2.try_into().expect("two is non-zero");
+        });
+        context.plugin_or_default::<LateDiscard>().lock().remaining = 1;
+        let scope = state
+            .begin_output_for_test(&context, ViewportId::ROOT, WindowId::from(17))
+            .expect("the native output scope exists");
+        let token = current_native_output_token().expect("the active scope publishes its token");
+
+        let mut output = context.run_ui_with_pass_finalizer(
+            egui::RawInput::default(),
+            |_| {},
+            |context, ended_viewport, disposition, output| {
+                state.finalize_output_pass(context, ended_viewport, disposition, output);
+            },
+        );
+        output.textures_delta.clear();
+        scope.finish().present();
+
+        assert_eq!(
+            *host.finalizations.lock(),
+            [
+                (token, ViewportId::ROOT, egui::OutputPassDisposition::Repeat,),
+                (
+                    token,
+                    ViewportId::ROOT,
+                    egui::OutputPassDisposition::Terminal,
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn unwinding_output_scope_reports_an_exact_not_presented_tombstone() {
+        let host = Arc::new(RecordingHost::default());
+        let handler: Arc<dyn NativeHostHandler> = Arc::<RecordingHost>::clone(&host);
+        let state = NativeHostState::new(Some(handler));
+        let context = egui::Context::default();
+        let token = Arc::new(Mutex::new(None));
+        let observed_token = Arc::clone(&token);
+
+        let interrupted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _scope = state
+                .begin_output_for_test(&context, ViewportId::ROOT, WindowId::from(19))
+                .expect("the native output scope exists");
+            *observed_token.lock() = current_native_output_token();
+            panic!("the UI callback unwound");
+        }));
+
+        assert!(interrupted.is_err());
+        let token = token
+            .lock()
+            .expect("the output token was captured before unwinding");
+        assert_eq!(
+            *host.outputs.lock(),
+            [NativeOutputResult {
+                token,
+                ordinal: NativeOutputOrdinal(NonZeroU64::MIN),
+                status: NativeOutputStatus::NotPresented,
+            }],
+            "unwinding must terminate the exact reserved output token"
+        );
     }
 
     #[test]

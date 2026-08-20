@@ -289,6 +289,7 @@ impl EpiIntegration {
         app: &mut dyn epi::App,
         viewport_ui_cb: Option<&DeferredViewportUiCallback>,
         raw_input: egui::RawInput,
+        #[cfg(feature = "native-host-seam")] native_host: &super::host_seam::NativeHostState,
     ) -> egui::FullOutput {
         let raw_input = self.prepare_raw_input(app, raw_input);
 
@@ -297,7 +298,9 @@ impl EpiIntegration {
 
         let is_root_viewport = viewport_ui_cb.is_none();
 
-        let full_output = self.egui_ctx.run_ui(raw_input, |ui| {
+        let egui_ctx = self.egui_ctx.clone();
+        let frame = &mut self.frame;
+        let mut run_app_ui = |ui: &mut egui::Ui| {
             if let Some(viewport_ui_cb) = viewport_ui_cb {
                 // Child viewport
                 profiling::scope!("viewport_callback");
@@ -305,14 +308,24 @@ impl EpiIntegration {
             } else {
                 {
                     profiling::scope!("App::logic");
-                    app.logic(ui.ctx(), &mut self.frame);
+                    app.logic(ui.ctx(), frame);
                 }
                 {
                     profiling::scope!("App::ui");
-                    app.ui(ui, &mut self.frame);
+                    app.ui(ui, frame);
                 }
             }
-        });
+        };
+        #[cfg(feature = "native-host-seam")]
+        let full_output = egui_ctx.run_ui_with_pass_finalizer(
+            raw_input,
+            &mut run_app_ui,
+            |context, ended_viewport, disposition, output| {
+                native_host.finalize_output_pass(context, ended_viewport, disposition, output);
+            },
+        );
+        #[cfg(not(feature = "native-host-seam"))]
+        let full_output = egui_ctx.run_ui(raw_input, &mut run_app_ui);
 
         if close_requested {
             let canceled = full_output.viewport_output[&viewport_id]

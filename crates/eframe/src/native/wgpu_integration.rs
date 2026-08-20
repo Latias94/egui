@@ -925,7 +925,13 @@ impl WgpuWinitRunning<'_> {
                 .as_ref()
                 .map(NativeViewportRosterCapture::as_borrowed),
         );
-        let full_output = integration.update(app.as_mut(), viewport_ui_cb.as_deref(), raw_input);
+        let full_output = integration.update(
+            app.as_mut(),
+            viewport_ui_cb.as_deref(),
+            raw_input,
+            #[cfg(feature = "native-host-seam")]
+            native_host,
+        );
         #[cfg(feature = "native-host-seam")]
         if let Some((viewport_id, cancelled)) = integration.take_viewport_close_result() {
             native_host.finish_viewport_close_request(

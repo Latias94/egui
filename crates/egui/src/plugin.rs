@@ -1,4 +1,4 @@
-use crate::{Context, FullOutput, RawInput, Ui, ViewportId};
+use crate::{Context, FullOutput, RawInput, Ui};
 use ahash::HashMap;
 use epaint::mutex::{Mutex, MutexGuard};
 use std::sync::Arc;
@@ -56,26 +56,6 @@ pub trait Plugin: Send + Sync + core::any::Any + 'static {
     /// Useful to inspect or modify the output.
     /// Since this is called outside a pass, don't show ui here. Using `Context::debug_painter` is fine though.
     fn output_hook(&mut self, ctx: &Context, output: &mut FullOutput) {}
-
-    /// Called after every ordinary [`Self::output_hook`] completed successfully
-    /// and egui froze whether this pass repeats or terminates its run.
-    ///
-    /// `ended_viewport` is captured before egui restores the parent viewport,
-    /// so it remains exact for non-root and immediate viewport passes. This
-    /// callback is skipped if an ordinary output hook unwinds.
-    ///
-    /// The disposition is already frozen when this callback runs. Mutating
-    /// discard reasons in `output` does not change whether the current run
-    /// repeats; this phase is intended for settling state against the final
-    /// ordinary output, not for requesting another pass.
-    fn output_pass_settlement(
-        &mut self,
-        ctx: &Context,
-        ended_viewport: ViewportId,
-        disposition: OutputPassDisposition,
-        output: &mut FullOutput,
-    ) {
-    }
 
     /// Called when a widget is created and is under the pointer.
     ///
@@ -213,19 +193,6 @@ impl PluginsOrdered {
         profiling::scope!("plugins", "on_output");
         self.for_each_dyn(|plugin| {
             plugin.output_hook(ctx, output);
-        });
-    }
-
-    pub fn on_output_pass_settlement(
-        &self,
-        ctx: &Context,
-        ended_viewport: ViewportId,
-        disposition: OutputPassDisposition,
-        output: &mut FullOutput,
-    ) {
-        profiling::scope!("plugins", "on_output_pass_settlement");
-        self.for_each_dyn(|plugin| {
-            plugin.output_pass_settlement(ctx, ended_viewport, disposition, output);
         });
     }
 

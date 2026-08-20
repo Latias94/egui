@@ -814,36 +814,71 @@ impl Context {
     /// ```
     #[must_use]
     pub fn run_ui(&self, new_input: RawInput, mut run_ui: impl FnMut(&mut Ui)) -> FullOutput {
-        self.run_ui_dyn(new_input, &mut run_ui)
+        self.run_ui_with_pass_finalizer(new_input, &mut run_ui, |_, _, _, _| {})
+    }
+
+    /// Runs one complete egui UI frame and lets the integration finalize each
+    /// completed pass after every ordinary output hook returned successfully.
+    ///
+    /// The finalizer is owned by the integration driving this exact `run_ui`
+    /// call. It receives the ended viewport before egui restores any parent
+    /// viewport, the frozen repeat/terminal disposition, and the exact output
+    /// produced by that pass. No egui plugin runs after the finalizer.
+    ///
+    /// This is intended for framework integrations that must atomically settle
+    /// host state against the output they themselves produced. Applications
+    /// should normally use [`Self::run_ui`].
+    #[must_use]
+    pub fn run_ui_with_pass_finalizer(
+        &self,
+        new_input: RawInput,
+        mut run_ui: impl FnMut(&mut Ui),
+        mut finalize_pass: impl FnMut(&Context, ViewportId, OutputPassDisposition, &mut FullOutput),
+    ) -> FullOutput {
+        self.run_ui_dyn(new_input, &mut run_ui, &mut finalize_pass)
     }
 
     #[must_use]
-    fn run_ui_dyn(&self, new_input: RawInput, run_ui: &mut dyn FnMut(&mut Ui)) -> FullOutput {
+    fn run_ui_dyn(
+        &self,
+        new_input: RawInput,
+        run_ui: &mut dyn FnMut(&mut Ui),
+        finalize_pass: &mut dyn FnMut(&Context, ViewportId, OutputPassDisposition, &mut FullOutput),
+    ) -> FullOutput {
         let plugins = self.read(|ctx| ctx.plugins.ordered_plugins());
-        self.run_dyn(new_input, &mut |ctx| {
-            let mut root_ui = Ui::new(
-                ctx.clone(),
-                Id::new((ctx.viewport_id(), "__top_ui")),
-                UiBuilder::new()
-                    .layer_id(LayerId::background())
-                    .max_rect(ctx.viewport_rect()),
-            );
+        self.run_dyn(
+            new_input,
+            &mut |ctx| {
+                let mut root_ui = Ui::new(
+                    ctx.clone(),
+                    Id::new((ctx.viewport_id(), "__top_ui")),
+                    UiBuilder::new()
+                        .layer_id(LayerId::background())
+                        .max_rect(ctx.viewport_rect()),
+                );
 
-            {
-                plugins.on_begin_pass(&mut root_ui);
-                run_ui(&mut root_ui);
-                plugins.on_end_pass(&mut root_ui);
-            }
+                {
+                    plugins.on_begin_pass(&mut root_ui);
+                    run_ui(&mut root_ui);
+                    plugins.on_end_pass(&mut root_ui);
+                }
 
-            ctx.pass_state_mut(|state| {
-                state.root_ui_available_rect = Some(root_ui.available_rect_before_wrap());
-                state.root_ui_min_rect = Some(root_ui.min_rect());
-            });
-        })
+                ctx.pass_state_mut(|state| {
+                    state.root_ui_available_rect = Some(root_ui.available_rect_before_wrap());
+                    state.root_ui_min_rect = Some(root_ui.min_rect());
+                });
+            },
+            finalize_pass,
+        )
     }
 
     #[must_use]
-    fn run_dyn(&self, mut new_input: RawInput, run_ui: &mut dyn FnMut(&Self)) -> FullOutput {
+    fn run_dyn(
+        &self,
+        mut new_input: RawInput,
+        run_ui: &mut dyn FnMut(&Self),
+        finalize_pass: &mut dyn FnMut(&Context, ViewportId, OutputPassDisposition, &mut FullOutput),
+    ) -> FullOutput {
         profiling::function_scope!();
         let viewport_id = new_input.viewport_id;
         let max_passes = self.write(|ctx| ctx.memory.options.max_passes.get());
@@ -876,7 +911,7 @@ impl Context {
 
             self.begin_pass(new_input.take());
             run_ui(self);
-            let (ended_viewport, plugins, mut pass_output) = self.end_pass_before_settlement();
+            let (ended_viewport, mut pass_output) = self.end_pass_before_finalization();
             debug_assert!(
                 0 < pass_output.platform_output.num_completed_passes,
                 "Completed passes was lower than 0, was {}",
@@ -890,7 +925,7 @@ impl Context {
             } else {
                 OutputPassDisposition::Terminal
             };
-            plugins.on_output_pass_settlement(self, ended_viewport, disposition, &mut pass_output);
+            finalize_pass(self, ended_viewport, disposition, &mut pass_output);
             output.append(pass_output);
 
             if disposition == OutputPassDisposition::Terminal {
@@ -2586,8 +2621,21 @@ impl Context {
     /// Call at the end of each frame if you called [`Context::begin_pass`].
     #[must_use]
     pub fn end_pass(&self) -> FullOutput {
-        let (ended_viewport, plugins, mut output) = self.end_pass_before_settlement();
-        plugins.on_output_pass_settlement(
+        self.end_pass_with_pass_finalizer(|_, _, _, _| {})
+    }
+
+    /// Ends one manually driven pass and invokes the integration-owned
+    /// finalizer after every ordinary output hook completed successfully.
+    ///
+    /// A manual pass is always terminal because egui does not own a surrounding
+    /// multipass loop for [`Self::begin_pass`] / [`Self::end_pass`].
+    #[must_use]
+    pub fn end_pass_with_pass_finalizer(
+        &self,
+        finalize_pass: impl FnOnce(&Context, ViewportId, OutputPassDisposition, &mut FullOutput),
+    ) -> FullOutput {
+        let (ended_viewport, mut output) = self.end_pass_before_finalization();
+        finalize_pass(
             self,
             ended_viewport,
             OutputPassDisposition::Terminal,
@@ -2596,7 +2644,7 @@ impl Context {
         output
     }
 
-    fn end_pass_before_settlement(&self) -> (ViewportId, plugin::PluginsOrdered, FullOutput) {
+    fn end_pass_before_finalization(&self) -> (ViewportId, FullOutput) {
         profiling::function_scope!();
 
         if self.options(|o| o.zoom_with_keyboard) {
@@ -2620,7 +2668,7 @@ impl Context {
         let plugins = self.read(|ctx| ctx.plugins.ordered_plugins());
         plugins.on_output(self, &mut output);
 
-        (ended_viewport, plugins, output)
+        (ended_viewport, output)
     }
 
     /// Keep the native window theme in sync with the egui [`crate::ThemePreference`],
@@ -4549,30 +4597,6 @@ mod test {
     };
 
     #[derive(Default)]
-    struct OutputPassSettlementProbe {
-        observations: Arc<Mutex<Vec<(ViewportId, OutputPassDisposition)>>>,
-    }
-
-    impl crate::plugin::Plugin for OutputPassSettlementProbe {
-        fn debug_name(&self) -> &'static str {
-            "egui::test::output_pass_settlement_probe"
-        }
-
-        fn output_pass_settlement(
-            &mut self,
-            _ctx: &Context,
-            ended_viewport: ViewportId,
-            disposition: OutputPassDisposition,
-            _output: &mut FullOutput,
-        ) {
-            self.observations
-                .lock()
-                .expect("the settlement observations are not poisoned")
-                .push((ended_viewport, disposition));
-        }
-    }
-
-    #[derive(Default)]
     struct LateOutputHook {
         discard_remaining: usize,
         panic_once: bool,
@@ -4601,14 +4625,15 @@ mod test {
         }
     }
 
-    fn install_output_pass_settlement_probe(
-        ctx: &Context,
-    ) -> Arc<Mutex<Vec<(ViewportId, OutputPassDisposition)>>> {
-        let observations = Arc::new(Mutex::new(Vec::new()));
-        ctx.plugin_or_default::<OutputPassSettlementProbe>()
-            .lock()
-            .observations = Arc::clone(&observations);
-        observations
+    fn recording_finalizer(
+        observations: Arc<Mutex<Vec<(ViewportId, OutputPassDisposition)>>>,
+    ) -> impl FnMut(&Context, ViewportId, OutputPassDisposition, &mut FullOutput) {
+        move |_context, ended_viewport, disposition, _output| {
+            observations
+                .lock()
+                .expect("the finalizer observations are not poisoned")
+                .push((ended_viewport, disposition));
+        }
     }
 
     fn test_input() -> RawInput {
@@ -5335,9 +5360,13 @@ mod test {
     #[test]
     fn output_pass_settlement_reports_terminal_root_run() {
         let ctx = Context::default();
-        let observations = install_output_pass_settlement_probe(&ctx);
+        let observations = Arc::new(Mutex::new(Vec::new()));
 
-        let output = ctx.run_ui(test_input(), |_| {});
+        let output = ctx.run_ui_with_pass_finalizer(
+            test_input(),
+            |_| {},
+            recording_finalizer(Arc::clone(&observations)),
+        );
         output.drop_without_applying_deltas();
 
         assert_eq!(
@@ -5351,10 +5380,11 @@ mod test {
     #[test]
     fn manual_end_pass_settles_once_for_the_ended_viewport() {
         let ctx = Context::default();
-        let observations = install_output_pass_settlement_probe(&ctx);
+        let observations = Arc::new(Mutex::new(Vec::new()));
 
         ctx.begin_pass(test_input());
-        let output = ctx.end_pass();
+        let output =
+            ctx.end_pass_with_pass_finalizer(recording_finalizer(Arc::clone(&observations)));
         output.drop_without_applying_deltas();
 
         assert_eq!(
@@ -5368,13 +5398,17 @@ mod test {
     #[test]
     fn non_root_run_reports_the_ended_child_viewport() {
         let ctx = Context::default();
-        let observations = install_output_pass_settlement_probe(&ctx);
+        let observations = Arc::new(Mutex::new(Vec::new()));
         let child = ViewportId::from_hash_of("output-pass-settlement-child");
         let mut input = test_input();
         input.viewport_id = child;
         input.viewports.insert(child, Default::default());
 
-        let output = ctx.run_ui(input, |_| {});
+        let output = ctx.run_ui_with_pass_finalizer(
+            input,
+            |_| {},
+            recording_finalizer(Arc::clone(&observations)),
+        );
         output.drop_without_applying_deltas();
 
         assert_eq!(
@@ -5391,12 +5425,16 @@ mod test {
         ctx.options_mut(|options| {
             options.max_passes = 3.try_into().expect("three is non-zero");
         });
-        let observations = install_output_pass_settlement_probe(&ctx);
+        let observations = Arc::new(Mutex::new(Vec::new()));
         ctx.plugin_or_default::<LateOutputHook>()
             .lock()
             .discard_remaining = 1;
 
-        let output = ctx.run_ui(test_input(), |_| {});
+        let output = ctx.run_ui_with_pass_finalizer(
+            test_input(),
+            |_| {},
+            recording_finalizer(Arc::clone(&observations)),
+        );
         output.drop_without_applying_deltas();
 
         assert_eq!(
@@ -5415,11 +5453,15 @@ mod test {
         let ctx = Context::default();
         let warm_up = ctx.run_ui(test_input(), |_| {});
         warm_up.drop_without_applying_deltas();
-        let observations = install_output_pass_settlement_probe(&ctx);
+        let observations = Arc::new(Mutex::new(Vec::new()));
         ctx.plugin_or_default::<LateOutputHook>().lock().panic_once = true;
 
         let interrupted = catch_unwind(AssertUnwindSafe(|| {
-            let output = ctx.run_ui(test_input(), |_| {});
+            let output = ctx.run_ui_with_pass_finalizer(
+                test_input(),
+                |_| {},
+                recording_finalizer(Arc::clone(&observations)),
+            );
             output.drop_without_applying_deltas();
         }));
 
@@ -5439,12 +5481,16 @@ mod test {
         ctx.options_mut(|options| {
             options.max_passes = 1.try_into().expect("one is non-zero");
         });
-        let observations = install_output_pass_settlement_probe(&ctx);
+        let observations = Arc::new(Mutex::new(Vec::new()));
         ctx.plugin_or_default::<LateOutputHook>()
             .lock()
             .discard_remaining = 1;
 
-        let output = ctx.run_ui(test_input(), |_| {});
+        let output = ctx.run_ui_with_pass_finalizer(
+            test_input(),
+            |_| {},
+            recording_finalizer(Arc::clone(&observations)),
+        );
         output.drop_without_applying_deltas();
 
         assert_eq!(
@@ -5452,6 +5498,77 @@ mod test {
                 .lock()
                 .expect("the settlement observations are not poisoned"),
             [(ViewportId::ROOT, OutputPassDisposition::Terminal)]
+        );
+    }
+
+    #[test]
+    fn host_finalizer_runs_after_all_output_hooks() {
+        let ctx = Context::default();
+        ctx.options_mut(|options| {
+            options.max_passes = 3.try_into().expect("three is non-zero");
+        });
+        ctx.plugin_or_default::<LateOutputHook>()
+            .lock()
+            .discard_remaining = 1;
+        let observations = Arc::new(Mutex::new(Vec::new()));
+        let finalizer_observations = Arc::clone(&observations);
+
+        let output = ctx.run_ui_with_pass_finalizer(
+            test_input(),
+            |_| {},
+            move |_ctx, ended_viewport, disposition, output| {
+                finalizer_observations
+                    .lock()
+                    .expect("the finalizer observations are not poisoned")
+                    .push((
+                        ended_viewport,
+                        disposition,
+                        output.platform_output.requested_discard(),
+                    ));
+            },
+        );
+        output.drop_without_applying_deltas();
+
+        assert_eq!(
+            *observations
+                .lock()
+                .expect("the finalizer observations are not poisoned"),
+            [
+                (ViewportId::ROOT, OutputPassDisposition::Repeat, true),
+                (ViewportId::ROOT, OutputPassDisposition::Terminal, false),
+            ]
+        );
+    }
+
+    #[test]
+    fn output_hook_panic_skips_host_finalizer() {
+        let ctx = Context::default();
+        let warm_up = ctx.run_ui(test_input(), |_| {});
+        warm_up.drop_without_applying_deltas();
+        ctx.plugin_or_default::<LateOutputHook>().lock().panic_once = true;
+        let finalizer_calls = Arc::new(Mutex::new(0_u64));
+        let observed_calls = Arc::clone(&finalizer_calls);
+
+        let interrupted = catch_unwind(AssertUnwindSafe(|| {
+            let output = ctx.run_ui_with_pass_finalizer(
+                test_input(),
+                |_| {},
+                move |_ctx, _ended_viewport, _disposition, _output| {
+                    *observed_calls
+                        .lock()
+                        .expect("the finalizer counter is not poisoned") += 1;
+                },
+            );
+            output.drop_without_applying_deltas();
+        }));
+
+        assert!(interrupted.is_err());
+        assert_eq!(
+            *finalizer_calls
+                .lock()
+                .expect("the finalizer counter is not poisoned"),
+            0,
+            "a host finalizer cannot run before every ordinary output hook returns"
         );
     }
 
