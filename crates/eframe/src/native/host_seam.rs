@@ -657,22 +657,21 @@ impl NativeViewportCreateFailure {
     }
 }
 
-/// One physical-device removal observed before eframe handles it.
+/// One raw physical-device removal observed before eframe handles it.
+///
+/// Winit explicitly does not correlate raw-device identifiers with the
+/// virtual identifiers carried by window input events, so this fact exposes
+/// ordering only. A host must not use the raw callback identifier to target
+/// one window-input stream.
 #[derive(Clone, Copy, Debug)]
 pub struct NativeDeviceRemoval {
     ordinal: NativeEventOrdinal,
-    device_id: winit::event::DeviceId,
 }
 
 impl NativeDeviceRemoval {
     /// Returns the exact order assigned by this eframe native context.
     pub const fn ordinal(&self) -> NativeEventOrdinal {
         self.ordinal
-    }
-
-    /// Returns the physical device identity supplied by winit.
-    pub const fn device_id(&self) -> winit::event::DeviceId {
-        self.device_id
     }
 }
 
@@ -1250,14 +1249,13 @@ impl NativeHostState {
         &self,
         ctx: Option<&egui::Context>,
         ordinal: NativeEventOrdinal,
-        device_id: winit::event::DeviceId,
     ) {
         let Some(inner) = &self.inner else {
             return;
         };
         inner
             .handler
-            .on_device_removed(NativeDeviceRemoval { ordinal, device_id });
+            .on_device_removed(NativeDeviceRemoval { ordinal });
         if let Some(ctx) = ctx {
             ctx.request_repaint_of(ViewportId::ROOT);
         }
@@ -2225,7 +2223,7 @@ mod tests {
                 winit::event::PointerEventFacts,
             )>,
         >,
-        device_removals: Mutex<Vec<(u64, winit::event::DeviceId)>>,
+        device_removals: Mutex<Vec<u64>>,
         output_begins: Mutex<
             Vec<(
                 NativeOutputToken,
@@ -2312,9 +2310,7 @@ mod tests {
         }
 
         fn on_device_removed(&self, removal: NativeDeviceRemoval) {
-            self.device_removals
-                .lock()
-                .push((removal.ordinal().get(), removal.device_id()));
+            self.device_removals.lock().push(removal.ordinal().get());
         }
 
         fn on_global_focus(&self, observation: NativeGlobalFocusObservation) -> NativeHostWake {
@@ -2407,7 +2403,7 @@ mod tests {
             Some(ViewportId::ROOT),
             &press,
         );
-        state.observe_device_removal(None, sequencer.next(), device);
+        state.observe_device_removal(None, sequencer.next());
         state.observe_window_event(
             None,
             sequencer.next(),
@@ -2426,8 +2422,8 @@ mod tests {
         );
         assert_eq!(
             *host.device_removals.lock(),
-            vec![(2, device)],
-            "the typed removal keeps its exact native event order"
+            vec![2],
+            "the typed removal keeps exact order without claiming raw/window device correlation"
         );
     }
 
