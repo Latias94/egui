@@ -14,6 +14,8 @@ use egui::{ViewportBuilder, ViewportId};
 #[cfg(target_os = "linux")]
 use raw_window_handle::{HasDisplayHandle as _, HasWindowHandle as _};
 use winit::event_loop::ActiveEventLoop;
+#[cfg(all(target_os = "linux", feature = "x11"))]
+use winit::platform::x11::WindowExtX11 as _;
 use winit::window::{Window, WindowAttributes, WindowId};
 
 mod work_area;
@@ -657,7 +659,13 @@ impl NativeWindowSnapshot {
             .outer_position()
             .ok()
             .map(|position| physical_rect(position, window.outer_size()));
-        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+        #[cfg(all(target_os = "linux", feature = "x11"))]
+        let outer_rect = window
+            .exact_outer_position_and_size()
+            .map(|(position, size)| physical_rect(position, size));
+        #[cfg(all(target_os = "linux", not(feature = "x11")))]
+        let outer_rect = None;
+        #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
         let outer_rect = None;
 
         #[cfg(target_os = "windows")]
