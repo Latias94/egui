@@ -1337,6 +1337,7 @@ impl Prepared {
             max_offset,
             wheel_scroll_multiplier,
             always_scroll_enabled_direction,
+            Vec2b::FALSE,
         );
 
         if scroll_source.mouse_wheel
@@ -1703,12 +1704,24 @@ impl Prepared {
         state.content_is_too_large = content_is_too_large;
         state.interact_rect = Some(inner_rect);
 
+        // The next wheel edge has no source in the hit-test challenge. Freeze where a
+        // trackpad or momentum edge can be swallowed even though a mouse wheel would chain.
+        // Use the completed content measurement, which enables elasticity on the next pass.
+        let elastic_may_consume: [bool; 2] = core::array::from_fn(|d| {
+            ui.spacing().scroll.kinetic.rubber_band
+                && content_is_too_large[d]
+                && (!has_scrolling_ancestor
+                    || state.offset[d] < 0.0
+                    || state.offset[d] > max_offset[d].max(0.0)
+                    || state.bounced_this_momentum[d])
+        });
         let scroll_hit_state = crate::hit_test::ScrollAreaScrollHitState::new(
             direction_enabled,
             state.offset,
             max_offset,
             wheel_scroll_multiplier,
             always_scroll_enabled_direction,
+            elastic_may_consume.into(),
         );
         let scroll_hit_rect = ui.clip_rect().intersect(outer_rect);
         ui.ctx().pass_state_mut(|pass_state| {

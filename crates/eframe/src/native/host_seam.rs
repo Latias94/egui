@@ -890,7 +890,7 @@ struct QueuedNativeViewportPointerPassthroughCommands(
 );
 
 fn pointer_passthrough_commands_id() -> egui::Id {
-    egui::Id::new("eframe::native_host::pointer_passthrough_commands")
+    egui::Id::unique("eframe::native_host::pointer_passthrough_commands")
 }
 
 /// Queues one host-owned pointer pass-through command for an exact viewport.

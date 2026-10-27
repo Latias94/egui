@@ -76,6 +76,8 @@ impl CompletedPassHitAuthority {
     ///
     /// `presented_candidates` must contain only identities bound to the exact product output being
     /// queried. Framework scroll areas and unrecognized frontmost candidates remain blockers.
+    /// Returns `None` when the point is invalid or the missing event source leaves elastic
+    /// scrolling ambiguous. All scroll state used by this query belongs to the frozen pass.
     #[must_use]
     pub fn scroll_hit_test(
         &self,
@@ -202,6 +204,8 @@ impl<'a> CompletedPassHitState<'a> {
                 challenge.classify_candidate(candidate, presented_candidates)
             }
             Some(WidgetScrollHitRoute::Framework) => WidgetScrollHit::Blocked,
+            // Do not skip a source-dependent framework receiver and admit a candidate behind it.
+            Some(WidgetScrollHitRoute::Unknown) => return None,
             None if eligible_route_was_occluded => WidgetScrollHit::Blocked,
             None => WidgetScrollHit::NoReceiver,
         };
@@ -447,6 +451,7 @@ pub(crate) struct WidgetScrollHitRegistration(usize);
 pub(crate) enum WidgetScrollHitRoute {
     Candidate(WidgetHitIdentity),
     Framework,
+    Unknown,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -490,9 +495,7 @@ impl WidgetScrollHitRecord {
             WidgetScrollHitRecordKind::Candidate(candidate) => {
                 Some(WidgetScrollHitRoute::Candidate(candidate))
             }
-            WidgetScrollHitRecordKind::ScrollArea(state) => state
-                .accepts_projected_delta(projected_delta)
-                .then_some(WidgetScrollHitRoute::Framework),
+            WidgetScrollHitRecordKind::ScrollArea(state) => state.route(projected_delta),
             WidgetScrollHitRecordKind::PendingScrollArea => None,
         }
     }
@@ -568,6 +571,8 @@ pub(crate) struct ScrollAreaScrollHitState {
     max_offset: Vec2,
     wheel_scroll_multiplier: Vec2,
     always_scroll_enabled_direction: bool,
+    /// Axes where an outward trackpad/momentum edge may be consumed without ordinary capacity.
+    elastic_may_consume: Vec2b,
 }
 
 impl ScrollAreaScrollHitState {
@@ -577,6 +582,7 @@ impl ScrollAreaScrollHitState {
         max_offset: Vec2,
         wheel_scroll_multiplier: Vec2,
         always_scroll_enabled_direction: bool,
+        elastic_may_consume: Vec2b,
     ) -> Self {
         Self {
             direction_enabled,
@@ -584,6 +590,7 @@ impl ScrollAreaScrollHitState {
             max_offset,
             wheel_scroll_multiplier,
             always_scroll_enabled_direction,
+            elastic_may_consume,
         }
     }
 
@@ -596,24 +603,30 @@ impl ScrollAreaScrollHitState {
         projected_delta * self.wheel_scroll_multiplier[axis]
     }
 
-    pub(crate) fn accepts_live_axis(self, axis: usize, scroll_delta: f32) -> bool {
-        self.accepts_axis(axis, f64::from(scroll_delta))
-    }
-
-    fn accepts_projected_delta(self, projected_delta: Option<WidgetScrollDelta>) -> bool {
+    fn route(self, projected_delta: Option<WidgetScrollDelta>) -> Option<WidgetScrollHitRoute> {
         match projected_delta {
-            Some(projected_delta) => (0..2).any(|axis| {
-                let projected_delta = if self.always_scroll_enabled_direction {
-                    projected_delta.x + projected_delta.y
-                } else if axis == 0 {
-                    projected_delta.x
-                } else {
-                    projected_delta.y
-                };
-                let scroll_delta = projected_delta * f64::from(self.wheel_scroll_multiplier[axis]);
-                self.accepts_axis(axis, scroll_delta)
-            }),
-            None => (0..2).any(|axis| self.has_potential_capacity(axis)),
+            Some(projected_delta) => {
+                let mut source_dependent = false;
+                for axis in 0..2 {
+                    let projected_delta = if self.always_scroll_enabled_direction {
+                        projected_delta.x + projected_delta.y
+                    } else if axis == 0 {
+                        projected_delta.x
+                    } else {
+                        projected_delta.y
+                    };
+                    let scroll_delta =
+                        projected_delta * f64::from(self.wheel_scroll_multiplier[axis]);
+                    if self.accepts_axis(axis, scroll_delta) {
+                        return Some(WidgetScrollHitRoute::Framework);
+                    }
+                    source_dependent |= self.elastic_may_consume[axis] && scroll_delta != 0.0;
+                }
+                source_dependent.then_some(WidgetScrollHitRoute::Unknown)
+            }
+            None => (0..2)
+                .any(|axis| self.has_potential_capacity(axis))
+                .then_some(WidgetScrollHitRoute::Framework),
         }
     }
 

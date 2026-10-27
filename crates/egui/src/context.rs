@@ -136,6 +136,15 @@ impl ContextImpl {
         let viewport = self.viewports.entry(viewport_id).or_default();
         viewport.repaint.causes.push(cause);
 
+        let info = RequestRepaintInfo {
+            viewport_id,
+            delay: Duration::ZERO,
+            current_cumulative_pass_nr: viewport.repaint.cumulative_pass_nr,
+        };
+        if let Some(observer) = &self.repaint_observer {
+            (observer)(info);
+        }
+
         // A zero delay already means that a repaint is queued (or is being
         // serviced). Do not add another callback to the same causal boundary.
         if viewport.repaint.repaint_delay == Duration::ZERO {
@@ -144,11 +153,7 @@ impl ContextImpl {
 
         viewport.repaint.repaint_delay = Duration::ZERO;
         if let Some(callback) = &self.request_repaint_callback {
-            (callback)(RequestRepaintInfo {
-                viewport_id,
-                delay: Duration::ZERO,
-                current_cumulative_pass_nr: viewport.repaint.cumulative_pass_nr,
-            });
+            (callback)(info);
         }
     }
 
@@ -1858,6 +1863,9 @@ impl Context {
     /// produce [`crate::WidgetScrollHit::Blocked`].
     ///
     /// Returns `None` when the viewport has not completed a pass or the point is not finite.
+    /// Also returns `None` when elastic scrolling depends on the event source, which the
+    /// challenge does not carry. This is unknown delivery, not known-empty or blocked delivery.
+    /// Queries use only completed-pass state and never inspect a later pass's input.
     /// [`crate::WidgetScrollHit::NoReceiver`] is authoritative known-empty evidence.
     #[must_use]
     pub fn scroll_hit_test_last_pass(
@@ -5337,8 +5345,8 @@ mod test {
         let ctx = Context::default();
         ctx.options_mut(|options| options.max_passes = 2.try_into().unwrap());
 
-        let first_id = Id::new("first-pass-widget");
-        let final_id = Id::new("final-pass-widget");
+        let first_id = Id::unique("first-pass-widget");
+        let final_id = Id::unique("final-pass-widget");
         let rect = Rect::from_min_size(Pos2::new(8.0, 8.0), Vec2::splat(32.0));
         let mut pass = 0;
         let output = ctx.run_ui(test_input(), |ui| {
@@ -5374,10 +5382,10 @@ mod test {
         );
         ctx.options_mut(|options| options.max_passes = 2.try_into().unwrap());
 
-        let first_id = Id::new("first-pass-authority-widget");
-        let final_id = Id::new("final-pass-authority-widget");
-        let first_scroll_id = Id::new("first-pass-authority-scroll");
-        let final_scroll_id = Id::new("final-pass-authority-scroll");
+        let first_id = Id::unique("first-pass-authority-widget");
+        let final_id = Id::unique("final-pass-authority-widget");
+        let first_scroll_id = Id::unique("first-pass-authority-scroll");
+        let final_scroll_id = Id::unique("final-pass-authority-scroll");
         let rect = Rect::from_min_size(Pos2::new(8.0, 8.0), Vec2::splat(32.0));
         let mut pass = 0;
         let mut final_candidate = None;
@@ -5436,10 +5444,10 @@ mod test {
     #[test]
     fn completed_pass_hit_authority_does_not_read_a_later_pass() {
         let ctx = Context::default();
-        let old_widget_id = Id::new("retained-authority-old-widget");
-        let new_widget_id = Id::new("retained-authority-new-widget");
-        let old_scroll_id = Id::new("retained-authority-old-scroll");
-        let new_scroll_id = Id::new("retained-authority-new-scroll");
+        let old_widget_id = Id::unique("retained-authority-old-widget");
+        let new_widget_id = Id::unique("retained-authority-new-widget");
+        let old_scroll_id = Id::unique("retained-authority-old-scroll");
+        let new_scroll_id = Id::unique("retained-authority-new-scroll");
         let rect = Rect::from_min_size(Pos2::new(8.0, 8.0), Vec2::splat(32.0));
         let mut old_candidate = None;
 
@@ -5504,8 +5512,8 @@ mod test {
         let ctx = Context::default();
         ctx.global_style_mut(|style| style.interaction.interact_radius = 8.0);
 
-        let widget_id = Id::new("frozen-transform-and-radius-widget");
-        let scroll_id = Id::new("frozen-transform-scroll");
+        let widget_id = Id::unique("frozen-transform-and-radius-widget");
+        let scroll_id = Id::unique("frozen-transform-scroll");
         let rect = Rect::from_min_size(Pos2::new(16.0, 16.0), Vec2::splat(16.0));
         let mut candidate = None;
         let output = ctx.run_ui(test_input(), |ui| {
@@ -5578,8 +5586,8 @@ mod test {
     #[test]
     fn completed_pass_hit_authority_freezes_area_interactivity_and_order() {
         let ctx = Context::default();
-        let back_id = Id::new("frozen-area-order-back");
-        let front_id = Id::new("frozen-area-order-front");
+        let back_id = Id::unique("frozen-area-order-back");
+        let front_id = Id::unique("frozen-area-order-front");
         let back_layer = LayerId::new(Order::Middle, back_id);
         let position = Pos2::new(16.0, 16.0);
         let size = Vec2::splat(32.0);
@@ -5661,9 +5669,9 @@ mod test {
     #[test]
     fn completed_pass_hit_authority_freezes_modal_scroll_occlusion() {
         let ctx = Context::default();
-        let receiver_area_id = Id::new("frozen-modal-scroll-receiver-area");
-        let receiver_id = Id::new("frozen-modal-scroll-receiver");
-        let modal_id = Id::new("frozen-modal-scroll-modal");
+        let receiver_area_id = Id::unique("frozen-modal-scroll-receiver-area");
+        let receiver_id = Id::unique("frozen-modal-scroll-receiver");
+        let modal_id = Id::unique("frozen-modal-scroll-modal");
         let modal_layer = LayerId::new(Order::Middle, modal_id);
         let receiver_position = Pos2::new(8.0, 8.0);
         let modal_position = Pos2::new(80.0, 80.0);
@@ -5779,8 +5787,8 @@ mod test {
         let ctx = Context::default();
         ctx.options_mut(|options| options.max_passes = 2.try_into().unwrap());
 
-        let first_id = Id::new("first-pass-scroll-candidate");
-        let final_id = Id::new("final-pass-scroll-candidate");
+        let first_id = Id::unique("first-pass-scroll-candidate");
+        let final_id = Id::unique("final-pass-scroll-candidate");
         let rect = Rect::from_min_size(Pos2::new(8.0, 8.0), Vec2::splat(32.0));
         let mut pass = 0;
         let mut final_candidate = None;
@@ -5837,6 +5845,7 @@ mod test {
         let mut inner_rect = Rect::NOTHING;
         let output = ctx.run_ui(test_input(), |ui| {
             ui.style_mut().always_scroll_the_only_direction = false;
+            ui.spacing_mut().scroll.kinetic.rubber_band = false;
             let outer = ScrollArea::vertical()
                 .id_salt("outer-scroll-hit")
                 .max_height(96.0)
@@ -5853,7 +5862,7 @@ mod test {
                     inner_rect = inner.inner_rect;
                     ui.add_space(120.0);
                 });
-            assert_eq!(outer.state.offset.y, 0.0);
+            assert_eq!(outer.state.clamped_offset().y, 0.0);
         });
         output.drop_without_applying_deltas();
 
@@ -5901,13 +5910,378 @@ mod test {
         assert_eq!(snapshot.hit(), WidgetScrollHit::Blocked);
     }
 
+    fn scroll_authority_input(
+        point: Pos2,
+        delta: f32,
+        source: crate::MouseWheelSource,
+    ) -> RawInput {
+        let mut input = test_input();
+        input.events.push(crate::Event::PointerMoved(point));
+        for (phase, delta) in [
+            (crate::TouchPhase::Start, 0.0),
+            (crate::TouchPhase::Move, delta),
+        ] {
+            input.events.push(crate::Event::MouseWheel {
+                unit: crate::MouseWheelUnit::Point,
+                delta: vec2(0.0, delta),
+                phase,
+                source,
+                modifiers: Default::default(),
+            });
+        }
+        input
+    }
+
+    fn scroll_authority_frame(
+        ctx: &Context,
+        input: RawInput,
+        initial_offset: Option<f32>,
+        nested: bool,
+    ) -> (Rect, crate::scroll_area::State) {
+        let mut result = None;
+        let output = ctx.run_ui(input, |ui| {
+            let mut show_scroll = |ui: &mut crate::Ui| {
+                let mut scroll = ScrollArea::vertical()
+                    .id_salt("elastic-scroll-authority")
+                    .max_height(64.0)
+                    .auto_shrink(false)
+                    .scroll_bar_visibility(crate::scroll_area::ScrollBarVisibility::AlwaysHidden);
+                if let Some(offset) = initial_offset {
+                    scroll = scroll.vertical_scroll_offset(offset);
+                }
+                let scroll = scroll.show(ui, |ui| ui.set_min_height(192.0));
+                result = Some((scroll.inner_rect, scroll.state));
+            };
+            if nested {
+                // Keep a real scrolling ancestor, but leave wheel consumption to the inner area.
+                ScrollArea::vertical()
+                    .id_salt("elastic-scroll-ancestor")
+                    .max_height(96.0)
+                    .auto_shrink(false)
+                    .scroll_source(crate::scroll_area::ScrollSource::NONE)
+                    .show(ui, |ui| {
+                        show_scroll(ui);
+                        ui.set_min_height(256.0);
+                    });
+            } else {
+                show_scroll(ui);
+            }
+        });
+        output.drop_without_applying_deltas();
+        result.expect("the real scroll area completed a pass")
+    }
+
+    #[test]
+    fn elastic_scroll_authority_is_unknown_at_top_and_bottom() {
+        use crate::MouseWheelSource::{Trackpad, Unknown, Wheel};
+
+        for (offset, delta) in [(0.0, 10.0), (128.0, -10.0)] {
+            for rubber_band in [false, true] {
+                for source in [Wheel, Unknown, Trackpad] {
+                    let ctx = Context::default();
+                    ctx.global_style_mut(|style| {
+                        style.spacing.scroll.kinetic.rubber_band = rubber_band
+                    });
+                    let mut rect = Rect::NOTHING;
+                    for _ in 0..2 {
+                        (rect, _) = scroll_authority_frame(&ctx, test_input(), Some(offset), false);
+                    }
+                    let authority = ctx
+                        .capture_completed_pass_hit_authority(ViewportId::ROOT)
+                        .unwrap();
+                    let query = spatial_scroll(0.0, f64::from(delta));
+                    let hit = authority.scroll_hit_test(rect.center(), &[], query);
+                    if rubber_band {
+                        assert_eq!(hit, None, "source is absent from the challenge");
+                    } else {
+                        assert_eq!(hit.unwrap().hit(), WidgetScrollHit::NoReceiver);
+                    }
+                    assert_eq!(
+                        authority
+                            .scroll_hit_test(rect.center(), &[], spatial_scroll(0.0, 0.0))
+                            .unwrap()
+                            .hit(),
+                        WidgetScrollHit::NoReceiver,
+                        "elasticity does not consume a zero delta"
+                    );
+
+                    let (_, state) = scroll_authority_frame(
+                        &ctx,
+                        scroll_authority_input(rect.center(), delta, source),
+                        None,
+                        false,
+                    );
+                    let consumed = rubber_band && source == Trackpad;
+                    assert_eq!(
+                        ctx.input(|input| input.smooth_scroll_delta().y),
+                        if consumed { 0.0 } else { delta }
+                    );
+                    assert_eq!(state.clamped_offset().y, offset);
+                    if consumed {
+                        assert!(state.overscroll().y * delta < 0.0);
+                    } else {
+                        assert_eq!(state.unclamped_offset().y, offset);
+                    }
+                    assert_eq!(
+                        authority.scroll_hit_test(rect.center(), &[], query),
+                        hit,
+                        "later source-specific input cannot change frozen authority"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn nested_scroll_authority_distinguishes_chaining_from_elastic_overscroll() {
+        use crate::MouseWheelSource::Trackpad;
+
+        for offset in [0.0, 5.0] {
+            let ctx = Context::default();
+            let mut rect = Rect::NOTHING;
+            for _ in 0..2 {
+                (rect, _) = scroll_authority_frame(&ctx, test_input(), Some(offset), true);
+            }
+            let query = spatial_scroll(0.0, 10.0);
+            let before = ctx
+                .capture_completed_pass_hit_authority(ViewportId::ROOT)
+                .unwrap();
+            assert_eq!(
+                before
+                    .scroll_hit_test(rect.center(), &[], query)
+                    .unwrap()
+                    .hit(),
+                if offset == 0.0 {
+                    WidgetScrollHit::NoReceiver
+                } else {
+                    WidgetScrollHit::Blocked
+                }
+            );
+
+            let (_, state) = scroll_authority_frame(
+                &ctx,
+                scroll_authority_input(rect.center(), 10.0, Trackpad),
+                None,
+                true,
+            );
+            let overscrolled = offset > 0.0;
+            assert_eq!(state.unclamped_offset().y < 0.0, overscrolled);
+            assert_eq!(
+                ctx.input(|input| input.smooth_scroll_delta().y),
+                if overscrolled { 0.0 } else { 10.0 }
+            );
+            let after = ctx
+                .capture_completed_pass_hit_authority(ViewportId::ROOT)
+                .unwrap();
+            if overscrolled {
+                assert_eq!(after.scroll_hit_test(rect.center(), &[], query), None);
+                let (_, further) = scroll_authority_frame(
+                    &ctx,
+                    scroll_authority_input(rect.center(), 10.0, Trackpad),
+                    None,
+                    true,
+                );
+                assert!(further.unclamped_offset().y < state.unclamped_offset().y);
+                assert_eq!(ctx.input(|input| input.smooth_scroll_delta().y), 0.0);
+                assert_eq!(after.scroll_hit_test(rect.center(), &[], query), None);
+            } else {
+                assert_eq!(
+                    after
+                        .scroll_hit_test(rect.center(), &[], query)
+                        .unwrap()
+                        .hit(),
+                    WidgetScrollHit::NoReceiver
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn elastic_scroll_authority_freezes_momentum_reservation_after_settling() {
+        use crate::MouseWheelSource::Momentum;
+
+        let ctx = Context::default();
+        let mut rect = Rect::NOTHING;
+        for _ in 0..2 {
+            (rect, _) = scroll_authority_frame(&ctx, test_input(), Some(5.0), true);
+        }
+        let (_, mut state) = scroll_authority_frame(
+            &ctx,
+            scroll_authority_input(rect.center(), 10.0, Momentum),
+            None,
+            true,
+        );
+        assert_eq!(state.unclamped_offset().y, 0.0);
+        assert!(state.velocity().y < 0.0);
+        assert_eq!(ctx.input(|input| input.smooth_scroll_delta().y), 0.0);
+
+        // Keep the momentum source active while the spring returns to rest.
+        for _ in 0..120 {
+            (_, state) = scroll_authority_frame(
+                &ctx,
+                scroll_authority_input(rect.center(), 0.0, Momentum),
+                None,
+                true,
+            );
+            if state.unclamped_offset().y == 0.0 && state.velocity().y == 0.0 {
+                break;
+            }
+        }
+        assert_eq!(state.unclamped_offset().y, 0.0);
+        assert_eq!(state.velocity().y, 0.0);
+        let authority = ctx
+            .capture_completed_pass_hit_authority(ViewportId::ROOT)
+            .unwrap();
+        assert_eq!(
+            authority.scroll_hit_test(rect.center(), &[], spatial_scroll(0.0, 10.0)),
+            None
+        );
+
+        let (_, swallowed) = scroll_authority_frame(
+            &ctx,
+            scroll_authority_input(rect.center(), 10.0, Momentum),
+            None,
+            true,
+        );
+        assert_eq!(swallowed.unclamped_offset(), state.unclamped_offset());
+        assert_eq!(swallowed.velocity(), state.velocity());
+        assert_eq!(
+            ctx.input(|input| input.smooth_scroll_delta().y),
+            0.0,
+            "consumption need not move the offset"
+        );
+    }
+
+    #[test]
+    fn elastic_scroll_authority_preserves_candidate_order_and_frozen_state() {
+        for candidate_in_front in [false, true] {
+            let ctx = Context::default();
+            let mut candidate = None;
+            let mut rect = Rect::NOTHING;
+            for _ in 0..2 {
+                let output = ctx.run_ui(test_input(), |ui| {
+                    let candidate_rect = ui.max_rect();
+                    let id = Id::unique("elastic-scroll-candidate");
+                    if !candidate_in_front {
+                        candidate = Some(ui.register_scroll_hit_candidate(candidate_rect, id));
+                    }
+                    let scroll = ScrollArea::vertical()
+                        .id_salt("elastic-scroll-authority")
+                        .max_height(64.0)
+                        .auto_shrink(false)
+                        .show(ui, |ui| ui.set_min_height(192.0));
+                    rect = scroll.inner_rect;
+                    if candidate_in_front {
+                        candidate = Some(ui.register_scroll_hit_candidate(candidate_rect, id));
+                    }
+                });
+                output.drop_without_applying_deltas();
+            }
+            let candidate = candidate.unwrap();
+            let authority = ctx
+                .capture_completed_pass_hit_authority(ViewportId::ROOT)
+                .unwrap();
+            if candidate_in_front {
+                assert_eq!(
+                    authority
+                        .scroll_hit_test(rect.center(), &[], spatial_scroll(0.0, 10.0))
+                        .unwrap()
+                        .hit(),
+                    WidgetScrollHit::Blocked,
+                    "an unrecognized frontmost candidate still blocks delivery"
+                );
+            }
+            for challenge in [
+                spatial_scroll(0.0, 10.0),
+                WidgetScrollHitChallenge::Locked {
+                    receiver: candidate,
+                    projected_delta: Some(scroll_delta(0.0, 10.0)),
+                },
+            ] {
+                let hit = authority.scroll_hit_test(rect.center(), &[candidate], challenge);
+                if candidate_in_front {
+                    assert_eq!(hit.unwrap().hit(), WidgetScrollHit::Candidate(candidate));
+                } else {
+                    assert_eq!(
+                        hit, None,
+                        "unknown framework consumption cannot fall through to a candidate"
+                    );
+                }
+            }
+
+            ctx.global_style_mut(|style| style.spacing.scroll.kinetic.rubber_band = false);
+            scroll_authority_frame(&ctx, test_input(), None, false);
+            assert_eq!(
+                ctx.scroll_hit_test_last_pass(
+                    ViewportId::ROOT,
+                    rect.center(),
+                    &[],
+                    spatial_scroll(0.0, 10.0)
+                )
+                .unwrap()
+                .hit(),
+                WidgetScrollHit::NoReceiver
+            );
+            let frozen =
+                authority.scroll_hit_test(rect.center(), &[candidate], spatial_scroll(0.0, 10.0));
+            if candidate_in_front {
+                assert_eq!(frozen.unwrap().hit(), WidgetScrollHit::Candidate(candidate));
+            } else {
+                assert_eq!(frozen, None);
+            }
+        }
+    }
+
+    #[test]
+    fn elastic_scroll_authority_keeps_non_consuming_areas_known_empty() {
+        use crate::MouseWheelSource::Trackpad;
+
+        for (height, multiplier, source) in [
+            (32.0, 1.0, crate::scroll_area::ScrollSource::MOUSE_WHEEL),
+            (192.0, 0.0, crate::scroll_area::ScrollSource::MOUSE_WHEEL),
+            (192.0, 1.0, crate::scroll_area::ScrollSource::NONE),
+        ] {
+            let ctx = Context::default();
+            let mut rect = Rect::NOTHING;
+            let mut show = |input| {
+                let output = ctx.run_ui(input, |ui| {
+                    let scroll = ScrollArea::vertical()
+                        .id_salt("non-consuming-scroll-authority")
+                        .max_height(64.0)
+                        .auto_shrink(false)
+                        .wheel_scroll_multiplier(Vec2::splat(multiplier))
+                        .scroll_source(source)
+                        .show(ui, |ui| ui.set_min_height(height));
+                    rect = scroll.inner_rect;
+                    assert_eq!(scroll.state.unclamped_offset().y, 0.0);
+                });
+                output.drop_without_applying_deltas();
+                rect
+            };
+            show(test_input());
+            let point = show(test_input()).center();
+            let authority = ctx
+                .capture_completed_pass_hit_authority(ViewportId::ROOT)
+                .unwrap();
+            assert_eq!(
+                authority
+                    .scroll_hit_test(point, &[], spatial_scroll(0.0, 10.0))
+                    .unwrap()
+                    .hit(),
+                WidgetScrollHit::NoReceiver
+            );
+            show(scroll_authority_input(point, 10.0, Trackpad));
+            assert_eq!(ctx.input(|input| input.smooth_scroll_delta().y), 10.0);
+        }
+    }
+
     #[test]
     fn locked_scroll_hit_does_not_retarget_and_framework_scroll_blocks() {
         let ctx = Context::default();
         let candidate_rect = Rect::from_min_size(Pos2::new(8.0, 8.0), Vec2::splat(32.0));
         let framework_rect = Rect::from_min_size(Pos2::new(64.0, 8.0), Vec2::new(48.0, 64.0));
-        let locked_id = Id::new("locked-scroll-candidate");
-        let replacement_id = Id::new("replacement-scroll-candidate");
+        let locked_id = Id::unique("locked-scroll-candidate");
+        let replacement_id = Id::unique("replacement-scroll-candidate");
         let mut locked = None;
         let mut replacement = None;
         let mut framework_scroll_rect = Rect::NOTHING;

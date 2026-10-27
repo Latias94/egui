@@ -648,7 +648,7 @@ impl Painter {
         clear_color: [f32; 4],
         clipped_primitives: &[epaint::ClippedPrimitive],
         textures_delta: &mut epaint::textures::TexturesDelta,
-        capture_data: Vec<UserData>,
+        capture_data: Vec<egui::ScreenshotCallback>,
         window: &Arc<winit::window::Window>,
     ) -> WinitPaintResult {
         WinitPaintResult(self.paint_and_update_textures_impl(
@@ -674,7 +674,7 @@ impl Painter {
         clear_color: [f32; 4],
         clipped_primitives: &[epaint::ClippedPrimitive],
         textures_delta: &mut epaint::textures::TexturesDelta,
-        capture_data: Vec<UserData>,
+        capture_data: Vec<egui::ScreenshotCallback>,
         window: &Arc<winit::window::Window>,
     ) -> WinitPaintResult {
         WinitPaintResult(self.paint_and_update_textures_impl(
@@ -697,7 +697,7 @@ impl Painter {
         clear_color: [f32; 4],
         clipped_primitives: &[epaint::ClippedPrimitive],
         textures_delta: &mut epaint::textures::TexturesDelta,
-        capture_data: Vec<UserData>,
+        capture_data: Vec<egui::ScreenshotCallback>,
         window: &Arc<winit::window::Window>,
         mode: WinitPaintMode,
     ) -> WinitPaintRunResult {
@@ -794,6 +794,8 @@ impl Painter {
             }
         };
 
+        // An offscreen capture still submits GPU work and consumes its texture updates,
+        // but only an actual surface presentation may produce a presented host result.
         let (mut encoder, user_cmd_bufs, screen_descriptor) =
             prepared.take().unwrap_or_else(|| {
                 prepare_render_resources(
@@ -835,7 +837,7 @@ impl Painter {
                 };
                 if size.width == 0 || size.height == 0 {
                     log::warn!("Cannot capture a screenshot of a zero-sized surface");
-                    return vsync_sec;
+                    return WinitPaintRunResult::dropped(vsync_sec);
                 }
 
                 let capture_state = self
@@ -849,7 +851,7 @@ impl Painter {
             } else {
                 // Unreachable: without a frame to present to, and with nothing to capture,
                 // we returned above.
-                return vsync_sec;
+                return WinitPaintRunResult::dropped(vsync_sec);
             };
             let target_view = target_texture.create_view(&wgpu::TextureViewDescriptor::default());
 
@@ -965,9 +967,10 @@ impl Painter {
             let start = web_time::Instant::now();
             render_state.queue.present(output_frame);
             vsync_sec += start.elapsed().as_secs_f32();
+            WinitPaintRunResult::presented(vsync_sec)
+        } else {
+            WinitPaintRunResult::dropped(vsync_sec)
         }
-
-        WinitPaintRunResult::presented(vsync_sec)
     }
 
     pub fn gc_viewports(&mut self, active_viewports: &ViewportIdSet) {

@@ -1419,23 +1419,16 @@ impl Viewport {
             (None, None)
         };
 
-        let mut window_attributes =
-            egui_winit::create_winit_window_attributes(egui_ctx, self.builder.clone());
-        if let Some(idx) = self.builder.monitor {
-            if let Some(monitor) = event_loop.available_monitors().nth(idx) {
-                window_attributes = window_attributes
-                    .with_fullscreen(Some(winit::window::Fullscreen::Borderless(Some(monitor))));
-            } else {
-                log::warn!(
-                    "ViewportBuilder::with_monitor({idx}): index out of range ({} monitors available)",
-                    event_loop.available_monitors().count()
-                );
-            }
-        }
+        let window_attributes = egui_winit::apply_monitor_to_window_attributes(
+            egui_winit::create_winit_window_attributes(egui_ctx, self.builder.clone()),
+            &self.builder,
+            event_loop,
+        );
         #[cfg(feature = "native-host-seam")]
-        if let Some(native_override) = native_override {
-            window_attributes = native_override.apply_to_attributes(window_attributes);
-        }
+        let window_attributes = match native_override {
+            Some(native_override) => native_override.apply_to_attributes(window_attributes),
+            None => window_attributes,
+        };
 
         let window = match event_loop.create_window(window_attributes) {
             Ok(window) => window,
@@ -1479,14 +1472,16 @@ impl Viewport {
 
         windows_id.insert(window.id(), viewport_id);
 
-        self.egui_winit = Some(egui_winit::State::new(
+        let mut egui_winit = egui_winit::State::new(
             egui_ctx.clone(),
             viewport_id,
             event_loop,
             Some(window.scale_factor() as f32),
             event_loop.system_theme(),
             painter.max_texture_side(),
-        ));
+        );
+        egui_winit.set_clipboard_shortcuts(clipboard_shortcuts);
+        self.egui_winit = Some(egui_winit);
 
         egui_winit::update_viewport_info(&mut self.info, egui_ctx, &window, true);
         #[cfg(feature = "native-host-seam")]
