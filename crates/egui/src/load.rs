@@ -4,7 +4,7 @@
 //! will get you up and running quickly with its reasonable default implementations of the traits described below.
 //!
 //! 1. Add [`egui_extras`](https://crates.io/crates/egui_extras/) as a dependency with the `all_loaders` feature (`cargo add egui_extras -F all_loaders`).
-//! 2. Add a call to [`egui_extras::install_image_loaders`](https://docs.rs/egui_extras/latest/egui_extras/fn.install_image_loaders.html)
+//! 2. Add a call to [`egui_extras::install_image_loaders`](https://docs.rs/egui_extras/latest/egui_extras/loaders/fn.install_image_loaders.html)
 //!    in your app's setup code.
 //! 3. Use [`Ui::image`][`crate::ui::Ui::image`] with some [`ImageSource`][`crate::ImageSource`].
 //!
@@ -55,11 +55,11 @@
 mod bytes_loader;
 mod texture_loader;
 
+use alloc::{borrow::Cow, sync::Arc};
 use core::{
     fmt::{Debug, Display},
     ops::Deref,
 };
-use std::{borrow::Cow, sync::Arc};
 
 use ahash::HashMap;
 
@@ -305,6 +305,19 @@ macro_rules! generate_loader_id {
     };
 }
 pub use crate::generate_loader_id;
+
+/// Does the given URI end with the given file extension?
+///
+/// The comparison ignores ASCII case and any `#fragment` at the end of the URI,
+/// so `has_extension("cat.GIF#frame=2", "gif")` is `true`.
+///
+/// This is useful when implementing an [`ImageLoader`].
+pub fn has_extension(uri: &str, extension: &str) -> bool {
+    let path = uri.split('#').next().unwrap_or(uri);
+    std::path::Path::new(path)
+        .extension()
+        .is_some_and(|found| found.eq_ignore_ascii_case(extension))
+}
 
 pub type BytesLoadResult = Result<BytesPoll>;
 
@@ -638,4 +651,15 @@ impl Loaders {
             loader.end_pass(pass_index);
         }
     }
+}
+
+#[test]
+fn test_has_extension() {
+    assert!(has_extension("cat.svg", "svg"));
+    assert!(has_extension("cat.SVG", "svg"));
+    assert!(has_extension("http://example.com/cat.gif#frame=2", "gif"));
+    assert!(!has_extension("cat.svg.png", "svg"));
+    assert!(!has_extension("svg", "svg"));
+    assert!(!has_extension("cat.jpeg", "jpg"));
+    assert!(!has_extension("cat.svg?v=1", "svg"));
 }

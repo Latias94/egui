@@ -204,12 +204,12 @@ pub struct PassState {
 
     /// What the root UI had available at the end of the previous pass.
     ///
-    /// Only set if [`crate::Context::run_ui`] has been called.
+    /// Only set if [`crate::Context::run_ui`] or [`crate::Context::root_ui`] has been called.
     pub root_ui_available_rect: Option<Rect>,
 
     /// What the root UI had used at the end of the previous pass.
     ///
-    /// Only set if [`crate::Context::run_ui`] has been called.
+    /// Only set if [`crate::Context::run_ui`] or [`crate::Context::root_ui`] has been called.
     pub root_ui_min_rect: Option<Rect>,
 
     /// The current scroll area should scroll to this range (horizontal, vertical).
@@ -233,6 +233,9 @@ pub struct PassState {
 
     #[cfg(debug_assertions)]
     pub debug_rect: Option<DebugRect>,
+
+    #[cfg(debug_assertions)]
+    pub(crate) widget_id_change_warning_exclusions: Vec<Rect>,
 }
 
 impl Default for PassState {
@@ -252,6 +255,9 @@ impl Default for PassState {
 
             #[cfg(debug_assertions)]
             debug_rect: None,
+
+            #[cfg(debug_assertions)]
+            widget_id_change_warning_exclusions: Vec::new(),
         }
     }
 }
@@ -274,6 +280,9 @@ impl PassState {
 
             #[cfg(debug_assertions)]
             debug_rect,
+
+            #[cfg(debug_assertions)]
+            widget_id_change_warning_exclusions,
         } = self;
 
         used_ids.clear();
@@ -289,6 +298,7 @@ impl PassState {
         #[cfg(debug_assertions)]
         {
             *debug_rect = None;
+            widget_id_change_warning_exclusions.clear();
         }
 
         *accesskit_state = None;
