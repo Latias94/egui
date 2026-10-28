@@ -390,6 +390,8 @@ pub enum NativeViewportVisibilityStatus {
     Dispatched,
     /// The active window backend does not implement the operation.
     Unsupported,
+    /// The command was retired before execution. This proves no native window state.
+    Retired,
 }
 
 /// Opaque identity for one host-owned native visibility command.
@@ -918,6 +920,8 @@ pub enum NativeViewportFocusStatus {
     AlreadyFocused,
     /// Eframe dispatched the platform focus request and awaits a native event.
     Requested,
+    /// The command was retired before execution. This proves no native focus state.
+    Retired,
 }
 
 /// Opaque identity for one host-owned viewport focus command.
@@ -949,7 +953,7 @@ impl NativeViewportFocusResult {
         self.window_id
     }
 
-    /// Returns whether the command observed focus or requested it.
+    /// Returns whether the command observed focus, requested it, or retired before execution.
     pub const fn status(self) -> NativeViewportFocusStatus {
         self.status
     }
@@ -964,6 +968,8 @@ pub enum NativeViewportPointerPassthroughStatus {
     Unsupported,
     /// The platform ignored or failed the cursor hit-test request.
     Failed,
+    /// The command was retired before execution. This proves no cursor hit-test state.
+    Retired,
 }
 
 /// Opaque identity for one host-owned pointer pass-through command.
@@ -1007,6 +1013,40 @@ impl NativeViewportPointerPassthroughResult {
     }
 }
 
+/// Exact terminal identity of a pending property command retired before execution.
+///
+/// The viewport or its window was forgotten while the command remained queued. This reports
+/// neither an attempted native operation nor an observed window state. No window identity is
+/// invented: a host may correlate the token with its own pre-dispatch target reservation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NativeViewportPropertyCommandRetirement {
+    /// One queued focus command was retired.
+    Focus {
+        /// Target viewport of the retired command.
+        viewport_id: ViewportId,
+        /// Exact token returned when the command was queued.
+        token: NativeViewportFocusCommandToken,
+    },
+    /// One queued visibility command was retired.
+    Visibility {
+        /// Target viewport of the retired command.
+        viewport_id: ViewportId,
+        /// Exact token returned when the command was queued.
+        token: NativeViewportVisibilityCommandToken,
+        /// Requested visibility of the retired command.
+        visible: bool,
+    },
+    /// One queued pointer pass-through command was retired.
+    PointerPassthrough {
+        /// Target viewport of the retired command.
+        viewport_id: ViewportId,
+        /// Exact token returned when the command was queued.
+        token: NativeViewportPointerPassthroughCommandToken,
+        /// Requested pass-through value of the retired command.
+        enabled: bool,
+    },
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum QueuedNativeViewportPropertyCommand {
     Focus(NativeViewportFocusCommandToken),
@@ -1042,8 +1082,10 @@ enum NativeViewportPropertyResult {
 /// There is no ordering guarantee between different viewports. A viewport without a native window
 /// cannot produce a result; queuing a command does not create a native window.
 /// An active native-host attachment must already be bound to `ctx` (as it is during viewport UI).
-/// Otherwise the token is unused and no operation or callback is scheduled. Pending commands are
-/// discarded when their attachment or target viewport is retired.
+/// Otherwise the token is unused and no operation or callback is scheduled. Forgetting a target
+/// viewport or its current window retires pending commands through
+/// [`NativeHostHandler::on_viewport_property_command_retired`], in their original queue order.
+/// Releasing the attachment discards any remaining commands with that attachment.
 pub fn queue_native_viewport_focus(
     ctx: &egui::Context,
     viewport_id: ViewportId,
@@ -1222,6 +1264,21 @@ pub trait NativeHostHandler: Send + Sync + 'static {
     fn on_viewport_pointer_passthrough(
         &self,
         _result: NativeViewportPointerPassthroughResult,
+    ) -> NativeHostWake {
+        NativeHostWake::Wait
+    }
+
+    /// Reports one pending property command retired without executing a native operation.
+    ///
+    /// Forgetting a viewport or its current window removes that viewport's queue and reports
+    /// each exact token in enqueue order, after releasing all internal mutex guards. Commands
+    /// already consumed for dispatch do not also retire. Queueing a fresh command from this
+    /// callback is permitted; it belongs to the next queue and survives this retirement.
+    /// A late forget for an older window does not retire a replacement window's commands.
+    /// Wake requests arm the existing root wake after the current pass.
+    fn on_viewport_property_command_retired(
+        &self,
+        _retirement: NativeViewportPropertyCommandRetirement,
     ) -> NativeHostWake {
         NativeHostWake::Wait
     }
@@ -2578,18 +2635,22 @@ impl NativeHostStateInner {
     }
 
     fn forget_presented_window(&self, viewport_id: ViewportId, window_id: WindowId) {
-        if self
-            .window_input
-            .lock()
-            .records
-            .get(&viewport_id)
-            .is_none_or(|record| record.window_id == window_id)
-        {
-            self.viewport_property_commands
-                .lock()
-                .0
-                .remove(&viewport_id);
-        }
+        let retired_commands = {
+            let window_input = self.window_input.lock();
+            if window_input
+                .records
+                .get(&viewport_id)
+                .is_none_or(|record| record.window_id == window_id)
+            {
+                self.viewport_property_commands
+                    .lock()
+                    .0
+                    .remove(&viewport_id)
+                    .unwrap_or_default()
+            } else {
+                VecDeque::new()
+            }
+        };
         self.pending_viewport_closes
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -2622,13 +2683,16 @@ impl NativeHostStateInner {
             .lock()
             .forget_window(viewport_id, window_id);
         self.bump_presentation_generation(viewport_id);
+        self.notify_retired_property_commands(viewport_id, retired_commands);
     }
 
     fn forget_presented_viewport(&self, viewport_id: ViewportId) {
-        self.viewport_property_commands
+        let retired_commands = self
+            .viewport_property_commands
             .lock()
             .0
-            .remove(&viewport_id);
+            .remove(&viewport_id)
+            .unwrap_or_default();
         self.pending_viewport_closes
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -2643,6 +2707,46 @@ impl NativeHostStateInner {
             .remove(&viewport_id);
         self.window_input.lock().forget_viewport(viewport_id);
         self.bump_presentation_generation(viewport_id);
+        self.notify_retired_property_commands(viewport_id, retired_commands);
+    }
+
+    fn notify_retired_property_commands(
+        &self,
+        viewport_id: ViewportId,
+        commands: VecDeque<QueuedNativeViewportPropertyCommand>,
+    ) {
+        // The queue is detached and all ledger cleanup is complete before host code runs.
+        // Reentrant queueing creates a successor queue which this loop cannot remove.
+        for command in commands {
+            let retirement = match command {
+                QueuedNativeViewportPropertyCommand::Focus(token) => {
+                    NativeViewportPropertyCommandRetirement::Focus { viewport_id, token }
+                }
+                QueuedNativeViewportPropertyCommand::Visibility { token, visible } => {
+                    NativeViewportPropertyCommandRetirement::Visibility {
+                        viewport_id,
+                        token,
+                        visible,
+                    }
+                }
+                QueuedNativeViewportPropertyCommand::PointerPassthrough { token, enabled } => {
+                    NativeViewportPropertyCommandRetirement::PointerPassthrough {
+                        viewport_id,
+                        token,
+                        enabled,
+                    }
+                }
+            };
+            if self
+                .handler
+                .on_viewport_property_command_retired(retirement)
+                != NativeHostWake::Wait
+            {
+                // Forget callbacks have no Context. Both repaint variants preserve a root
+                // wake through the existing event-loop latch without retaining that Context.
+                self.root_wake_after_current.store(true, Ordering::Release);
+            }
+        }
     }
 
     fn invalidate_presented_viewport(&self, viewport_id: ViewportId) {

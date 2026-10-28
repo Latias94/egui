@@ -5,6 +5,7 @@ enum Trace {
     Ordinary(egui::ViewportCommand),
     Applied(QueuedNativeViewportPropertyCommand),
     Callback(NativeViewportPropertyResult),
+    Retired(NativeViewportPropertyCommandRetirement),
 }
 
 #[derive(Default)]
@@ -13,6 +14,14 @@ struct PropertyHost {
 }
 
 impl NativeHostHandler for PropertyHost {
+    fn on_viewport_property_command_retired(
+        &self,
+        retirement: NativeViewportPropertyCommandRetirement,
+    ) -> NativeHostWake {
+        self.trace.lock().push(Trace::Retired(retirement));
+        NativeHostWake::Wait
+    }
+
     fn on_viewport_focus(&self, result: NativeViewportFocusResult) -> NativeHostWake {
         self.trace
             .lock()
@@ -307,14 +316,38 @@ fn missing_viewport_cannot_acknowledge_another_viewports_commands() {
 fn property_commands_do_not_cross_attachment_or_viewport_retirement() {
     let (host, state, ctx) = fixture();
     let viewport = ViewportId::ROOT;
-    queue_native_viewport_focus(&ctx, viewport);
-    queue_native_viewport_visibility(&ctx, viewport, true);
+    let focus = queue_native_viewport_focus(&ctx, viewport);
+    let visibility = queue_native_viewport_visibility(&ctx, viewport, true);
     state.forget_presented_viewport(viewport);
     assert!(state.take_viewport_property_commands(viewport).is_empty());
-    queue_native_viewport_focus(&ctx, viewport);
-    queue_native_viewport_visibility(&ctx, viewport, true);
+    let next_focus = queue_native_viewport_focus(&ctx, viewport);
+    let next_visibility = queue_native_viewport_visibility(&ctx, viewport, true);
     state.forget_presented_window(viewport, WindowId::from(41));
     assert!(state.take_viewport_property_commands(viewport).is_empty());
+    assert_eq!(
+        *host.trace.lock(),
+        [
+            Trace::Retired(NativeViewportPropertyCommandRetirement::Focus {
+                viewport_id: viewport,
+                token: focus,
+            }),
+            Trace::Retired(NativeViewportPropertyCommandRetirement::Visibility {
+                viewport_id: viewport,
+                token: visibility,
+                visible: true,
+            }),
+            Trace::Retired(NativeViewportPropertyCommandRetirement::Focus {
+                viewport_id: viewport,
+                token: next_focus,
+            }),
+            Trace::Retired(NativeViewportPropertyCommandRetirement::Visibility {
+                viewport_id: viewport,
+                token: next_visibility,
+                visible: true,
+            }),
+        ]
+    );
+    host.trace.lock().clear();
     let stale = queue_native_viewport_focus(&ctx, viewport);
     let clone = state.clone();
     drop(state);
@@ -369,9 +402,9 @@ fn retired_typed_properties_leave_no_ordinary_commands_for_a_successor_window() 
                     ctx.send_viewport_cmd_to(viewport, command.clone());
                 }
             }
-            queue_native_viewport_focus(&ctx, viewport);
-            queue_native_viewport_visibility(&ctx, viewport, true);
-            queue_native_viewport_pointer_passthrough(&ctx, viewport, true);
+            let focus = queue_native_viewport_focus(&ctx, viewport);
+            let visibility = queue_native_viewport_visibility(&ctx, viewport, true);
+            let pointer = queue_native_viewport_pointer_passthrough(&ctx, viewport, true);
 
             // Preserve output/deferred-command copies collected before the old window retires.
             let mut output_commands = if full_output {
@@ -413,15 +446,277 @@ fn retired_typed_properties_leave_no_ordinary_commands_for_a_successor_window() 
             let deferred_commands = targets.remove(&viewport).unwrap();
             dispatch(&host, &state, &ctx, viewport, deferred_commands);
 
-            let expected = if preserve_app_commands {
-                app_commands
-                    .into_iter()
-                    .map(Trace::Ordinary)
-                    .collect::<Vec<_>>()
-            } else {
-                Vec::new()
-            };
+            let mut expected = vec![
+                Trace::Retired(NativeViewportPropertyCommandRetirement::Focus {
+                    viewport_id: viewport,
+                    token: focus,
+                }),
+                Trace::Retired(NativeViewportPropertyCommandRetirement::Visibility {
+                    viewport_id: viewport,
+                    token: visibility,
+                    visible: true,
+                }),
+                Trace::Retired(
+                    NativeViewportPropertyCommandRetirement::PointerPassthrough {
+                        viewport_id: viewport,
+                        token: pointer,
+                        enabled: true,
+                    },
+                ),
+            ];
+            if preserve_app_commands {
+                expected.extend(app_commands.into_iter().map(Trace::Ordinary));
+            }
             assert_eq!(*host.trace.lock(), expected);
+        }
+    }
+}
+
+#[test]
+fn pending_property_retirement_preserves_exact_queue_order_and_is_once_only() {
+    for forget_window in [false, true] {
+        let (host, state, ctx) = fixture();
+        let viewport = ViewportId::from_hash_of("retiring-properties");
+        let other_viewport = ViewportId::from_hash_of("surviving-properties");
+        let window = WindowId::from(41);
+        state
+            .inner
+            .as_ref()
+            .unwrap()
+            .capture_window_input_state(viewport, window);
+        let hide = queue_native_viewport_visibility(&ctx, viewport, false);
+        let focus = queue_native_viewport_focus(&ctx, viewport);
+        let pointer = queue_native_viewport_pointer_passthrough(&ctx, viewport, true);
+        let other = queue_native_viewport_focus(&ctx, other_viewport);
+        let show = queue_native_viewport_visibility(&ctx, viewport, true);
+        let opaque = queue_native_viewport_pointer_passthrough(&ctx, viewport, false);
+
+        if forget_window {
+            state.forget_presented_window(viewport, window);
+        } else {
+            state.forget_presented_viewport(viewport);
+        }
+        let expected = [
+            Trace::Retired(NativeViewportPropertyCommandRetirement::Visibility {
+                viewport_id: viewport,
+                token: hide,
+                visible: false,
+            }),
+            Trace::Retired(NativeViewportPropertyCommandRetirement::Focus {
+                viewport_id: viewport,
+                token: focus,
+            }),
+            Trace::Retired(
+                NativeViewportPropertyCommandRetirement::PointerPassthrough {
+                    viewport_id: viewport,
+                    token: pointer,
+                    enabled: true,
+                },
+            ),
+            Trace::Retired(NativeViewportPropertyCommandRetirement::Visibility {
+                viewport_id: viewport,
+                token: show,
+                visible: true,
+            }),
+            Trace::Retired(
+                NativeViewportPropertyCommandRetirement::PointerPassthrough {
+                    viewport_id: viewport,
+                    token: opaque,
+                    enabled: false,
+                },
+            ),
+        ];
+        assert_eq!(*host.trace.lock(), expected);
+        state.forget_presented_window(viewport, window);
+        state.forget_presented_viewport(viewport);
+        dispatch(&host, &state, &ctx, viewport, []);
+        assert_eq!(*host.trace.lock(), expected);
+        assert!(!state.take_root_wake_after_current());
+
+        dispatch(&host, &state, &ctx, other_viewport, []);
+        let trace = host.trace.lock();
+        assert_eq!(
+            &trace[expected.len()..],
+            [
+                Trace::Applied(QueuedNativeViewportPropertyCommand::Focus(other)),
+                Trace::Callback(NativeViewportPropertyResult::Focus(
+                    NativeViewportFocusResult {
+                        token: other,
+                        viewport_id: other_viewport,
+                        window_id: window,
+                        status: NativeViewportFocusStatus::Requested,
+                    }
+                )),
+            ]
+        );
+    }
+}
+
+#[test]
+fn old_window_forget_preserves_replacement_property_commands() {
+    let (host, state, ctx) = fixture();
+    let viewport = ViewportId::ROOT;
+    let predecessor = WindowId::from(40);
+    let replacement = WindowId::from(41);
+    let inner = state.inner.as_ref().unwrap();
+    inner.capture_window_input_state(viewport, predecessor);
+    inner.capture_window_input_state(viewport, replacement);
+    let focus = queue_native_viewport_focus(&ctx, viewport);
+    let visibility = queue_native_viewport_visibility(&ctx, viewport, false);
+    let pointer = queue_native_viewport_pointer_passthrough(&ctx, viewport, true);
+
+    state.forget_presented_window(viewport, predecessor);
+    assert!(host.trace.lock().is_empty());
+    assert!(
+        state
+            .with_pending_viewport_property_targets(Default::default())
+            .contains_key(&viewport)
+    );
+    dispatch(&host, &state, &ctx, viewport, []);
+    let trace = host.trace.lock();
+    let applied: Vec<_> = trace
+        .iter()
+        .filter_map(|entry| match entry {
+            Trace::Applied(command) => Some(*command),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        applied,
+        [
+            QueuedNativeViewportPropertyCommand::Focus(focus),
+            QueuedNativeViewportPropertyCommand::Visibility {
+                token: visibility,
+                visible: false,
+            },
+            QueuedNativeViewportPropertyCommand::PointerPassthrough {
+                token: pointer,
+                enabled: true,
+            },
+        ]
+    );
+    assert_eq!(trace.len(), 6);
+    assert!(
+        trace
+            .chunks_exact(2)
+            .all(|pair| matches!(pair[1], Trace::Callback(_)))
+    );
+    drop(trace);
+    state.forget_presented_window(viewport, replacement);
+    state.forget_presented_viewport(viewport);
+    assert_eq!(host.trace.lock().len(), 6);
+    assert!(!state.take_root_wake_after_current());
+}
+
+#[test]
+fn property_retirement_reentrant_queue_survives_and_preserves_root_wake() {
+    struct ReentrantHost {
+        wake: NativeHostWake,
+        trace: egui::mutex::Mutex<Vec<NativeViewportPropertyCommandRetirement>>,
+        requeue: egui::mutex::Mutex<Option<(egui::Context, Weak<NativeHostStateInner>)>>,
+        fresh: egui::mutex::Mutex<Option<NativeViewportFocusCommandToken>>,
+    }
+
+    impl NativeHostHandler for ReentrantHost {
+        fn on_viewport_property_command_retired(
+            &self,
+            retirement: NativeViewportPropertyCommandRetirement,
+        ) -> NativeHostWake {
+            self.trace.lock().push(retirement);
+            let requeue = self.requeue.lock().take();
+            if let Some((ctx, weak)) = requeue {
+                let viewport = ViewportId::ROOT;
+                let inner = weak.upgrade().unwrap();
+                assert!(inner.viewport_property_commands.lock().0.is_empty());
+                assert!(!inner.window_input.lock().records.contains_key(&viewport));
+                assert!(
+                    inner
+                        .pending_viewport_closes
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .is_empty()
+                );
+                assert!(
+                    inner
+                        .presented_outputs
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .is_empty()
+                );
+                assert!(
+                    inner
+                        .renderer_outputs
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .is_empty()
+                );
+                assert_eq!(inner.current_presentation_generation(viewport), 1);
+                *self.fresh.lock() = Some(queue_native_viewport_focus(&ctx, viewport));
+            }
+            self.wake
+        }
+    }
+
+    for forget_window in [false, true] {
+        for wake in [
+            NativeHostWake::Wait,
+            NativeHostWake::RepaintRoot,
+            NativeHostWake::RepaintRootAfterCurrent,
+        ] {
+            let host = Arc::new(ReentrantHost {
+                wake,
+                trace: Default::default(),
+                requeue: Default::default(),
+                fresh: Default::default(),
+            });
+            let state = NativeHostState::new(Some(host.clone()));
+            let ctx = egui::Context::default();
+            state.bind_close_context(&ctx);
+            let viewport = ViewportId::ROOT;
+            let window = WindowId::from(41);
+            let inner = state.inner.as_ref().unwrap();
+            inner.capture_window_input_state(viewport, window);
+            *host.requeue.lock() = Some((ctx.clone(), Arc::downgrade(inner)));
+            let focus = queue_native_viewport_focus(&ctx, viewport);
+            let visibility = queue_native_viewport_visibility(&ctx, viewport, true);
+            let pointer = queue_native_viewport_pointer_passthrough(&ctx, viewport, false);
+
+            if forget_window {
+                state.forget_presented_window(viewport, window);
+            } else {
+                state.forget_presented_viewport(viewport);
+            }
+            assert_eq!(
+                *host.trace.lock(),
+                [
+                    NativeViewportPropertyCommandRetirement::Focus {
+                        viewport_id: viewport,
+                        token: focus,
+                    },
+                    NativeViewportPropertyCommandRetirement::Visibility {
+                        viewport_id: viewport,
+                        token: visibility,
+                        visible: true,
+                    },
+                    NativeViewportPropertyCommandRetirement::PointerPassthrough {
+                        viewport_id: viewport,
+                        token: pointer,
+                        enabled: false,
+                    },
+                ]
+            );
+            let fresh = host.fresh.lock().unwrap();
+            assert_ne!(fresh, focus);
+            assert_eq!(
+                Vec::from(state.take_viewport_property_commands(viewport)),
+                [QueuedNativeViewportPropertyCommand::Focus(fresh)]
+            );
+            assert!(state.take_viewport_property_commands(viewport).is_empty());
+            assert_eq!(
+                state.take_root_wake_after_current(),
+                wake != NativeHostWake::Wait
+            );
+            assert!(!state.take_root_wake_after_current());
         }
     }
 }
