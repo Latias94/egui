@@ -20,12 +20,16 @@ use winit::window::{Window, WindowAttributes, WindowId};
 
 #[cfg(test)]
 mod close_tests;
+#[cfg(test)]
+mod property_tests;
 mod work_area;
 
 use work_area::OwnedNativeWorkAreaRoster;
 pub use work_area::{NativeDisplayId, NativeWorkAreaRecord, NativeWorkAreaRoster};
 
 static NEXT_CONTEXT_ID: AtomicU64 = AtomicU64::new(1);
+static NEXT_FOCUS_COMMAND: AtomicU64 = AtomicU64::new(1);
+static NEXT_VISIBILITY_COMMAND: AtomicU64 = AtomicU64::new(1);
 static NEXT_POINTER_PASSTHROUGH_COMMAND: AtomicU64 = AtomicU64::new(1);
 
 thread_local! {
@@ -388,9 +392,14 @@ pub enum NativeViewportVisibilityStatus {
     Unsupported,
 }
 
-/// Result of one native visibility dispatch.
+/// Opaque identity for one host-owned native visibility command.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct NativeViewportVisibilityCommandToken(NonZeroU64);
+
+/// Result of one host-owned native visibility dispatch.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct NativeViewportVisibilityResult {
+    token: NativeViewportVisibilityCommandToken,
     viewport_id: ViewportId,
     window_id: WindowId,
     visible: bool,
@@ -398,6 +407,11 @@ pub struct NativeViewportVisibilityResult {
 }
 
 impl NativeViewportVisibilityResult {
+    /// Returns the exact host command which produced this result.
+    pub const fn token(self) -> NativeViewportVisibilityCommandToken {
+        self.token
+    }
+
     /// Returns the eframe viewport which received the command.
     pub const fn viewport_id(self) -> ViewportId {
         self.viewport_id
@@ -906,15 +920,25 @@ pub enum NativeViewportFocusStatus {
     Requested,
 }
 
-/// Exact viewport focus command consumed by eframe.
+/// Opaque identity for one host-owned viewport focus command.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct NativeViewportFocusCommandToken(NonZeroU64);
+
+/// Exact host-owned viewport focus command consumed by eframe.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct NativeViewportFocusResult {
+    token: NativeViewportFocusCommandToken,
     viewport_id: ViewportId,
     window_id: WindowId,
     status: NativeViewportFocusStatus,
 }
 
 impl NativeViewportFocusResult {
+    /// Returns the exact host command which produced this result.
+    pub const fn token(self) -> NativeViewportFocusCommandToken {
+        self.token
+    }
+
     /// Returns the target eframe viewport.
     pub const fn viewport_id(self) -> ViewportId {
         self.viewport_id
@@ -984,18 +1008,106 @@ impl NativeViewportPointerPassthroughResult {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct QueuedNativeViewportPointerPassthroughCommand {
-    token: NativeViewportPointerPassthroughCommandToken,
-    enabled: bool,
+enum QueuedNativeViewportPropertyCommand {
+    Focus(NativeViewportFocusCommandToken),
+    Visibility {
+        token: NativeViewportVisibilityCommandToken,
+        visible: bool,
+    },
+    PointerPassthrough {
+        token: NativeViewportPointerPassthroughCommandToken,
+        enabled: bool,
+    },
 }
 
-#[derive(Clone, Default)]
-struct QueuedNativeViewportPointerPassthroughCommands(
-    BTreeMap<ViewportId, VecDeque<QueuedNativeViewportPointerPassthroughCommand>>,
+#[derive(Default)]
+struct QueuedNativeViewportPropertyCommands(
+    BTreeMap<ViewportId, VecDeque<QueuedNativeViewportPropertyCommand>>,
 );
 
-fn pointer_passthrough_commands_id() -> egui::Id {
-    egui::Id::unique("eframe::native_host::pointer_passthrough_commands")
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NativeViewportPropertyResult {
+    Focus(NativeViewportFocusResult),
+    Visibility(NativeViewportVisibilityResult),
+    PointerPassthrough(NativeViewportPointerPassthroughResult),
+}
+
+/// Queues one host-owned focus command for an exact viewport.
+///
+/// Ordinary [`egui::ViewportCommand::Focus`] commands do not produce
+/// [`NativeHostHandler::on_viewport_focus`] callbacks. The dedicated command performs the native
+/// operation itself and echoes this opaque token. Its result is not proof of native focus.
+///
+/// Host property commands run after ordinary commands, in enqueue order within each viewport.
+/// There is no ordering guarantee between different viewports. A viewport without a native window
+/// cannot produce a result; queuing a command does not create a native window.
+/// An active native-host attachment must already be bound to `ctx` (as it is during viewport UI).
+/// Otherwise the token is unused and no operation or callback is scheduled. Pending commands are
+/// discarded when their attachment or target viewport is retired.
+pub fn queue_native_viewport_focus(
+    ctx: &egui::Context,
+    viewport_id: ViewportId,
+) -> NativeViewportFocusCommandToken {
+    let token = NativeViewportFocusCommandToken(next_non_zero(
+        &NEXT_FOCUS_COMMAND,
+        "native focus command identity exhausted",
+    ));
+    queue_native_viewport_property(
+        ctx,
+        viewport_id,
+        QueuedNativeViewportPropertyCommand::Focus(token),
+    );
+    token
+}
+
+/// Queues one host-owned visibility command for an exact viewport.
+///
+/// Ordinary [`egui::ViewportCommand::Visible`] commands and viewport builder changes do not produce
+/// [`NativeHostHandler::on_viewport_visibility`] callbacks. The dedicated command performs the
+/// native operation itself and echoes this opaque token. Dispatch is not visibility or presentation
+/// proof. Queue ordering and missing-window behavior match [`queue_native_viewport_focus`].
+pub fn queue_native_viewport_visibility(
+    ctx: &egui::Context,
+    viewport_id: ViewportId,
+    visible: bool,
+) -> NativeViewportVisibilityCommandToken {
+    let token = NativeViewportVisibilityCommandToken(next_non_zero(
+        &NEXT_VISIBILITY_COMMAND,
+        "native visibility command identity exhausted",
+    ));
+    queue_native_viewport_property(
+        ctx,
+        viewport_id,
+        QueuedNativeViewportPropertyCommand::Visibility { token, visible },
+    );
+    token
+}
+
+fn queue_native_viewport_property(
+    ctx: &egui::Context,
+    viewport_id: ViewportId,
+    command: QueuedNativeViewportPropertyCommand,
+) {
+    let handle =
+        ctx.data(|data| data.get_temp::<NativeCloseResolutionHandle>(close_resolution_handle_id()));
+    let Some(inner) = handle.and_then(|handle| handle.0.upgrade()) else {
+        return;
+    };
+    inner
+        .viewport_property_commands
+        .lock()
+        .0
+        .entry(viewport_id)
+        .or_default()
+        .push_back(command);
+    // Keep property authority entirely on the attachment. An ordinary companion could survive
+    // retirement in Context or a renderer's deferred commands and affect a successor window.
+    ctx.request_repaint_of(viewport_id);
+    if viewport_id != ViewportId::ROOT {
+        // Hidden children do not run app logic. The root's logic-only boundary also dispatches
+        // pending typed targets without forcing a hidden UI pass.
+        ctx.request_repaint_of(ViewportId::ROOT);
+    }
 }
 
 /// Queues one host-owned pointer pass-through command for an exact viewport.
@@ -1004,6 +1116,7 @@ fn pointer_passthrough_commands_id() -> egui::Id {
 /// not produce [`NativeHostHandler::on_viewport_pointer_passthrough`] callbacks. This dedicated
 /// path returns an opaque token which is echoed by the terminal callback, so a native coordinator
 /// cannot accidentally consume an unrelated same-value application command.
+/// Queue ordering and attachment requirements match [`queue_native_viewport_focus`].
 pub fn queue_native_viewport_pointer_passthrough(
     ctx: &egui::Context,
     viewport_id: ViewportId,
@@ -1013,38 +1126,12 @@ pub fn queue_native_viewport_pointer_passthrough(
         &NEXT_POINTER_PASSTHROUGH_COMMAND,
         "native pointer pass-through command identity exhausted",
     ));
-    ctx.data_mut(|data| {
-        data.get_temp_mut_or_default::<QueuedNativeViewportPointerPassthroughCommands>(
-            pointer_passthrough_commands_id(),
-        )
-        .0
-        .entry(viewport_id)
-        .or_default()
-        .push_back(QueuedNativeViewportPointerPassthroughCommand { token, enabled });
-    });
-
-    // Ensure the target viewport participates in platform-output processing. The ordinary command
-    // is intentionally callback-free; the host-owned command is applied last and supplies the
-    // exact terminal result.
-    ctx.send_viewport_cmd_to(
+    queue_native_viewport_property(
+        ctx,
         viewport_id,
-        egui::ViewportCommand::MousePassthrough(enabled),
+        QueuedNativeViewportPropertyCommand::PointerPassthrough { token, enabled },
     );
     token
-}
-
-fn take_native_viewport_pointer_passthrough_commands(
-    ctx: &egui::Context,
-    viewport_id: ViewportId,
-) -> VecDeque<QueuedNativeViewportPointerPassthroughCommand> {
-    ctx.data_mut(|data| {
-        data.get_temp_mut_or_default::<QueuedNativeViewportPointerPassthroughCommands>(
-            pointer_passthrough_commands_id(),
-        )
-        .0
-        .remove(&viewport_id)
-        .unwrap_or_default()
-    })
 }
 
 /// External native coordinator callbacks.
@@ -1124,7 +1211,9 @@ pub trait NativeHostHandler: Send + Sync + 'static {
         NativeHostWake::Wait
     }
 
-    /// Reports that eframe consumed one exact viewport focus command.
+    /// Reports consumption of one [`queue_native_viewport_focus`] command with its exact token.
+    ///
+    /// Ordinary focus commands never produce this callback. This is not native focus proof.
     fn on_viewport_focus(&self, _result: NativeViewportFocusResult) -> NativeHostWake {
         NativeHostWake::Wait
     }
@@ -1174,7 +1263,9 @@ pub trait NativeHostHandler: Send + Sync + 'static {
         NativeHostWake::Wait
     }
 
-    /// Reports a native visibility request after eframe attempts to dispatch it.
+    /// Reports one [`queue_native_viewport_visibility`] dispatch with its exact token.
+    ///
+    /// Ordinary visibility commands and builder changes never produce this callback.
     fn on_viewport_visibility(&self, _result: NativeViewportVisibilityResult) -> NativeHostWake {
         NativeHostWake::Wait
     }
@@ -1318,6 +1409,7 @@ struct NativeHostStateInner {
     next_output: AtomicU64,
     next_create_attempt: AtomicU64,
     pending_viewport_closes: Mutex<BTreeMap<ViewportId, PendingNativeViewportClose>>,
+    viewport_property_commands: egui::mutex::Mutex<QueuedNativeViewportPropertyCommands>,
     presented_outputs: Mutex<BTreeMap<ViewportId, NativeRetentionRecord>>,
     renderer_outputs: Mutex<BTreeMap<ViewportId, NativeRetentionRecord>>,
     presentation_generations: Mutex<BTreeMap<ViewportId, u64>>,
@@ -1368,6 +1460,9 @@ impl NativeHostState {
                 next_output: AtomicU64::new(1),
                 next_create_attempt: AtomicU64::new(1),
                 pending_viewport_closes: Mutex::new(BTreeMap::new()),
+                viewport_property_commands: egui::mutex::Mutex::new(
+                    QueuedNativeViewportPropertyCommands::default(),
+                ),
                 presented_outputs: Mutex::new(BTreeMap::new()),
                 renderer_outputs: Mutex::new(BTreeMap::new()),
                 presentation_generations: Mutex::new(BTreeMap::new()),
@@ -1937,25 +2032,6 @@ impl NativeHostState {
         }
     }
 
-    fn notify_viewport_visibility(
-        &self,
-        ctx: &egui::Context,
-        viewport_id: ViewportId,
-        window: &Window,
-        visible: bool,
-    ) {
-        let status = visibility_control_for_window(window);
-        self.notify_viewport_visibility_result(
-            ctx,
-            NativeViewportVisibilityResult {
-                viewport_id,
-                window_id: window.id(),
-                visible,
-                status,
-            },
-        );
-    }
-
     fn notify_viewport_visibility_result(
         &self,
         ctx: &egui::Context,
@@ -1964,9 +2040,7 @@ impl NativeHostState {
         let Some(inner) = &self.inner else {
             return;
         };
-        if inner.handler.on_viewport_visibility(result) == NativeHostWake::RepaintRoot {
-            ctx.request_repaint_of(ViewportId::ROOT);
-        }
+        apply_host_wake(inner, ctx, inner.handler.on_viewport_visibility(result));
     }
 
     pub(crate) fn deferred_visibility_status(
@@ -1985,6 +2059,57 @@ impl NativeHostState {
         window: &Window,
         actions_requested: &mut Vec<egui_winit::ActionRequested>,
     ) {
+        self.process_viewport_commands_with(
+            ctx,
+            viewport_id,
+            commands,
+            |command| {
+                if self.inner.is_some()
+                    && let egui::ViewportCommand::MousePassthrough(enabled) = &command
+                {
+                    if let Err(error) = self.apply_window_input_state(viewport_id, window, *enabled)
+                    {
+                        log::warn!("{command:?}: {error}");
+                    }
+                } else {
+                    egui_winit::process_viewport_commands(
+                        ctx,
+                        info,
+                        std::iter::once(command),
+                        window,
+                        actions_requested,
+                    );
+                }
+            },
+            |command| self.apply_viewport_property_command(viewport_id, window, command),
+        );
+    }
+
+    /// Includes typed targets in logic-only dispatch without queuing ordinary property commands.
+    pub(crate) fn with_pending_viewport_property_targets(
+        &self,
+        mut commands: egui::OrderedViewportIdMap<Vec<egui::ViewportCommand>>,
+    ) -> egui::OrderedViewportIdMap<Vec<egui::ViewportCommand>> {
+        if let Some(inner) = &self.inner {
+            for &viewport_id in inner.viewport_property_commands.lock().0.keys() {
+                commands.entry(viewport_id).or_default();
+            }
+        }
+        commands
+    }
+
+    // Keep ordinary dispatch and typed queue consumption at the same boundary in both backends.
+    // The closures also let tests exercise that boundary without creating an OS window.
+    fn process_viewport_commands_with(
+        &self,
+        ctx: &egui::Context,
+        viewport_id: ViewportId,
+        commands: impl IntoIterator<Item = egui::ViewportCommand>,
+        mut apply_ordinary: impl FnMut(egui::ViewportCommand),
+        mut apply_property: impl FnMut(
+            QueuedNativeViewportPropertyCommand,
+        ) -> NativeViewportPropertyResult,
+    ) {
         for command in commands {
             if matches!(
                 command,
@@ -1993,84 +2118,97 @@ impl NativeHostState {
             {
                 continue;
             }
-            let requested_visibility = match command {
-                egui::ViewportCommand::Visible(visible) => Some(visible),
-                _ => None,
-            };
-            let requested_focus = matches!(command, egui::ViewportCommand::Focus).then(|| {
-                if window.has_focus() {
-                    NativeViewportFocusStatus::AlreadyFocused
-                } else {
-                    NativeViewportFocusStatus::Requested
-                }
-            });
-            if self.inner.is_some()
-                && let egui::ViewportCommand::MousePassthrough(enabled) = &command
-            {
-                match self.apply_window_input_state(viewport_id, window, *enabled) {
-                    Ok(_) => {}
-                    Err(error) => {
-                        log::warn!("{command:?}: {error}");
-                    }
-                }
-            } else {
-                egui_winit::process_viewport_commands(
-                    ctx,
-                    info,
-                    std::iter::once(command),
-                    window,
-                    actions_requested,
-                );
-            }
-            if let Some(visible) = requested_visibility {
-                self.notify_viewport_visibility(ctx, viewport_id, window, visible);
-            }
-            if let Some(status) = requested_focus {
-                self.notify_viewport_focus(ctx, viewport_id, window.id(), status);
-            }
+            apply_ordinary(command);
         }
 
-        for command in take_native_viewport_pointer_passthrough_commands(ctx, viewport_id) {
-            let status = match self.apply_window_input_state(viewport_id, window, command.enabled) {
-                Ok(_) => NativeViewportPointerPassthroughStatus::Applied,
-                Err(winit::error::ExternalError::NotSupported(_)) => {
-                    NativeViewportPointerPassthroughStatus::Unsupported
+        for command in self.take_viewport_property_commands(viewport_id) {
+            match apply_property(command) {
+                NativeViewportPropertyResult::Focus(result) => {
+                    self.notify_viewport_focus(ctx, result);
                 }
-                Err(winit::error::ExternalError::Ignored | winit::error::ExternalError::Os(_)) => {
-                    NativeViewportPointerPassthroughStatus::Failed
+                NativeViewportPropertyResult::Visibility(result) => {
+                    self.notify_viewport_visibility_result(ctx, result);
                 }
-            };
-            self.notify_viewport_pointer_passthrough(
-                ctx,
-                NativeViewportPointerPassthroughResult {
-                    token: command.token,
-                    viewport_id,
-                    window_id: window.id(),
-                    enabled: command.enabled,
-                    status,
-                },
-            );
+                NativeViewportPropertyResult::PointerPassthrough(result) => {
+                    self.notify_viewport_pointer_passthrough(ctx, result);
+                }
+            }
         }
     }
 
-    fn notify_viewport_focus(
+    fn take_viewport_property_commands(
         &self,
-        ctx: &egui::Context,
         viewport_id: ViewportId,
-        window_id: WindowId,
-        status: NativeViewportFocusStatus,
-    ) {
+    ) -> VecDeque<QueuedNativeViewportPropertyCommand> {
+        self.inner.as_ref().map_or_else(VecDeque::new, |inner| {
+            inner
+                .viewport_property_commands
+                .lock()
+                .0
+                .remove(&viewport_id)
+                .unwrap_or_default()
+        })
+    }
+
+    fn apply_viewport_property_command(
+        &self,
+        viewport_id: ViewportId,
+        window: &Window,
+        command: QueuedNativeViewportPropertyCommand,
+    ) -> NativeViewportPropertyResult {
+        match command {
+            QueuedNativeViewportPropertyCommand::Focus(token) => {
+                let status = if window.has_focus() {
+                    NativeViewportFocusStatus::AlreadyFocused
+                } else {
+                    window.focus_window();
+                    NativeViewportFocusStatus::Requested
+                };
+                NativeViewportPropertyResult::Focus(NativeViewportFocusResult {
+                    token,
+                    viewport_id,
+                    window_id: window.id(),
+                    status,
+                })
+            }
+            QueuedNativeViewportPropertyCommand::Visibility { token, visible } => {
+                window.set_visible(visible);
+                NativeViewportPropertyResult::Visibility(NativeViewportVisibilityResult {
+                    token,
+                    viewport_id,
+                    window_id: window.id(),
+                    visible,
+                    status: visibility_control_for_window(window),
+                })
+            }
+            QueuedNativeViewportPropertyCommand::PointerPassthrough { token, enabled } => {
+                let status = match self.apply_window_input_state(viewport_id, window, enabled) {
+                    Ok(_) => NativeViewportPointerPassthroughStatus::Applied,
+                    Err(winit::error::ExternalError::NotSupported(_)) => {
+                        NativeViewportPointerPassthroughStatus::Unsupported
+                    }
+                    Err(
+                        winit::error::ExternalError::Ignored | winit::error::ExternalError::Os(_),
+                    ) => NativeViewportPointerPassthroughStatus::Failed,
+                };
+                NativeViewportPropertyResult::PointerPassthrough(
+                    NativeViewportPointerPassthroughResult {
+                        token,
+                        viewport_id,
+                        window_id: window.id(),
+                        enabled,
+                        status,
+                    },
+                )
+            }
+        }
+    }
+
+    fn notify_viewport_focus(&self, ctx: &egui::Context, result: NativeViewportFocusResult) {
         let Some(inner) = &self.inner else {
             return;
         };
-        if inner.handler.on_viewport_focus(NativeViewportFocusResult {
-            viewport_id,
-            window_id,
-            status,
-        }) == NativeHostWake::RepaintRoot
-        {
-            ctx.request_repaint_of(ViewportId::ROOT);
-        }
+        apply_host_wake(inner, ctx, inner.handler.on_viewport_focus(result));
     }
 
     fn notify_viewport_pointer_passthrough(
@@ -2081,9 +2219,11 @@ impl NativeHostState {
         let Some(inner) = &self.inner else {
             return;
         };
-        if inner.handler.on_viewport_pointer_passthrough(result) == NativeHostWake::RepaintRoot {
-            ctx.request_repaint_of(ViewportId::ROOT);
-        }
+        apply_host_wake(
+            inner,
+            ctx,
+            inner.handler.on_viewport_pointer_passthrough(result),
+        );
     }
 }
 
@@ -2438,6 +2578,18 @@ impl NativeHostStateInner {
     }
 
     fn forget_presented_window(&self, viewport_id: ViewportId, window_id: WindowId) {
+        if self
+            .window_input
+            .lock()
+            .records
+            .get(&viewport_id)
+            .is_none_or(|record| record.window_id == window_id)
+        {
+            self.viewport_property_commands
+                .lock()
+                .0
+                .remove(&viewport_id);
+        }
         self.pending_viewport_closes
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -2473,6 +2625,10 @@ impl NativeHostStateInner {
     }
 
     fn forget_presented_viewport(&self, viewport_id: ViewportId) {
+        self.viewport_property_commands
+            .lock()
+            .0
+            .remove(&viewport_id);
         self.pending_viewport_closes
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -2931,16 +3087,23 @@ mod tests {
         let state = NativeHostState::new(Some(handler));
         let child_viewport = ViewportId::from_hash_of("focus-command-child");
         let child_window = WindowId::from(19);
+        let context = egui::Context::default();
+        state.bind_close_context(&context);
+        let token = queue_native_viewport_focus(&context, child_viewport);
 
         state.notify_viewport_focus(
-            &egui::Context::default(),
-            child_viewport,
-            child_window,
-            NativeViewportFocusStatus::AlreadyFocused,
+            &context,
+            NativeViewportFocusResult {
+                token,
+                viewport_id: child_viewport,
+                window_id: child_window,
+                status: NativeViewportFocusStatus::AlreadyFocused,
+            },
         );
 
         let results = host.viewport_focus_results.lock();
         assert_eq!(results.len(), 1);
+        assert_eq!(results[0].token(), token);
         assert_eq!(results[0].viewport_id(), child_viewport);
         assert_eq!(results[0].window_id(), child_window);
         assert_eq!(
@@ -2955,6 +3118,7 @@ mod tests {
         let handler: Arc<dyn NativeHostHandler> = Arc::<RecordingHost>::clone(&host);
         let state = NativeHostState::new(Some(handler));
         let context = egui::Context::default();
+        state.bind_close_context(&context);
         let child_viewport = ViewportId::from_hash_of("pointer-passthrough-child");
         let child_window = WindowId::from(23);
         let token = queue_native_viewport_pointer_passthrough(&context, child_viewport, true);
@@ -2985,38 +3149,42 @@ mod tests {
     #[test]
     fn pointer_passthrough_host_commands_keep_exact_tokens_and_viewport_order() {
         let context = egui::Context::default();
+        let state = NativeHostState::new(Some(Arc::new(RecordingHost::default())));
+        state.bind_close_context(&context);
         let first_viewport = ViewportId::from_hash_of("pointer-passthrough-first");
         let second_viewport = ViewportId::from_hash_of("pointer-passthrough-second");
         let first = queue_native_viewport_pointer_passthrough(&context, first_viewport, true);
         let other = queue_native_viewport_pointer_passthrough(&context, second_viewport, true);
         let second = queue_native_viewport_pointer_passthrough(&context, first_viewport, false);
 
-        let first_commands =
-            take_native_viewport_pointer_passthrough_commands(&context, first_viewport);
+        let first_commands = state.take_viewport_property_commands(first_viewport);
         assert_eq!(
             first_commands.into_iter().collect::<Vec<_>>(),
             [
-                QueuedNativeViewportPointerPassthroughCommand {
+                QueuedNativeViewportPropertyCommand::PointerPassthrough {
                     token: first,
                     enabled: true,
                 },
-                QueuedNativeViewportPointerPassthroughCommand {
+                QueuedNativeViewportPropertyCommand::PointerPassthrough {
                     token: second,
                     enabled: false,
                 },
             ]
         );
         assert_eq!(
-            take_native_viewport_pointer_passthrough_commands(&context, second_viewport)
+            state
+                .take_viewport_property_commands(second_viewport)
                 .into_iter()
                 .collect::<Vec<_>>(),
-            [QueuedNativeViewportPointerPassthroughCommand {
+            [QueuedNativeViewportPropertyCommand::PointerPassthrough {
                 token: other,
                 enabled: true,
             }]
         );
         assert!(
-            take_native_viewport_pointer_passthrough_commands(&context, first_viewport).is_empty()
+            state
+                .take_viewport_property_commands(first_viewport)
+                .is_empty()
         );
     }
 
@@ -4344,8 +4512,12 @@ mod tests {
                 repaint_count.fetch_add(1, Ordering::Relaxed);
             }
         });
+        state.bind_close_context(&ctx);
+        let viewport_id = ViewportId::from_hash_of("shown-child");
+        let token = queue_native_viewport_visibility(&ctx, viewport_id, true);
         let result = NativeViewportVisibilityResult {
-            viewport_id: ViewportId::from_hash_of("shown-child"),
+            token,
+            viewport_id,
             window_id: WindowId::from(31),
             visible: true,
             status: NativeViewportVisibilityStatus::Dispatched,
@@ -4353,8 +4525,10 @@ mod tests {
 
         state.notify_viewport_visibility_result(&ctx, result);
 
+        assert_eq!(result.token(), token);
         assert_eq!(host.visibility_results.lock().as_slice(), &[result]);
-        assert_eq!(repaint_count.load(Ordering::Relaxed), 1);
+        assert!(ctx.has_requested_repaint_for(&ViewportId::ROOT));
+        assert_eq!(repaint_count.load(Ordering::Relaxed), 2);
     }
 
     #[test]

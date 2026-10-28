@@ -863,6 +863,9 @@ impl WgpuWinitRunning<'_> {
                     native_host,
                 );
                 #[cfg(feature = "native-host-seam")]
+                let viewport_commands =
+                    native_host.with_pending_viewport_property_targets(viewport_commands);
+                #[cfg(feature = "native-host-seam")]
                 if let Some((viewport_id, cancelled)) = integration.take_viewport_close_result() {
                     native_host.finish_viewport_close_request(
                         &integration.egui_ctx,

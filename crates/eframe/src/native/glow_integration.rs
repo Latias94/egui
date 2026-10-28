@@ -877,6 +877,10 @@ impl GlowWinitRunning<'_> {
                     &self.native_host,
                 );
                 #[cfg(feature = "native-host-seam")]
+                let viewport_commands = self
+                    .native_host
+                    .with_pending_viewport_property_targets(viewport_commands);
+                #[cfg(feature = "native-host-seam")]
                 if let Some((viewport_id, cancelled)) =
                     self.integration.take_viewport_close_result()
                 {
