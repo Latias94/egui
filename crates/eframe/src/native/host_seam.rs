@@ -8,7 +8,7 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, VecDeque};
 use std::num::NonZeroU64;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError, Weak};
 
 use egui::{ViewportBuilder, ViewportId};
 #[cfg(target_os = "linux")]
@@ -18,6 +18,8 @@ use winit::event_loop::ActiveEventLoop;
 use winit::platform::x11::WindowExtX11 as _;
 use winit::window::{Window, WindowAttributes, WindowId};
 
+#[cfg(test)]
+mod close_tests;
 mod work_area;
 
 use work_area::OwnedNativeWorkAreaRoster;
@@ -92,13 +94,109 @@ impl NativeEventOrdinal {
     }
 }
 
-/// Exact native close request retained until eframe decides whether the
-/// matching viewport output cancelled it.
+/// Exact attachment-local native close request.
+///
+/// A host may hold this request before egui input translation and resolve it in
+/// a later update without inventing a second close event or cancellation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct NativeViewportCloseRequest {
+    attachment: NativeHostAttachment,
     event: NativeEventOrdinal,
     viewport_id: ViewportId,
     window_id: WindowId,
+}
+
+/// Host ownership of one immutable native event before input translation.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum NativeWindowEventDisposition {
+    /// Preserve ordinary eframe processing of this event.
+    #[default]
+    Continue,
+    /// Retain this exact close request without forwarding it as egui input.
+    ///
+    /// Only the request carried by this callback is accepted. A held request
+    /// stays held until an exact decision or physical-window retirement.
+    HoldClose(NativeViewportCloseRequest),
+}
+
+/// Final host decision for an exact held native close request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NativeViewportCloseDecision {
+    /// Permit root shutdown or release the deferred child's close gate.
+    ///
+    /// The host remains responsible for omitting/retiring an allowed child.
+    Allow,
+    /// Keep the window and report cancellation of the original exact request.
+    Veto,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NativeCloseOwnership {
+    Application,
+    Held {
+        decision: Option<NativeViewportCloseDecision>,
+    },
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PendingNativeViewportClose {
+    request: NativeViewportCloseRequest,
+    ownership: NativeCloseOwnership,
+}
+
+#[derive(Clone)]
+struct NativeCloseResolutionHandle(Weak<NativeHostStateInner>);
+
+fn close_resolution_handle_id() -> egui::Id {
+    egui::Id::unique("eframe::native_host::close_resolution_handle")
+}
+
+/// Schedules a final decision for a held request on its attached egui context.
+///
+/// Returns `false` for a foreign attachment, stale/retired request, unmanaged
+/// close, or conflicting decision. Repeating the same decision before execution
+/// is harmless. Acceptance wakes the root but is not physical-close proof.
+/// Veto reports the original request through
+/// [`NativeHostHandler::on_viewport_close_cancelled`]; a neutral hold never does.
+pub fn resolve_native_viewport_close(
+    ctx: &egui::Context,
+    request: NativeViewportCloseRequest,
+    decision: NativeViewportCloseDecision,
+) -> bool {
+    let handle =
+        ctx.data(|data| data.get_temp::<NativeCloseResolutionHandle>(close_resolution_handle_id()));
+    let Some(inner) = handle.and_then(|handle| handle.0.upgrade()) else {
+        return false;
+    };
+    if inner.attachment != request.attachment {
+        return false;
+    }
+    let accepted = {
+        let mut pending = inner
+            .pending_viewport_closes
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let Some(close) = pending.get_mut(&request.viewport_id) else {
+            return false;
+        };
+        if close.request != request {
+            return false;
+        }
+        match &mut close.ownership {
+            NativeCloseOwnership::Application => false,
+            NativeCloseOwnership::Held { decision: retained } => match *retained {
+                Some(previous) => previous == decision,
+                None => {
+                    *retained = Some(decision);
+                    true
+                }
+            },
+        }
+    };
+    if accepted {
+        ctx.request_repaint_of(ViewportId::ROOT);
+    }
+    accepted
 }
 
 impl NativeViewportCloseRequest {
@@ -731,6 +829,7 @@ pub struct NativeWindowEvent<'a> {
     window_id: WindowId,
     viewport_id: Option<ViewportId>,
     event: &'a winit::event::WindowEvent,
+    close_request: Option<NativeViewportCloseRequest>,
 }
 
 impl NativeWindowEvent<'_> {
@@ -752,6 +851,12 @@ impl NativeWindowEvent<'_> {
     /// Returns the immutable native event before egui-winit translation.
     pub const fn event(&self) -> &winit::event::WindowEvent {
         self.event
+    }
+
+    /// Returns the canonical close identity carried by this exact callback.
+    /// Repeated OS close events for one still-pending window keep this identity.
+    pub const fn close_request(&self) -> Option<NativeViewportCloseRequest> {
+        self.close_request
     }
 }
 
@@ -1001,7 +1106,15 @@ pub trait NativeHostHandler: Send + Sync + 'static {
     }
 
     /// Observes one window event before egui-winit translates it.
-    fn on_window_event(&self, _event: NativeWindowEvent<'_>) {}
+    ///
+    /// Retain the immutable event and its exact route before returning
+    /// `HoldClose(event.close_request().unwrap())`. Only that callback's close
+    /// identity can be claimed; other events always continue normally. Once
+    /// held, repeated OS close callbacks cannot release the gate by returning
+    /// `Continue`. Resolve the retained request with [`resolve_native_viewport_close`].
+    fn on_window_event(&self, _event: NativeWindowEvent<'_>) -> NativeWindowEventDisposition {
+        NativeWindowEventDisposition::Continue
+    }
 
     /// Observes one physical-device removal before eframe handles it.
     fn on_device_removed(&self, _removal: NativeDeviceRemoval) {}
@@ -1204,7 +1317,7 @@ struct NativeHostStateInner {
     next_token: AtomicU64,
     next_output: AtomicU64,
     next_create_attempt: AtomicU64,
-    pending_viewport_closes: Mutex<BTreeMap<ViewportId, NativeViewportCloseRequest>>,
+    pending_viewport_closes: Mutex<BTreeMap<ViewportId, PendingNativeViewportClose>>,
     presented_outputs: Mutex<BTreeMap<ViewportId, NativeRetentionRecord>>,
     renderer_outputs: Mutex<BTreeMap<ViewportId, NativeRetentionRecord>>,
     presentation_generations: Mutex<BTreeMap<ViewportId, u64>>,
@@ -1289,34 +1402,177 @@ impl NativeHostState {
         window_id: WindowId,
         viewport_id: Option<ViewportId>,
         event: &winit::event::WindowEvent,
-    ) {
+    ) -> NativeWindowEventDisposition {
         let Some(inner) = &self.inner else {
-            return;
+            return NativeWindowEventDisposition::Continue;
         };
-        if let Some(viewport_id) = viewport_id
-            && matches!(event, winit::event::WindowEvent::CloseRequested)
+        if matches!(event, winit::event::WindowEvent::CloseRequested)
+            && let Some(ctx) = ctx
         {
+            self.bind_close_context(ctx);
+        }
+        let close_request = if let Some(viewport_id) = viewport_id
+            && matches!(
+                event,
+                winit::event::WindowEvent::CloseRequested | winit::event::WindowEvent::Destroyed
+            ) {
             let mut pending = inner
                 .pending_viewport_closes
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
-            pending
-                .entry(viewport_id)
-                .or_insert(NativeViewportCloseRequest {
-                    event: ordinal,
-                    viewport_id,
-                    window_id,
-                });
-        }
-        inner.handler.on_window_event(NativeWindowEvent {
+            if matches!(event, winit::event::WindowEvent::Destroyed) {
+                if pending
+                    .get(&viewport_id)
+                    .is_some_and(|close| close.request.window_id == window_id)
+                {
+                    pending.remove(&viewport_id);
+                }
+                None
+            } else if matches!(event, winit::event::WindowEvent::CloseRequested) {
+                if pending
+                    .get(&viewport_id)
+                    .is_some_and(|close| close.request.window_id != window_id)
+                {
+                    pending.remove(&viewport_id);
+                }
+                Some(
+                    pending
+                        .entry(viewport_id)
+                        .or_insert_with(|| PendingNativeViewportClose {
+                            request: NativeViewportCloseRequest {
+                                attachment: inner.attachment,
+                                event: ordinal,
+                                viewport_id,
+                                window_id,
+                            },
+                            ownership: NativeCloseOwnership::Application,
+                        })
+                        .request,
+                )
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let disposition = inner.handler.on_window_event(NativeWindowEvent {
             ordinal,
             window_id,
             viewport_id,
             event,
+            close_request,
         });
         if let Some(ctx) = ctx {
             ctx.request_repaint_of(ViewportId::ROOT);
         }
+        if let Some(request) = close_request {
+            let mut pending = inner
+                .pending_viewport_closes
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if let Some(close) = pending.get_mut(&request.viewport_id)
+                && close.request == request
+            {
+                if disposition == NativeWindowEventDisposition::HoldClose(request)
+                    && close.ownership == NativeCloseOwnership::Application
+                {
+                    close.ownership = NativeCloseOwnership::Held { decision: None };
+                }
+                if matches!(close.ownership, NativeCloseOwnership::Held { .. }) {
+                    return NativeWindowEventDisposition::HoldClose(request);
+                }
+            }
+        }
+        NativeWindowEventDisposition::Continue
+    }
+
+    pub(crate) fn bind_close_context(&self, ctx: &egui::Context) {
+        if let Some(inner) = &self.inner {
+            ctx.data_mut(|data| {
+                data.insert_temp(
+                    close_resolution_handle_id(),
+                    NativeCloseResolutionHandle(Arc::downgrade(inner)),
+                )
+            });
+        }
+    }
+
+    pub(crate) fn is_close_held(&self, viewport_id: ViewportId) -> bool {
+        self.inner.as_ref().is_some_and(|inner| {
+            inner
+                .pending_viewport_closes
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .get(&viewport_id)
+                .is_some_and(|close| matches!(close.ownership, NativeCloseOwnership::Held { .. }))
+        })
+    }
+
+    pub(crate) fn prepare_close_input(&self, input: &mut egui::RawInput) {
+        for (viewport, info) in &mut input.viewports {
+            if self.is_close_held(*viewport) {
+                info.events
+                    .retain(|event| !matches!(event, egui::ViewportEvent::Close));
+            }
+        }
+    }
+
+    pub(crate) fn capture_viewport_info(
+        &self,
+        viewport: ViewportId,
+        info: &mut egui::ViewportInfo,
+    ) -> egui::ViewportInfo {
+        // Consume the renderer-owned event, not just the input clone. Another
+        // viewport may resolve this request before its own next update.
+        if self.is_close_held(viewport) {
+            info.events
+                .retain(|event| !matches!(event, egui::ViewportEvent::Close));
+        }
+        info.clone()
+    }
+
+    /// Consumes only final decisions from the existing close ledger. Child
+    /// Allow releases the host's gate; the host still owns child retirement.
+    pub(crate) fn settle_close_resolutions(&self, ctx: &egui::Context) -> bool {
+        self.bind_close_context(ctx);
+        let Some(inner) = &self.inner else {
+            return false;
+        };
+        let decided = {
+            let mut pending = inner
+                .pending_viewport_closes
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            let mut decided = Vec::new();
+            pending.retain(|_, close| {
+                if let NativeCloseOwnership::Held {
+                    decision: Some(decision),
+                } = close.ownership
+                {
+                    decided.push((close.request, decision));
+                    false
+                } else {
+                    true
+                }
+            });
+            decided
+        };
+        let mut root_allowed = false;
+        for (request, decision) in decided {
+            match decision {
+                NativeViewportCloseDecision::Allow => {
+                    root_allowed |= request.viewport_id == ViewportId::ROOT
+                }
+                NativeViewportCloseDecision::Veto => {
+                    if inner.handler.on_viewport_close_cancelled(request)
+                        == NativeHostWake::RepaintRoot
+                    {
+                        ctx.request_repaint_of(ViewportId::ROOT);
+                    }
+                }
+            }
+        }
+        root_allowed
     }
 
     pub(crate) fn observe_device_removal(
@@ -1364,16 +1620,25 @@ impl NativeHostState {
         &self,
         ctx: &egui::Context,
         viewport_id: ViewportId,
+        window_id: WindowId,
         cancelled: bool,
     ) {
         let Some(inner) = &self.inner else {
             return;
         };
-        let request = inner
-            .pending_viewport_closes
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .remove(&viewport_id);
+        let request = {
+            let mut pending = inner
+                .pending_viewport_closes
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if !pending.get(&viewport_id).is_some_and(|close| {
+                close.request.window_id == window_id
+                    && close.ownership == NativeCloseOwnership::Application
+            }) {
+                return;
+            }
+            pending.remove(&viewport_id).map(|close| close.request)
+        };
         if !cancelled {
             return;
         }
@@ -1470,6 +1735,7 @@ impl NativeHostState {
         snapshot: NativeWindowSnapshot,
         root_roster: Option<NativeViewportRoster<'_>>,
     ) -> Option<NativeOutputScope> {
+        self.bind_close_context(ctx);
         let inner = Arc::clone(self.inner.as_ref()?);
         debug_assert!(
             create_attempt.is_none_or(|attempt| {
@@ -1720,6 +1986,13 @@ impl NativeHostState {
         actions_requested: &mut Vec<egui_winit::ActionRequested>,
     ) {
         for command in commands {
+            if matches!(
+                command,
+                egui::ViewportCommand::Close | egui::ViewportCommand::CancelClose
+            ) && self.is_close_held(viewport_id)
+            {
+                continue;
+            }
             let requested_visibility = match command {
                 egui::ViewportCommand::Visible(visible) => Some(visible),
                 _ => None,
@@ -2165,6 +2438,12 @@ impl NativeHostStateInner {
     }
 
     fn forget_presented_window(&self, viewport_id: ViewportId, window_id: WindowId) {
+        self.pending_viewport_closes
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retain(|viewport, close| {
+                *viewport != viewport_id || close.request.window_id != window_id
+            });
         let mut presented_outputs = self
             .presented_outputs
             .lock()
@@ -2194,6 +2473,10 @@ impl NativeHostStateInner {
     }
 
     fn forget_presented_viewport(&self, viewport_id: ViewportId) {
+        self.pending_viewport_closes
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&viewport_id);
         self.presented_outputs
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -2404,11 +2687,13 @@ mod tests {
             *self.hidden_viewport.lock() == Some(viewport_id)
         }
 
-        fn on_window_event(&self, event: NativeWindowEvent<'_>) {
+        fn on_window_event(&self, event: NativeWindowEvent<'_>) -> NativeWindowEventDisposition {
             let facts = match event.event() {
                 winit::event::WindowEvent::MouseInput { facts, .. }
                 | winit::event::WindowEvent::MouseWheel { facts, .. } => *facts,
-                winit::event::WindowEvent::CloseRequested => return,
+                winit::event::WindowEvent::CloseRequested => {
+                    return NativeWindowEventDisposition::Continue;
+                }
                 other => panic!("expected pointer event, got {other:?}"),
             };
             self.events.lock().push((
@@ -2417,6 +2702,7 @@ mod tests {
                 event.viewport_id(),
                 facts,
             ));
+            NativeWindowEventDisposition::Continue
         }
 
         fn on_device_removed(&self, removal: NativeDeviceRemoval) {
@@ -2585,7 +2871,7 @@ mod tests {
             Some(ViewportId::ROOT),
             &WindowEvent::CloseRequested,
         );
-        state.finish_viewport_close_request(&ctx, ViewportId::ROOT, false);
+        state.finish_viewport_close_request(&ctx, ViewportId::ROOT, root_window, false);
         assert!(host.viewport_close_cancellations.lock().is_empty());
 
         state.observe_window_event(
@@ -2595,7 +2881,7 @@ mod tests {
             Some(child_viewport),
             &WindowEvent::CloseRequested,
         );
-        state.finish_viewport_close_request(&ctx, child_viewport, true);
+        state.finish_viewport_close_request(&ctx, child_viewport, child_window, true);
 
         let requests = host.viewport_close_cancellations.lock();
         assert_eq!(requests.len(), 1);

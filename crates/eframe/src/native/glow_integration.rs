@@ -8,6 +8,9 @@
 #![expect(clippy::undocumented_unsafe_blocks)]
 #![expect(clippy::unwrap_used)]
 
+#[cfg(all(test, feature = "native-host-seam"))]
+mod close_tests;
+
 use core::{cell::RefCell, num::NonZeroU32};
 use std::{rc::Rc, sync::Arc, time::Instant};
 
@@ -832,10 +835,18 @@ impl GlowWinitRunning<'_> {
             self.integration.pre_update();
 
             raw_input.time = Some(self.integration.beginning.elapsed().as_secs_f64());
+            #[cfg(feature = "native-host-seam")]
+            let native_host = glutin.native_host.clone();
             raw_input.viewports = glutin
                 .viewports
-                .iter()
-                .map(|(id, viewport)| (*id, viewport.info.clone()))
+                .iter_mut()
+                .map(|(id, viewport)| {
+                    #[cfg(feature = "native-host-seam")]
+                    let info = native_host.capture_viewport_info(*id, &mut viewport.info);
+                    #[cfg(not(feature = "native-host-seam"))]
+                    let info = viewport.info.clone();
+                    (*id, info)
+                })
                 .collect();
 
             (
@@ -859,9 +870,12 @@ impl GlowWinitRunning<'_> {
                 let egui::LogicOutput {
                     platform_output,
                     viewport_commands,
-                } = self
-                    .integration
-                    .update_logic_only(self.app.as_mut(), raw_input);
+                } = self.integration.update_logic_only(
+                    self.app.as_mut(),
+                    raw_input,
+                    #[cfg(feature = "native-host-seam")]
+                    &self.native_host,
+                );
                 #[cfg(feature = "native-host-seam")]
                 if let Some((viewport_id, cancelled)) =
                     self.integration.take_viewport_close_result()
@@ -869,6 +883,7 @@ impl GlowWinitRunning<'_> {
                     self.native_host.finish_viewport_close_request(
                         &self.integration.egui_ctx,
                         viewport_id,
+                        window_id,
                         cancelled,
                     );
                 }
@@ -1017,6 +1032,7 @@ impl GlowWinitRunning<'_> {
             self.native_host.finish_viewport_close_request(
                 &self.integration.egui_ctx,
                 viewport_id,
+                window_id,
                 cancelled,
             );
         }
@@ -1989,6 +2005,12 @@ impl GlutinWindowContext {
             let viewport = initialize_or_update_viewport(
                 &mut self.viewports,
                 &mut self.current_viewport,
+                &mut ViewportRecreateCleanup {
+                    viewport_from_window: &mut self.viewport_from_window,
+                    window_from_viewport: &mut self.window_from_viewport,
+                    #[cfg(feature = "native-host-seam")]
+                    native_host: &self.native_host,
+                },
                 ids,
                 class,
                 builder,
@@ -2037,15 +2059,40 @@ fn clear_failed_window(
     #[cfg(feature = "native-host-seam")]
     {
         viewport.native_create_attempt = None;
-        native_host.forget_presented_window(viewport_id, window_id);
     }
-    viewport_from_window.remove(&window_id);
-    window_from_viewport.remove(&viewport_id);
+    ViewportRecreateCleanup {
+        viewport_from_window,
+        window_from_viewport,
+        #[cfg(feature = "native-host-seam")]
+        native_host,
+    }
+    .forget_replaced_window(viewport_id, window_id);
+}
+
+struct ViewportRecreateCleanup<'a> {
+    viewport_from_window: &'a mut HashMap<WindowId, ViewportId>,
+    window_from_viewport: &'a mut OrderedViewportIdMap<WindowId>,
+    #[cfg(feature = "native-host-seam")]
+    native_host: &'a NativeHostState,
+}
+
+impl ViewportRecreateCleanup<'_> {
+    fn forget_replaced_window(&mut self, viewport: ViewportId, window: WindowId) {
+        if self.viewport_from_window.get(&window) == Some(&viewport) {
+            self.viewport_from_window.remove(&window);
+        }
+        if self.window_from_viewport.get(&viewport) == Some(&window) {
+            self.window_from_viewport.remove(&viewport);
+        }
+        #[cfg(feature = "native-host-seam")]
+        self.native_host.forget_presented_window(viewport, window);
+    }
 }
 
 fn initialize_or_update_viewport<'a>(
     viewports: &'a mut OrderedViewportIdMap<Viewport>,
     current_viewport: &mut Option<ViewportId>,
+    recreate_cleanup: &mut ViewportRecreateCleanup<'_>,
     ids: ViewportIdPair,
     class: ViewportClass,
     mut builder: ViewportBuilder,
@@ -2107,7 +2154,21 @@ fn initialize_or_update_viewport<'a>(
                     ids.this,
                     viewport.builder.title
                 );
-                viewport.window = None;
+                let previous_window = viewport.window.take();
+                let previous_window_id = previous_window
+                    .as_ref()
+                    .map(|window| window.id())
+                    .or_else(|| {
+                        recreate_cleanup
+                            .window_from_viewport
+                            .get(&ids.this)
+                            .copied()
+                    });
+                if let Some(window) = previous_window_id {
+                    recreate_cleanup.forget_replaced_window(ids.this, window);
+                }
+                drop(previous_window);
+                viewport.info.events.clear();
                 viewport.egui_winit = None;
                 viewport.gl_surface = None;
                 #[cfg(feature = "native-host-seam")]
@@ -2174,6 +2235,12 @@ fn render_immediate_viewport(
         initialize_or_update_viewport(
             &mut glutin.viewports,
             &mut glutin.current_viewport,
+            &mut ViewportRecreateCleanup {
+                viewport_from_window: &mut glutin.viewport_from_window,
+                window_from_viewport: &mut glutin.window_from_viewport,
+                #[cfg(feature = "native-host-seam")]
+                native_host: &glutin.native_host,
+            },
             ids,
             ViewportClass::Immediate,
             builder,
@@ -2204,10 +2271,18 @@ fn render_immediate_viewport(
         egui_winit::update_viewport_info(&mut viewport.info, egui_ctx, window, false);
 
         let mut raw_input = egui_winit.take_egui_input(window);
+        #[cfg(feature = "native-host-seam")]
+        let native_host = glutin.native_host.clone();
         raw_input.viewports = glutin
             .viewports
-            .iter()
-            .map(|(id, viewport)| (*id, viewport.info.clone()))
+            .iter_mut()
+            .map(|(id, viewport)| {
+                #[cfg(feature = "native-host-seam")]
+                let info = native_host.capture_viewport_info(*id, &mut viewport.info);
+                #[cfg(not(feature = "native-host-seam"))]
+                let info = viewport.info.clone();
+                (*id, info)
+            })
             .collect();
         raw_input.time = Some(beginning.elapsed().as_secs_f64());
         raw_input

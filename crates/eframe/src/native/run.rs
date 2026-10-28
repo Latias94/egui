@@ -458,7 +458,7 @@ impl<T: WinitApp> ApplicationHandler<UserEvent> for WinitAppWrapper<T> {
                     let native_event = if self.native_host.is_enabled() {
                         let ordinal = self.native_event_sequence.next();
                         let viewport_id = self.winit_app.viewport_id_from_window_id(window_id);
-                        self.native_host.observe_window_event(
+                        let disposition = self.native_host.observe_window_event(
                             self.winit_app.egui_ctx(),
                             ordinal,
                             window_id,
@@ -468,13 +468,27 @@ impl<T: WinitApp> ApplicationHandler<UserEvent> for WinitAppWrapper<T> {
                         Some((
                             ordinal,
                             matches!(event, winit::event::WindowEvent::Focused(_)),
+                            disposition,
                         ))
                     } else {
                         None
                     };
-                    let event_result = self.winit_app.window_event(event_loop, window_id, event);
                     #[cfg(feature = "native-host-seam")]
-                    if let Some((ordinal, true)) = native_event {
+                    let held_close = native_event.is_some_and(|(_, _, disposition)| {
+                        matches!(
+                            disposition,
+                            super::host_seam::NativeWindowEventDisposition::HoldClose(_)
+                        )
+                    });
+                    #[cfg(not(feature = "native-host-seam"))]
+                    let held_close = false;
+                    let event_result = if held_close {
+                        Ok(EventResult::RepaintNext(window_id))
+                    } else {
+                        self.winit_app.window_event(event_loop, window_id, event)
+                    };
+                    #[cfg(feature = "native-host-seam")]
+                    if let Some((ordinal, true, _)) = native_event {
                         self.native_host.observe_global_focus(
                             self.winit_app.egui_ctx(),
                             ordinal,

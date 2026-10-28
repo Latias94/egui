@@ -12,6 +12,9 @@ use egui_winit::{EventResponse, WindowSettings};
 
 use crate::epi;
 
+#[cfg(all(test, feature = "native-host-seam"))]
+mod close_tests;
+
 #[cfg_attr(target_os = "ios", allow(dead_code, unused_variables, unused_mut))]
 pub fn viewport_builder(
     egui_zoom_factor: f32,
@@ -352,7 +355,13 @@ impl EpiIntegration {
         raw_input: egui::RawInput,
         #[cfg(feature = "native-host-seam")] native_host: &super::host_seam::NativeHostState,
     ) -> egui::FullOutput {
+        #[cfg(feature = "native-host-seam")]
+        native_host.bind_close_context(&self.egui_ctx);
         let raw_input = self.prepare_raw_input(app, raw_input);
+        #[cfg(feature = "native-host-seam")]
+        let mut raw_input = raw_input;
+        #[cfg(feature = "native-host-seam")]
+        native_host.prepare_close_input(&mut raw_input);
 
         let viewport_id = raw_input.viewport_id;
         let close_requested = raw_input.viewport().close_requested();
@@ -378,7 +387,7 @@ impl EpiIntegration {
             }
         };
         #[cfg(feature = "native-host-seam")]
-        let full_output = egui_ctx.run_ui_with_pass_finalizer(
+        let mut full_output = egui_ctx.run_ui_with_pass_finalizer(
             raw_input,
             &mut run_app_ui,
             |context, ended_viewport, disposition, output| {
@@ -387,6 +396,19 @@ impl EpiIntegration {
         );
         #[cfg(not(feature = "native-host-seam"))]
         let full_output = egui_ctx.run_ui(raw_input, &mut run_app_ui);
+
+        // Held closes are resolved by the host, not ordinary viewport commands.
+        #[cfg(feature = "native-host-seam")]
+        for (id, output) in &mut full_output.viewport_output {
+            if native_host.is_close_held(*id) {
+                output.commands.retain(|command| {
+                    !matches!(
+                        command,
+                        egui::ViewportCommand::Close | egui::ViewportCommand::CancelClose
+                    )
+                });
+            }
+        }
 
         if close_requested {
             let canceled = full_output.viewport_output[&viewport_id]
@@ -399,6 +421,11 @@ impl EpiIntegration {
             {
                 self.viewport_close_result = Some((viewport_id, canceled));
             }
+        }
+
+        #[cfg(feature = "native-host-seam")]
+        if native_host.settle_close_resolutions(&egui_ctx) {
+            self.handle_close_request(false);
         }
 
         self.pending_full_output.append(full_output);
@@ -416,8 +443,15 @@ impl EpiIntegration {
         &mut self,
         app: &mut dyn epi::App,
         raw_input: egui::RawInput,
+        #[cfg(feature = "native-host-seam")] native_host: &super::host_seam::NativeHostState,
     ) -> egui::LogicOutput {
+        #[cfg(feature = "native-host-seam")]
+        native_host.bind_close_context(&self.egui_ctx);
         let raw_input = self.prepare_raw_input(app, raw_input);
+        #[cfg(feature = "native-host-seam")]
+        let mut raw_input = raw_input;
+        #[cfg(feature = "native-host-seam")]
+        native_host.prepare_close_input(&mut raw_input);
 
         let viewport_id = raw_input.viewport_id;
         let close_requested = raw_input.viewport().close_requested();
@@ -426,6 +460,20 @@ impl EpiIntegration {
             profiling::scope!("App::logic");
             app.logic(ctx, &mut self.frame);
         });
+        #[cfg(feature = "native-host-seam")]
+        let mut logic_output = logic_output;
+
+        #[cfg(feature = "native-host-seam")]
+        for (id, commands) in &mut logic_output.viewport_commands {
+            if native_host.is_close_held(*id) {
+                commands.retain(|command| {
+                    !matches!(
+                        command,
+                        egui::ViewportCommand::Close | egui::ViewportCommand::CancelClose
+                    )
+                });
+            }
+        }
 
         // No pass consumed the input, so save it for the next one:
         self.pending_raw_input = raw_input;
@@ -440,6 +488,11 @@ impl EpiIntegration {
             {
                 self.viewport_close_result = Some((viewport_id, canceled));
             }
+        }
+
+        #[cfg(feature = "native-host-seam")]
+        if native_host.settle_close_resolutions(&self.egui_ctx) {
+            self.handle_close_request(false);
         }
 
         logic_output

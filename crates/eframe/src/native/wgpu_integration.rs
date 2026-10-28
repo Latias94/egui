@@ -825,8 +825,14 @@ impl WgpuWinitRunning<'_> {
 
             raw_input.time = Some(integration.beginning.elapsed().as_secs_f64());
             raw_input.viewports = viewports
-                .iter()
-                .map(|(id, viewport)| (*id, viewport.info.clone()))
+                .iter_mut()
+                .map(|(id, viewport)| {
+                    #[cfg(feature = "native-host-seam")]
+                    let info = native_host.capture_viewport_info(*id, &mut viewport.info);
+                    #[cfg(not(feature = "native-host-seam"))]
+                    let info = viewport.info.clone();
+                    (*id, info)
+                })
                 .collect();
 
             (
@@ -850,12 +856,18 @@ impl WgpuWinitRunning<'_> {
                 let egui::LogicOutput {
                     platform_output,
                     viewport_commands,
-                } = integration.update_logic_only(app.as_mut(), raw_input);
+                } = integration.update_logic_only(
+                    app.as_mut(),
+                    raw_input,
+                    #[cfg(feature = "native-host-seam")]
+                    native_host,
+                );
                 #[cfg(feature = "native-host-seam")]
                 if let Some((viewport_id, cancelled)) = integration.take_viewport_close_result() {
                     native_host.finish_viewport_close_request(
                         &integration.egui_ctx,
                         viewport_id,
+                        window_id,
                         cancelled,
                     );
                 }
@@ -947,6 +959,7 @@ impl WgpuWinitRunning<'_> {
             native_host.finish_viewport_close_request(
                 &integration.egui_ctx,
                 viewport_id,
+                window_id,
                 cancelled,
             );
         }
@@ -1599,8 +1612,14 @@ fn render_immediate_viewport(
 
         let mut input = egui_winit.take_egui_input(window);
         input.viewports = viewports
-            .iter()
-            .map(|(id, viewport)| (*id, viewport.info.clone()))
+            .iter_mut()
+            .map(|(id, viewport)| {
+                #[cfg(feature = "native-host-seam")]
+                let info = native_host.capture_viewport_info(*id, &mut viewport.info);
+                #[cfg(not(feature = "native-host-seam"))]
+                let info = viewport.info.clone();
+                (*id, info)
+            })
             .collect();
         input.time = Some(beginning.elapsed().as_secs_f64());
         input
@@ -1840,6 +1859,7 @@ fn initialize_or_update_viewport<'a>(
                 if let Some(window) = viewport.window.take() {
                     recreate_cleanup.forget_replaced_window(viewport.ids.this, window.id());
                 }
+                viewport.info.events.clear();
                 viewport.egui_winit = None;
                 #[cfg(feature = "native-host-seam")]
                 {
