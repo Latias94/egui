@@ -45,8 +45,8 @@ use crate::epaint::textures::TexturesDelta;
 #[cfg(feature = "native-host-seam")]
 use crate::native::host_seam::{
     NativeDeferredWindowOverride, NativeDeferredWindowPreparation, NativeHostState,
-    NativeOutputRenderMode, NativeViewportCreateAttempt, NativeViewportCreateFailureKind,
-    NativeViewportRosterCapture,
+    NativeOutputRenderMode, NativeOutputStart, NativeViewportCreateAttempt,
+    NativeViewportCreateFailureKind, NativeViewportRosterCapture,
 };
 use crate::{
     App, AppCreator, CreationContext, NativeOptions, Result, Storage,
@@ -779,15 +779,7 @@ impl GlowWinitRunning<'_> {
             }
         }
 
-        let (
-            raw_input,
-            viewport_ui_cb,
-            _output_snapshot,
-            _create_attempt,
-            is_visible,
-            render_hidden,
-            show_ui,
-        ) = {
+        let (viewport_ui_cb, _output_snapshot, _create_attempt, is_visible, render_hidden, show_ui) = {
             let mut glutin = self.glutin.borrow_mut();
             let egui_ctx = glutin.egui_ctx.clone();
             let Some(viewport) = glutin.viewports.get_mut(&viewport_id) else {
@@ -821,16 +813,78 @@ impl GlowWinitRunning<'_> {
             #[cfg(not(feature = "native-host-seam"))]
             let create_attempt = ();
 
-            let Some(egui_winit) = viewport.egui_winit.as_mut() else {
+            if viewport.egui_winit.is_none() {
                 return Ok(EventResult::Wait);
-            };
-            let mut raw_input = egui_winit.take_egui_input(window);
+            }
             let viewport_ui_cb = viewport.viewport_ui_cb.clone();
 
             let show_ui = mode == PassMode::Full
                 && (is_visible
                     || render_hidden
                     || is_viewport_or_descendant_visible(&glutin.viewports, viewport_id));
+
+            (
+                viewport_ui_cb,
+                output_snapshot,
+                create_attempt,
+                is_visible,
+                render_hidden,
+                show_ui,
+            )
+        };
+
+        // Admission must precede input extraction and any UI or framebuffer updates.
+        // Keep the scope outside renderer borrows so they leave before its terminal callback.
+        #[cfg(feature = "native-host-seam")]
+        let output_scope = if show_ui {
+            let root_roster = (viewport_id == ViewportId::ROOT).then(|| {
+                let records = self
+                    .glutin
+                    .borrow()
+                    .viewports
+                    .iter()
+                    .filter_map(|(id, viewport)| {
+                        viewport.window.as_deref().map(|window| {
+                            self.native_host.capture_viewport_record(
+                                *id,
+                                &self.integration.egui_ctx,
+                                window,
+                            )
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                NativeViewportRosterCapture::capture(event_loop, records)
+            });
+            match self.native_host.begin_output(
+                &self.integration.egui_ctx,
+                viewport_id,
+                window_id,
+                _create_attempt,
+                _output_snapshot,
+                root_roster
+                    .as_ref()
+                    .map(NativeViewportRosterCapture::as_borrowed),
+            ) {
+                NativeOutputStart::Disabled => None,
+                NativeOutputStart::Deferred => return Ok(EventResult::Wait),
+                NativeOutputStart::Accepted(scope) => Some(scope),
+            }
+        } else {
+            None
+        };
+
+        let raw_input = {
+            let mut glutin = self.glutin.borrow_mut();
+            let Some(viewport) = glutin.viewports.get_mut(&viewport_id) else {
+                return Ok(EventResult::Wait);
+            };
+            let Some(window) = viewport.window.as_ref() else {
+                return Ok(EventResult::Wait);
+            };
+            let Some(egui_winit) = viewport.egui_winit.as_mut() else {
+                return Ok(EventResult::Wait);
+            };
+            let mut raw_input = egui_winit.take_egui_input(window);
 
             self.integration.pre_update();
 
@@ -848,16 +902,7 @@ impl GlowWinitRunning<'_> {
                     (*id, info)
                 })
                 .collect();
-
-            (
-                raw_input,
-                viewport_ui_cb,
-                output_snapshot,
-                create_attempt,
-                is_visible,
-                render_hidden,
-                show_ui,
-            )
+            raw_input
         };
 
         if !show_ui {
@@ -945,36 +990,6 @@ impl GlowWinitRunning<'_> {
         let has_many_viewports = self.glutin.borrow().viewports.len() > 1;
         let clear_before_update = !has_many_viewports; // HACK: for some reason, an early clear doesn't "take" on Mac with multiple viewports.
 
-        #[cfg(feature = "native-host-seam")]
-        let root_roster = (viewport_id == ViewportId::ROOT).then(|| {
-            let records = self
-                .glutin
-                .borrow()
-                .viewports
-                .iter()
-                .filter_map(|(id, viewport)| {
-                    viewport.window.as_deref().map(|window| {
-                        self.native_host.capture_viewport_record(
-                            *id,
-                            &self.integration.egui_ctx,
-                            window,
-                        )
-                    })
-                })
-                .collect::<Vec<_>>();
-            NativeViewportRosterCapture::capture(event_loop, records)
-        });
-        #[cfg(feature = "native-host-seam")]
-        let output_scope = self.native_host.begin_output(
-            &self.integration.egui_ctx,
-            viewport_id,
-            window_id,
-            _create_attempt,
-            _output_snapshot,
-            root_roster
-                .as_ref()
-                .map(NativeViewportRosterCapture::as_borrowed),
-        );
         #[cfg(feature = "native-host-seam")]
         let has_native_output_scope = output_scope.is_some();
         #[cfg(not(feature = "native-host-seam"))]

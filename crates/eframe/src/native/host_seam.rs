@@ -275,6 +275,19 @@ impl NativeOutputToken {
     }
 }
 
+/// Host admission for one candidate native viewport output.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum NativeOutputAdmission {
+    /// The host reserved storage for this output and its exact terminal result.
+    #[default]
+    Proceed,
+    /// Leave the viewport input buffered and retry after a root control pass.
+    ///
+    /// The candidate token never becomes active and receives no pass finalization
+    /// or terminal callback. The host must not retain an output obligation for it.
+    Defer,
+}
+
 /// Completion order assigned when one [`egui::FullOutput`] finishes generation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct NativeOutputOrdinal(NonZeroU64);
@@ -1283,17 +1296,21 @@ pub trait NativeHostHandler: Send + Sync + 'static {
         NativeHostWake::Wait
     }
 
-    /// Announces the output token before the viewport UI callback runs.
+    /// Admits one candidate output before consuming input or running viewport UI.
     ///
-    /// Hosts may reserve the token here and attach the affine painted output
-    /// after the core frame commits. The callback is observation-only and must
-    /// not re-enter eframe.
+    /// Return [`NativeOutputAdmission::Proceed`] only after reserving storage for
+    /// the token and its terminal result. The host may attach affine painted
+    /// output after the core frame commits. [`NativeOutputAdmission::Defer`]
+    /// leaves input buffered, produces no output callbacks for the candidate,
+    /// and schedules a root repaint after the current native event. The callback
+    /// must not re-enter eframe; retained facts must be copied before returning.
     fn on_output_begin(
         &self,
         _token: NativeOutputToken,
         _window: NativeWindowSnapshot,
         _root_roster: Option<NativeViewportRoster<'_>>,
-    ) {
+    ) -> NativeOutputAdmission {
+        NativeOutputAdmission::Proceed
     }
 
     /// Finalizes one egui pass while its exact native output token is active.
@@ -1886,9 +1903,12 @@ impl NativeHostState {
         create_attempt: Option<NativeViewportCreateAttempt>,
         snapshot: NativeWindowSnapshot,
         root_roster: Option<NativeViewportRoster<'_>>,
-    ) -> Option<NativeOutputScope> {
+    ) -> NativeOutputStart {
         self.bind_close_context(ctx);
-        let inner = Arc::clone(self.inner.as_ref()?);
+        let Some(inner) = &self.inner else {
+            return NativeOutputStart::Disabled;
+        };
+        let inner = Arc::clone(inner);
         debug_assert!(
             create_attempt.is_none_or(|attempt| {
                 attempt.context == inner.attachment.context && attempt.viewport_id == viewport_id
@@ -1902,10 +1922,15 @@ impl NativeHostState {
             window_id,
             create_attempt,
         };
+        if inner.handler.on_output_begin(token, snapshot, root_roster)
+            == NativeOutputAdmission::Defer
+        {
+            apply_host_wake(&inner, ctx, NativeHostWake::RepaintRootAfterCurrent);
+            return NativeOutputStart::Deferred;
+        }
         let frame = inner.output_frame(viewport_id, window_id, snapshot);
         let retain_eligible = inner.has_presented_output(viewport_id, frame)
             && inner.has_renderer_output(viewport_id, frame);
-        inner.handler.on_output_begin(token, snapshot, root_roster);
         ACTIVE_OUTPUTS.with(|outputs| {
             outputs.borrow_mut().push(ActiveNativeOutput {
                 token,
@@ -1913,7 +1938,7 @@ impl NativeHostState {
                 retain_eligible,
             });
         });
-        Some(NativeOutputScope {
+        NativeOutputStart::Accepted(NativeOutputScope {
             inner,
             ctx: ctx.clone(),
             token,
@@ -1972,6 +1997,7 @@ impl NativeHostState {
             },
             None,
         )
+        .accepted()
     }
 
     pub(crate) fn forget_presented_window(&self, viewport_id: ViewportId, window_id: WindowId) {
@@ -2394,6 +2420,24 @@ impl NativeDeferredWindowOverride {
         window.set_decorations(false);
         window.set_outer_position(winit::dpi::PhysicalPosition::new(rect.x, rect.y));
         let _ = window.request_inner_size(winit::dpi::PhysicalSize::new(rect.width, rect.height));
+    }
+}
+
+/// Distinguishes ordinary rendering without a host from deferred host admission.
+#[must_use]
+pub(crate) enum NativeOutputStart {
+    Disabled,
+    Deferred,
+    Accepted(NativeOutputScope),
+}
+
+#[cfg(test)]
+impl NativeOutputStart {
+    fn accepted(self) -> Option<NativeOutputScope> {
+        match self {
+            Self::Accepted(scope) => Some(scope),
+            Self::Disabled | Self::Deferred => None,
+        }
     }
 }
 
@@ -2894,6 +2938,7 @@ mod tests {
         create_attempts: Mutex<Vec<NativeViewportCreateAttempt>>,
         deferred_rect: Mutex<Option<(ViewportId, NativePhysicalRect)>>,
         deferred_viewport: Mutex<Option<ViewportId>>,
+        deferred_output: Mutex<Option<ViewportId>>,
         hidden_viewport: Mutex<Option<ViewportId>>,
         wake: NativeHostWake,
     }
@@ -2999,12 +3044,16 @@ mod tests {
             token: NativeOutputToken,
             window: NativeWindowSnapshot,
             root_roster: Option<NativeViewportRoster<'_>>,
-        ) {
+        ) -> NativeOutputAdmission {
+            if *self.deferred_output.lock() == Some(token.viewport_id()) {
+                return NativeOutputAdmission::Defer;
+            }
             self.output_begins.lock().push((
                 token,
                 window,
                 root_roster.map(RecordedNativeViewportRoster::from),
             ));
+            NativeOutputAdmission::Proceed
         }
 
         fn on_viewport_create_failed(
@@ -3612,6 +3661,152 @@ mod tests {
     }
 
     #[test]
+    fn deferred_nested_outputs_preserve_the_outer_token_and_contiguous_retry_completion() {
+        let host = Arc::new(RecordingHost::default());
+        let handler: Arc<dyn NativeHostHandler> = host.clone();
+        let state = NativeHostState::new(Some(handler));
+        let ctx = egui::Context::default();
+        let root_window = WindowId::from(11);
+        let child = ViewportId::from_hash_of("deferred-output-child");
+        let child_window = WindowId::from(22);
+        let outer = state
+            .begin_output_for_test(&ctx, ViewportId::ROOT, root_window)
+            .expect("the outer output is admitted");
+        let outer_token = current_native_output_token().unwrap();
+
+        for (viewport, window) in [(child, child_window), (ViewportId::ROOT, root_window)] {
+            *host.deferred_output.lock() = Some(viewport);
+            assert!(
+                state
+                    .begin_output_for_test(&ctx, viewport, window)
+                    .is_none()
+            );
+            assert_eq!(current_native_output_token(), Some(outer_token));
+            assert_eq!(host.output_begins.lock().len(), 1);
+            assert!(host.outputs.lock().is_empty());
+            assert_eq!(
+                state
+                    .inner
+                    .as_ref()
+                    .unwrap()
+                    .next_output
+                    .load(Ordering::Relaxed),
+                1,
+                "deferred candidates cannot consume a completion ordinal",
+            );
+            assert!(state.take_root_wake_after_current());
+            assert!(!state.take_root_wake_after_current());
+        }
+
+        *host.deferred_output.lock() = None;
+        let retried_child = state
+            .begin_output_for_test(&ctx, child, child_window)
+            .expect("the child retry is admitted");
+        let child_token = current_native_output_token().unwrap();
+        retried_child.finish().present();
+        assert_eq!(current_native_output_token(), Some(outer_token));
+        drop(outer);
+        assert_eq!(current_native_output_token(), None);
+
+        let next_root = state
+            .begin_output_for_test(&ctx, ViewportId::ROOT, root_window)
+            .expect("ordinary root output resumes");
+        let next_token = current_native_output_token().unwrap();
+        next_root.finish().present();
+
+        assert_eq!(
+            host.output_begins
+                .lock()
+                .iter()
+                .map(|(token, _, _)| *token)
+                .collect::<Vec<_>>(),
+            [outer_token, child_token, next_token],
+        );
+        assert_eq!(
+            host.outputs
+                .lock()
+                .iter()
+                .map(|result| (result.token(), result.ordinal().get(), result.status()))
+                .collect::<Vec<_>>(),
+            [
+                (child_token, 1, NativeOutputStatus::Presented),
+                (outer_token, 2, NativeOutputStatus::NotPresented),
+                (next_token, 3, NativeOutputStatus::Presented),
+            ],
+        );
+        assert_eq!(current_native_output_token(), None);
+    }
+
+    #[test]
+    fn deferred_output_preserves_the_exact_retained_frame_until_retry() {
+        let host = Arc::new(RecordingHost::default());
+        let handler: Arc<dyn NativeHostHandler> = host.clone();
+        let state = NativeHostState::new(Some(handler));
+        let ctx = egui::Context::default();
+        let window = WindowId::from(23);
+        state
+            .begin_output_for_test(&ctx, ViewportId::ROOT, window)
+            .expect("the initial output is admitted")
+            .finish()
+            .present();
+
+        *host.deferred_output.lock() = Some(ViewportId::ROOT);
+        assert!(
+            state
+                .begin_output_for_test(&ctx, ViewportId::ROOT, window)
+                .is_none()
+        );
+        assert_eq!(current_native_output_token(), None);
+        assert_eq!(host.outputs.lock().len(), 1);
+
+        *host.deferred_output.lock() = None;
+        let retry = state
+            .begin_output_for_test(&ctx, ViewportId::ROOT, window)
+            .expect("the retried output is admitted");
+        assert!(retain_current_native_output());
+        let settlement = retry.finish();
+        assert_eq!(settlement.render_mode(), NativeOutputRenderMode::Skip);
+        settlement.present();
+        let outputs = host.outputs.lock();
+        assert_eq!(outputs.len(), 2);
+        assert_eq!(outputs[1].ordinal().get(), 2);
+        assert_eq!(outputs[1].status(), NativeOutputStatus::NotPresented);
+    }
+
+    #[test]
+    fn disabled_output_host_leaves_ordinary_ui_available() {
+        let state = NativeHostState::default();
+        let ctx = egui::Context::default();
+        let start = state.begin_output(
+            &ctx,
+            ViewportId::ROOT,
+            WindowId::from(24),
+            None,
+            NativeWindowSnapshot {
+                inner_rect: None,
+                outer_rect: None,
+                native_scale_factor: 1.0,
+                presentation_scale_factor: 1.0,
+                visible: None,
+                minimized: None,
+                input_state: NativeWindowInputState::ReceivesInput,
+            },
+            None,
+        );
+        assert!(matches!(start, NativeOutputStart::Disabled));
+        assert_eq!(current_native_output_token(), None);
+        assert!(!state.take_root_wake_after_current());
+
+        let mut ran_ui = false;
+        let mut output = ctx.run_ui(egui::RawInput::default(), |_| {
+            ran_ui = true;
+            assert_eq!(current_native_output_token(), None);
+        });
+        output.textures_delta.clear();
+        assert!(ran_ui);
+    }
+
+    #[test]
     fn retained_output_requires_a_previous_exact_presentation() {
         let host = Arc::new(RecordingHost::default());
         let handler: Arc<dyn NativeHostHandler> = Arc::<RecordingHost>::clone(&host);
@@ -3738,18 +3933,21 @@ mod tests {
 
         state
             .begin_output(&ctx, viewport_id, window_id, None, initial_snapshot, None)
+            .accepted()
             .expect("the initial output scope exists")
             .finish()
             .present();
 
         let retained_same_size = state
             .begin_output(&ctx, viewport_id, window_id, None, initial_snapshot, None)
+            .accepted()
             .expect("the retained output scope exists");
         assert!(retain_current_native_output());
         retained_same_size.finish().present();
 
         let resized_output = state
             .begin_output(&ctx, viewport_id, window_id, None, resized_snapshot, None)
+            .accepted()
             .expect("the resized output scope exists");
         assert!(!retain_current_native_output());
         resized_output.finish().present();
@@ -3758,6 +3956,7 @@ mod tests {
 
         let invalidated_generation = state
             .begin_output(&ctx, viewport_id, window_id, None, resized_snapshot, None)
+            .accepted()
             .expect("the invalidated output scope exists");
         assert!(!retain_current_native_output());
         invalidated_generation.finish().present();
@@ -3788,6 +3987,7 @@ mod tests {
 
         let first_frame = state
             .begin_output(&ctx, viewport_id, window_id, None, initial_snapshot, None)
+            .accepted()
             .expect("the first output scope exists");
         assert!(!retain_current_native_output_with_overlay());
         let first_frame = first_frame.finish();
@@ -3796,18 +3996,21 @@ mod tests {
 
         let still_unavailable = state
             .begin_output(&ctx, viewport_id, window_id, None, initial_snapshot, None)
+            .accepted()
             .expect("the next no-frame output scope exists");
         assert!(!retain_current_native_output_with_overlay());
         still_unavailable.finish().present();
 
         state
             .begin_output(&ctx, viewport_id, window_id, None, initial_snapshot, None)
+            .accepted()
             .expect("the semantic output scope exists")
             .finish()
             .present();
 
         let overlay = state
             .begin_output(&ctx, viewport_id, window_id, None, initial_snapshot, None)
+            .accepted()
             .expect("the overlay output scope exists");
         assert!(retain_current_native_output_with_overlay());
         assert!(retain_current_native_output());
@@ -3817,6 +4020,7 @@ mod tests {
 
         let resized = state
             .begin_output(&ctx, viewport_id, window_id, None, resized_snapshot, None)
+            .accepted()
             .expect("the resized output scope exists");
         assert!(!retain_current_native_output_with_overlay());
         let resized = resized.finish();
@@ -3832,6 +4036,7 @@ mod tests {
                 resized_snapshot,
                 None,
             )
+            .accepted()
             .expect("the replacement-window output scope exists");
         assert!(!retain_current_native_output_with_overlay());
         let replacement = replacement.finish();
@@ -3848,6 +4053,7 @@ mod tests {
                 resized_snapshot,
                 None,
             )
+            .accepted()
             .expect("the invalidated-generation output scope exists");
         assert!(!retain_current_native_output_with_overlay());
         let invalidated = invalidated.finish();
@@ -3897,12 +4103,14 @@ mod tests {
 
         state
             .begin_output(&ctx, viewport_id, window_id, None, initial_snapshot, None)
+            .accepted()
             .expect("the semantic output scope exists")
             .finish()
             .present();
 
         let no_frame = state
             .begin_output(&ctx, viewport_id, window_id, None, resized_snapshot, None)
+            .accepted()
             .expect("the resized output scope exists");
         assert!(!retain_current_native_output_with_overlay());
         let no_frame = no_frame.finish();
@@ -3911,6 +4119,7 @@ mod tests {
 
         let restored_size = state
             .begin_output(&ctx, viewport_id, window_id, None, initial_snapshot, None)
+            .accepted()
             .expect("the restored-size output scope exists");
         assert!(
             !retain_current_native_output_with_overlay(),
@@ -3943,12 +4152,14 @@ mod tests {
 
         state
             .begin_output(&ctx, viewport_id, window_id, None, initial_snapshot, None)
+            .accepted()
             .expect("the semantic output scope exists")
             .finish()
             .present();
 
         let no_frame = state
             .begin_output(&ctx, viewport_id, window_id, None, resized_snapshot, None)
+            .accepted()
             .expect("the resized output scope exists");
         assert!(!retain_current_native_output_with_overlay());
         let no_frame = no_frame.finish();
@@ -3957,6 +4168,7 @@ mod tests {
 
         let restored_size = state
             .begin_output(&ctx, viewport_id, window_id, None, initial_snapshot, None)
+            .accepted()
             .expect("the restored-size output scope exists");
         assert!(
             retain_current_native_output_with_overlay(),
@@ -3989,12 +4201,14 @@ mod tests {
 
         state
             .begin_output(&ctx, viewport_id, window_id, None, initial_snapshot, None)
+            .accepted()
             .expect("the initial semantic output scope exists")
             .finish()
             .present();
 
         let predecessor = state
             .begin_output(&ctx, viewport_id, window_id, None, resized_snapshot, None)
+            .accepted()
             .expect("the no-frame predecessor scope exists");
         assert!(!retain_current_native_output_with_overlay());
         let predecessor = predecessor.finish();
@@ -4002,6 +4216,7 @@ mod tests {
 
         state
             .begin_output(&ctx, viewport_id, window_id, None, initial_snapshot, None)
+            .accepted()
             .expect("the semantic successor scope exists")
             .finish()
             .present();
@@ -4009,6 +4224,7 @@ mod tests {
 
         let after_late_predecessor = state
             .begin_output(&ctx, viewport_id, window_id, None, initial_snapshot, None)
+            .accepted()
             .expect("the post-settlement output scope exists");
         assert!(
             retain_current_native_output_with_overlay(),
@@ -4041,18 +4257,21 @@ mod tests {
 
         state
             .begin_output(&ctx, viewport_id, window_id, None, initial_snapshot, None)
+            .accepted()
             .expect("the initial semantic output scope exists")
             .finish()
             .present();
 
         let no_frame = state
             .begin_output(&ctx, viewport_id, window_id, None, resized_snapshot, None)
+            .accepted()
             .expect("the no-frame output scope exists");
         assert!(!retain_current_native_output_with_overlay());
         let no_frame = no_frame.finish();
 
         let overlay = state
             .begin_output(&ctx, viewport_id, window_id, None, initial_snapshot, None)
+            .accepted()
             .expect("the renderer-only successor scope exists");
         assert!(retain_current_native_output_with_overlay());
         let overlay = overlay.finish();
@@ -4062,6 +4281,7 @@ mod tests {
 
         let after_overlay = state
             .begin_output(&ctx, viewport_id, window_id, None, initial_snapshot, None)
+            .accepted()
             .expect("the output after the renderer-only successor exists");
         assert!(
             !retain_current_native_output_with_overlay(),
@@ -4175,6 +4395,7 @@ mod tests {
                     NativeWindowingBackend::Windows,
                 )),
             )
+            .accepted()
             .expect("root output scope exists");
         let token = current_native_output_token().expect("root token is active");
 
@@ -4505,6 +4726,7 @@ mod tests {
                 },
                 None,
             )
+            .accepted()
             .expect("the deferred output scope exists");
         let token = current_native_output_token().expect("the output token is active");
 

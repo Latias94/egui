@@ -29,7 +29,7 @@ use winit_integration::UserEvent;
 
 #[cfg(feature = "native-host-seam")]
 use crate::native::host_seam::{
-    NativeDeferredWindowPreparation, NativeHostState, NativeOutputRenderMode,
+    NativeDeferredWindowPreparation, NativeHostState, NativeOutputRenderMode, NativeOutputStart,
     NativeViewportCreateAttempt, NativeViewportCreateFailureKind, NativeViewportRosterCapture,
 };
 use crate::{
@@ -734,15 +734,7 @@ impl WgpuWinitRunning<'_> {
         let mut frame_timer = crate::stopwatch::Stopwatch::new();
         frame_timer.start();
 
-        let (
-            viewport_ui_cb,
-            raw_input,
-            _output_snapshot,
-            _create_attempt,
-            is_visible,
-            render_hidden,
-            show_ui,
-        ) = {
+        let (viewport_ui_cb, _output_snapshot, _create_attempt, is_visible, render_hidden, show_ui) = {
             profiling::scope!("Prepare");
             let mut shared_lock = shared.borrow_mut();
 
@@ -811,15 +803,75 @@ impl WgpuWinitRunning<'_> {
                 pollster::block_on(painter.set_window(viewport_id, Some(Arc::clone(window))))?;
             }
 
-            let Some(egui_winit) = egui_winit.as_mut() else {
+            if egui_winit.is_none() {
                 return Ok(EventResult::Wait);
-            };
-            let mut raw_input = egui_winit.take_egui_input(window);
+            }
 
             let show_ui = mode == PassMode::Full
                 && (is_visible
                     || render_hidden
                     || is_viewport_or_descendant_visible(viewports, viewport_id));
+
+            (
+                viewport_ui_cb,
+                output_snapshot,
+                create_attempt,
+                is_visible,
+                render_hidden,
+                show_ui,
+            )
+        };
+
+        // Admission must precede input extraction and any UI or framebuffer updates.
+        // Keep the scope outside renderer borrows so they leave before its terminal callback.
+        #[cfg(feature = "native-host-seam")]
+        let output_scope = if show_ui {
+            let root_roster = (viewport_id == ViewportId::ROOT).then(|| {
+                let records = shared
+                    .borrow()
+                    .viewports
+                    .iter()
+                    .filter_map(|(id, viewport)| {
+                        viewport.window.as_deref().map(|window| {
+                            native_host.capture_viewport_record(*id, &integration.egui_ctx, window)
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                NativeViewportRosterCapture::capture(event_loop, records)
+            });
+            match native_host.begin_output(
+                &integration.egui_ctx,
+                viewport_id,
+                window_id,
+                _create_attempt,
+                _output_snapshot,
+                root_roster
+                    .as_ref()
+                    .map(NativeViewportRosterCapture::as_borrowed),
+            ) {
+                NativeOutputStart::Disabled => None,
+                NativeOutputStart::Deferred => return Ok(EventResult::Wait),
+                NativeOutputStart::Accepted(scope) => Some(scope),
+            }
+        } else {
+            None
+        };
+
+        let raw_input = {
+            let mut shared_lock = shared.borrow_mut();
+            let viewports = &mut shared_lock.viewports;
+            let Some(viewport) = viewports.get_mut(&viewport_id) else {
+                return Ok(EventResult::Wait);
+            };
+            let Viewport {
+                window: Some(window),
+                egui_winit: Some(egui_winit),
+                ..
+            } = viewport
+            else {
+                return Ok(EventResult::Wait);
+            };
+            let mut raw_input = egui_winit.take_egui_input(window);
 
             integration.pre_update();
 
@@ -834,16 +886,7 @@ impl WgpuWinitRunning<'_> {
                     (*id, info)
                 })
                 .collect();
-
-            (
-                viewport_ui_cb,
-                raw_input,
-                output_snapshot,
-                create_attempt,
-                is_visible,
-                render_hidden,
-                show_ui,
-            )
+            raw_input
         };
 
         if !show_ui {
@@ -925,31 +968,6 @@ impl WgpuWinitRunning<'_> {
 
         // Runs the update, which could call immediate viewports,
         // so make sure we hold no locks here!
-        #[cfg(feature = "native-host-seam")]
-        let root_roster = (viewport_id == ViewportId::ROOT).then(|| {
-            let records = shared
-                .borrow()
-                .viewports
-                .iter()
-                .filter_map(|(id, viewport)| {
-                    viewport.window.as_deref().map(|window| {
-                        native_host.capture_viewport_record(*id, &integration.egui_ctx, window)
-                    })
-                })
-                .collect::<Vec<_>>();
-            NativeViewportRosterCapture::capture(event_loop, records)
-        });
-        #[cfg(feature = "native-host-seam")]
-        let output_scope = native_host.begin_output(
-            &integration.egui_ctx,
-            viewport_id,
-            window_id,
-            _create_attempt,
-            _output_snapshot,
-            root_roster
-                .as_ref()
-                .map(NativeViewportRosterCapture::as_borrowed),
-        );
         let full_output = integration.update(
             app.as_mut(),
             viewport_ui_cb.as_deref(),
