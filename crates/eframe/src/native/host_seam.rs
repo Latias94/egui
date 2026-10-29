@@ -1085,6 +1085,83 @@ enum NativeViewportPropertyResult {
     PointerPassthrough(NativeViewportPointerPassthroughResult),
 }
 
+/// One prepared host command whose terminal owner can be reserved before enqueueing.
+///
+/// Preparation only spends an opaque identity. Dropping this value schedules no
+/// native command or callback. Its viewport and requested value cannot change;
+/// [`Self::enqueue`] consumes it and therefore cannot enqueue it twice.
+#[must_use = "reserve the command's terminal owner, then enqueue it or drop it"]
+pub struct PreparedNativeViewportCommand<Token> {
+    token: Token,
+    viewport_id: ViewportId,
+    command: QueuedNativeViewportPropertyCommand,
+}
+
+impl<Token: Copy> PreparedNativeViewportCommand<Token> {
+    /// Returns the exact token which the eventual terminal callback will echo.
+    pub const fn token(&self) -> Token {
+        self.token
+    }
+}
+
+impl<Token> PreparedNativeViewportCommand<Token> {
+    /// Enqueues the prepared command after its host terminal owner is reserved.
+    ///
+    /// The context attachment, missing-window and retirement rules match
+    /// [`queue_native_viewport_focus`]. Without an active attachment the token
+    /// remains unused and no operation or callback is scheduled.
+    pub fn enqueue(self, ctx: &egui::Context) {
+        queue_native_viewport_property(ctx, self.viewport_id, self.command);
+    }
+}
+
+/// Prepares a focus command without enqueueing a native operation.
+pub fn prepare_native_viewport_focus(
+    viewport_id: ViewportId,
+) -> PreparedNativeViewportCommand<NativeViewportFocusCommandToken> {
+    let token = NativeViewportFocusCommandToken(next_non_zero(
+        &NEXT_FOCUS_COMMAND,
+        "native focus command identity exhausted",
+    ));
+    PreparedNativeViewportCommand {
+        token,
+        viewport_id,
+        command: QueuedNativeViewportPropertyCommand::Focus(token),
+    }
+}
+
+/// Prepares a visibility command without enqueueing a native operation.
+pub fn prepare_native_viewport_visibility(
+    viewport_id: ViewportId,
+    visible: bool,
+) -> PreparedNativeViewportCommand<NativeViewportVisibilityCommandToken> {
+    let token = NativeViewportVisibilityCommandToken(next_non_zero(
+        &NEXT_VISIBILITY_COMMAND,
+        "native visibility command identity exhausted",
+    ));
+    PreparedNativeViewportCommand {
+        token,
+        viewport_id,
+        command: QueuedNativeViewportPropertyCommand::Visibility { token, visible },
+    }
+}
+
+/// Prepares a pointer pass-through command without enqueueing a native operation.
+pub fn prepare_native_viewport_pointer_passthrough(
+    viewport_id: ViewportId,
+    enabled: bool,
+) -> PreparedNativeViewportCommand<NativeViewportPointerPassthroughCommandToken> {
+    let token = NativeViewportPointerPassthroughCommandToken(next_non_zero(
+        &NEXT_POINTER_PASSTHROUGH_COMMAND,
+        "native pointer pass-through command identity exhausted",
+    ));
+    PreparedNativeViewportCommand {
+        token,
+        viewport_id,
+        command: QueuedNativeViewportPropertyCommand::PointerPassthrough { token, enabled },
+    }
+}
+
 /// Queues one host-owned focus command for an exact viewport.
 ///
 /// Ordinary [`egui::ViewportCommand::Focus`] commands do not produce
@@ -1103,15 +1180,9 @@ pub fn queue_native_viewport_focus(
     ctx: &egui::Context,
     viewport_id: ViewportId,
 ) -> NativeViewportFocusCommandToken {
-    let token = NativeViewportFocusCommandToken(next_non_zero(
-        &NEXT_FOCUS_COMMAND,
-        "native focus command identity exhausted",
-    ));
-    queue_native_viewport_property(
-        ctx,
-        viewport_id,
-        QueuedNativeViewportPropertyCommand::Focus(token),
-    );
+    let command = prepare_native_viewport_focus(viewport_id);
+    let token = command.token();
+    command.enqueue(ctx);
     token
 }
 
@@ -1126,15 +1197,9 @@ pub fn queue_native_viewport_visibility(
     viewport_id: ViewportId,
     visible: bool,
 ) -> NativeViewportVisibilityCommandToken {
-    let token = NativeViewportVisibilityCommandToken(next_non_zero(
-        &NEXT_VISIBILITY_COMMAND,
-        "native visibility command identity exhausted",
-    ));
-    queue_native_viewport_property(
-        ctx,
-        viewport_id,
-        QueuedNativeViewportPropertyCommand::Visibility { token, visible },
-    );
+    let command = prepare_native_viewport_visibility(viewport_id, visible);
+    let token = command.token();
+    command.enqueue(ctx);
     token
 }
 
@@ -1177,15 +1242,9 @@ pub fn queue_native_viewport_pointer_passthrough(
     viewport_id: ViewportId,
     enabled: bool,
 ) -> NativeViewportPointerPassthroughCommandToken {
-    let token = NativeViewportPointerPassthroughCommandToken(next_non_zero(
-        &NEXT_POINTER_PASSTHROUGH_COMMAND,
-        "native pointer pass-through command identity exhausted",
-    ));
-    queue_native_viewport_property(
-        ctx,
-        viewport_id,
-        QueuedNativeViewportPropertyCommand::PointerPassthrough { token, enabled },
-    );
+    let command = prepare_native_viewport_pointer_passthrough(viewport_id, enabled);
+    let token = command.token();
+    command.enqueue(ctx);
     token
 }
 
@@ -4820,6 +4879,52 @@ mod tests {
             NativeViewportCreateFailureKind::WindowUnavailable
         );
         assert_eq!(repaint_count.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn prepared_property_commands_do_not_enqueue_until_the_host_has_reserved_their_tokens() {
+        let host = Arc::new(RecordingHost::default());
+        let handler: Arc<dyn NativeHostHandler> = Arc::<RecordingHost>::clone(&host);
+        let state = NativeHostState::new(Some(handler));
+        let context = egui::Context::default();
+        state.bind_close_context(&context);
+        let viewport = ViewportId::from_hash_of("prepared-property-owner");
+        let focus = prepare_native_viewport_focus(viewport);
+        let visibility = prepare_native_viewport_visibility(viewport, true);
+        let pointer = prepare_native_viewport_pointer_passthrough(viewport, false);
+        let focus_token = focus.token();
+        let visibility_token = visibility.token();
+        let pointer_token = pointer.token();
+        assert!(state.take_viewport_property_commands(viewport).is_empty());
+
+        // Rejected preparation spends only its identity, without a command or
+        // a retirement callback which would need an unreserved terminal owner.
+        let rejected = prepare_native_viewport_focus(viewport);
+        let rejected_token = rejected.token();
+        assert_ne!(rejected_token, focus_token);
+        drop(rejected);
+        assert!(state.take_viewport_property_commands(viewport).is_empty());
+
+        focus.enqueue(&context);
+        visibility.enqueue(&context);
+        pointer.enqueue(&context);
+        assert_eq!(
+            state
+                .take_viewport_property_commands(viewport)
+                .into_iter()
+                .collect::<Vec<_>>(),
+            [
+                QueuedNativeViewportPropertyCommand::Focus(focus_token),
+                QueuedNativeViewportPropertyCommand::Visibility {
+                    token: visibility_token,
+                    visible: true
+                },
+                QueuedNativeViewportPropertyCommand::PointerPassthrough {
+                    token: pointer_token,
+                    enabled: false
+                },
+            ]
+        );
     }
 
     #[test]
