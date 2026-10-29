@@ -108,7 +108,11 @@ impl ContextImpl {
         );
         viewport.repaint.causes.clear();
 
-        viewport.repaint.prev_pass_paint_delay = viewport.repaint.repaint_delay;
+        viewport.repaint.prev_pass_paint_delay = viewport
+            .repaint
+            .consumed_repaint_delay
+            .take()
+            .unwrap_or(viewport.repaint.repaint_delay);
 
         if viewport.repaint.outstanding == 0 {
             // We are repainting now, so we can wait a while for the next repaint.
@@ -395,6 +399,9 @@ struct ViewportRepaintInfo {
     /// If this was zero, we are repainting as quickly as possible
     /// (as far as we know).
     prev_pass_paint_delay: Duration,
+
+    /// Delay from the previous real pass before native wake consumption.
+    consumed_repaint_delay: Option<Duration>,
 }
 
 impl Default for ViewportRepaintInfo {
@@ -413,6 +420,7 @@ impl Default for ViewportRepaintInfo {
             prev_causes: Default::default(),
 
             prev_pass_paint_delay: Duration::MAX,
+            consumed_repaint_delay: None,
         }
     }
 }
@@ -2339,6 +2347,25 @@ impl Context {
     pub fn request_repaint_once_of(&self, id: ViewportId) {
         let cause = RepaintCause::new();
         self.write(|ctx| ctx.request_repaint_once(id, cause));
+    }
+
+    /// Acknowledges a repaint wake consumed by the integration before starting UI.
+    ///
+    /// This allows a later request to wake the same viewport when native output
+    /// admission defers without running a pass. It does not consume input,
+    /// advance pass numbers, or issue another repaint. Call before invoking
+    /// application admission callbacks so their new requests remain queued.
+    pub fn acknowledge_repaint_request(&self, id: ViewportId) {
+        self.write(|ctx| {
+            if let Some(viewport) = ctx.viewports.get_mut(&id) {
+                let previous_delay = viewport.repaint.repaint_delay;
+                viewport
+                    .repaint
+                    .consumed_repaint_delay
+                    .get_or_insert(previous_delay);
+                viewport.repaint.repaint_delay = Duration::MAX;
+            }
+        });
     }
 
     /// Request repaint after at most the specified duration elapses.
@@ -6567,6 +6594,48 @@ mod test {
             [Duration::from_secs(1), Duration::from_secs(2)],
             "The observer sees every request"
         );
+    }
+
+    #[test]
+    fn acknowledged_repaint_can_wake_again_without_a_viewport_pass() {
+        use crate::mutex::Mutex;
+        use alloc::sync::Arc;
+
+        let ctx = Context::default();
+        let child = ViewportId::from_hash_of("admission-deferred-child");
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        ctx.set_request_repaint_callback({
+            let requests = Arc::clone(&requests);
+            move |info| requests.lock().push(info)
+        });
+        ctx.request_repaint_once_of(child);
+        ctx.request_repaint_once_of(child);
+        assert_eq!(requests.lock().len(), 1);
+        let pass = ctx.cumulative_pass_nr_for(child);
+        ctx.acknowledge_repaint_request(child);
+        assert_eq!(requests.lock().len(), 1);
+        assert_eq!(ctx.cumulative_pass_nr_for(child), pass);
+        ctx.request_repaint_once_of(child);
+        let requests = requests.lock();
+        assert_eq!(requests.len(), 2);
+        assert!(
+            requests.iter().all(|request| request.viewport_id == child
+                && request.current_cumulative_pass_nr == pass)
+        );
+    }
+
+    #[test]
+    fn acknowledged_wakes_preserve_the_previous_real_pass_repaint_history() {
+        let ctx = Context::default();
+        ctx.set_fonts(FontDefinitions::empty());
+        let first = ctx.run_ui(RawInput::default(), |ui| ui.ctx().request_repaint());
+        first.drop_without_applying_deltas();
+        ctx.acknowledge_repaint_request(ViewportId::ROOT);
+        ctx.acknowledge_repaint_request(ViewportId::ROOT);
+        let second = ctx.run_ui(RawInput::default(), |ui| {
+            assert!(ui.ctx().requested_repaint_last_pass());
+        });
+        second.drop_without_applying_deltas();
     }
 
     #[test]

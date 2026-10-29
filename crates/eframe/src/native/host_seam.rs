@@ -1981,6 +1981,9 @@ impl NativeHostState {
             window_id,
             create_attempt,
         };
+        // The native dispatcher consumed this wake even if admission runs no
+        // egui pass. Re-arm before application callbacks can request a retry.
+        ctx.acknowledge_repaint_request(viewport_id);
         if inner.handler.on_output_begin(token, snapshot, root_roster)
             == NativeOutputAdmission::Defer
         {
@@ -3794,6 +3797,42 @@ mod tests {
             ],
         );
         assert_eq!(current_native_output_token(), None);
+    }
+
+    #[test]
+    fn deferred_child_rearms_a_consumed_wake_without_starting_a_pass() {
+        let host = Arc::new(RecordingHost::default());
+        let child = ViewportId::from_hash_of("deferred-child-repaint");
+        *host.deferred_output.lock() = Some(child);
+        let handler: Arc<dyn NativeHostHandler> = host.clone();
+        let state = NativeHostState::new(Some(handler));
+        let ctx = egui::Context::default();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        ctx.set_request_repaint_callback({
+            let requests = Arc::clone(&requests);
+            move |info| requests.lock().push(info.viewport_id)
+        });
+        ctx.request_repaint_once_of(child);
+        assert_eq!(*requests.lock(), [child]);
+        assert!(
+            state
+                .begin_output_for_test(&ctx, child, WindowId::from(22))
+                .is_none()
+        );
+        assert_eq!(ctx.cumulative_pass_nr_for(child), 0);
+        assert!(host.outputs.lock().is_empty());
+        assert_eq!(current_native_output_token(), None);
+        ctx.request_repaint_once_of(child);
+        assert_eq!(*requests.lock(), [child, child]);
+        assert_eq!(
+            state
+                .inner
+                .as_ref()
+                .unwrap()
+                .next_output
+                .load(Ordering::Relaxed),
+            1
+        );
     }
 
     #[test]
