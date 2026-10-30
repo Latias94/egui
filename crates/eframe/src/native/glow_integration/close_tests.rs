@@ -77,6 +77,7 @@ fn builder_recreate_retires_close_and_maps_before_deferred_admission() {
         sequence.next(),
         window,
         Some(child),
+        None,
         &winit::event::WindowEvent::CloseRequested,
     ) else {
         panic!("the close must be held");
@@ -125,6 +126,7 @@ fn builder_recreate_retires_close_and_maps_before_deferred_admission() {
         sequence.next(),
         successor,
         Some(child),
+        None,
         &winit::event::WindowEvent::CloseRequested,
     );
     ViewportRecreateCleanup {

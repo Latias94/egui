@@ -204,6 +204,7 @@ fn held_close(path: UpdatePath, target: ViewportId, decision: NativeViewportClos
         sequencer.next(),
         window,
         Some(target),
+        None,
         &WindowEvent::CloseRequested,
     );
     let NativeWindowEventDisposition::HoldClose(request) = disposition else {
@@ -370,6 +371,7 @@ fn application_owned_close_keeps_traditional_cancel_behavior() {
                     sequencer.next(),
                     WindowId::from(10),
                     Some(ViewportId::ROOT),
+                    None,
                     &WindowEvent::CloseRequested,
                 ),
                 NativeWindowEventDisposition::Continue
@@ -421,6 +423,7 @@ fn child_veto_consumes_backend_root_close_before_releasing_gate() {
             sequence.next(),
             window,
             Some(ViewportId::ROOT),
+            None,
             &WindowEvent::CloseRequested
         ),
         NativeWindowEventDisposition::Continue
@@ -433,6 +436,7 @@ fn child_veto_consumes_backend_root_close_before_releasing_gate() {
         sequence.next(),
         window,
         Some(ViewportId::ROOT),
+        None,
         &WindowEvent::CloseRequested,
     ) else {
         panic!("the repeated event must claim the same canonical request");
@@ -519,6 +523,7 @@ fn first_input_hook_can_resolve_a_close_captured_before_context_binding() {
             sequence.next(),
             WindowId::from(10),
             Some(ViewportId::ROOT),
+            None,
             &WindowEvent::CloseRequested,
         ) else {
             panic!("the first close must remain held before an egui context is available");

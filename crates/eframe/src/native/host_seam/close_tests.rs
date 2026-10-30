@@ -58,6 +58,7 @@ fn held_close(
         sequence.next(),
         window,
         Some(viewport),
+        None,
         &WindowEvent::CloseRequested,
     );
     let NativeWindowEventDisposition::HoldClose(request) = disposition else {
@@ -198,6 +199,7 @@ fn context_and_callback_hold_authority_cannot_cross_attachments() {
             second_sequence.next(),
             WindowId::from(20),
             Some(child),
+            None,
             &WindowEvent::CloseRequested
         ),
         NativeWindowEventDisposition::Continue
@@ -234,6 +236,7 @@ fn replacement_destroyed_and_detachment_revoke_only_exact_requests() {
         sequence.next(),
         old_window,
         Some(viewport),
+        None,
         &WindowEvent::Destroyed,
     );
     assert!(state.is_close_held(viewport));
@@ -254,6 +257,7 @@ fn replacement_destroyed_and_detachment_revoke_only_exact_requests() {
             sequence.next(),
             successor_window,
             Some(viewport),
+            None,
             &WindowEvent::Destroyed
         ),
         NativeWindowEventDisposition::Continue
@@ -292,6 +296,7 @@ fn held_raw_input_is_filtered_and_logic_only_context_can_schedule_a_decision() {
         sequence.next(),
         window,
         Some(ViewportId::ROOT),
+        None,
         &WindowEvent::CloseRequested,
     );
     let NativeWindowEventDisposition::HoldClose(request) = disposition else {

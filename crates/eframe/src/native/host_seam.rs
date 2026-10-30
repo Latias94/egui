@@ -549,12 +549,70 @@ impl NativePhysicalRect {
     }
 }
 
+/// Window-local geometry sampled at a native callback or output boundary.
+///
+/// Content size is expressed in physical pixels and is available independently
+/// of desktop position. The presentation scale uses egui-winit's `f32` zoom and
+/// native-scale multiplication, widened to `f64` after rounding.
+///
+/// These are current window facts, not the geometry which generated a queued
+/// input event. Hosts must compare them with the event's own geometry before
+/// interpreting event-local coordinates.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct NativeWindowLocalGeometry {
+    content_size: [u32; 2],
+    native_scale_factor: f64,
+    presentation_scale_factor: f64,
+}
+
+impl NativeWindowLocalGeometry {
+    /// Returns the physical content width and height, without a desktop origin.
+    pub const fn content_size(self) -> [u32; 2] {
+        self.content_size
+    }
+
+    /// Returns the platform-native scale sampled at this boundary.
+    pub const fn native_scale_factor(self) -> f64 {
+        self.native_scale_factor
+    }
+
+    /// Returns the egui presentation scale, including the current zoom factor.
+    pub const fn presentation_scale_factor(self) -> f64 {
+        self.presentation_scale_factor
+    }
+
+    pub(crate) fn capture(egui_ctx: &egui::Context, window: &Window) -> Self {
+        let size = window.inner_size();
+        let native_scale_factor = window.scale_factor();
+        Self::from_window_facts(
+            [size.width, size.height],
+            native_scale_factor,
+            egui_ctx.zoom_factor(),
+        )
+    }
+
+    fn from_window_facts(
+        content_size: [u32; 2],
+        native_scale_factor: f64,
+        zoom_factor: f32,
+    ) -> Self {
+        // Match egui_winit::pixels_per_point without reading the native scale again.
+        let presentation_scale_factor = f64::from(zoom_factor * native_scale_factor as f32);
+        Self {
+            content_size,
+            native_scale_factor,
+            presentation_scale_factor,
+        }
+    }
+}
+
 /// Window facts captured for the exact callback that owns an output token.
 ///
 /// Unsupported or unavailable facts remain [`None`]. In particular, this
 /// snapshot does not infer desktop geometry from cached viewport information.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct NativeWindowSnapshot {
+    content_size: [u32; 2],
     inner_rect: Option<NativePhysicalRect>,
     outer_rect: Option<NativePhysicalRect>,
     native_scale_factor: f64,
@@ -729,6 +787,12 @@ fn native_windowing_backend(_event_loop: &ActiveEventLoop) -> NativeWindowingBac
 }
 
 impl NativeWindowSnapshot {
+    /// Returns the physical content width and height, even when the platform
+    /// cannot report the content's desktop position.
+    pub const fn content_size(self) -> [u32; 2] {
+        self.content_size
+    }
+
     /// Returns the current physical content rectangle, when the platform can
     /// report its desktop position.
     pub const fn inner_rect(self) -> Option<NativePhysicalRect> {
@@ -776,10 +840,8 @@ impl NativeWindowSnapshot {
         window: &Window,
         input_state: NativeWindowInputState,
     ) -> Self {
-        let inner_rect = window
-            .inner_position()
-            .ok()
-            .map(|position| physical_rect(position, window.inner_size()));
+        let local_geometry = NativeWindowLocalGeometry::capture(egui_ctx, window);
+        let inner_position = window.inner_position().ok();
 
         #[cfg(any(target_os = "windows", target_os = "macos"))]
         let outer_rect = window
@@ -802,11 +864,33 @@ impl NativeWindowSnapshot {
 
         let visible = window.is_visible();
 
+        Self::from_captured_geometry(
+            local_geometry,
+            inner_position,
+            outer_rect,
+            visible,
+            minimized,
+            input_state,
+        )
+    }
+
+    fn from_captured_geometry(
+        local_geometry: NativeWindowLocalGeometry,
+        inner_position: Option<winit::dpi::PhysicalPosition<i32>>,
+        outer_rect: Option<NativePhysicalRect>,
+        visible: Option<bool>,
+        minimized: Option<bool>,
+        input_state: NativeWindowInputState,
+    ) -> Self {
+        let [width, height] = local_geometry.content_size();
+        let inner_rect = inner_position
+            .map(|position| physical_rect(position, winit::dpi::PhysicalSize::new(width, height)));
         Self {
+            content_size: [width, height],
             inner_rect,
             outer_rect,
-            native_scale_factor: window.scale_factor(),
-            presentation_scale_factor: f64::from(egui_winit::pixels_per_point(egui_ctx, window)),
+            native_scale_factor: local_geometry.native_scale_factor(),
+            presentation_scale_factor: local_geometry.presentation_scale_factor(),
             visible,
             minimized,
             input_state,
@@ -857,6 +941,7 @@ pub struct NativeWindowEvent<'a> {
     ordinal: NativeEventOrdinal,
     window_id: WindowId,
     viewport_id: Option<ViewportId>,
+    local_geometry: Option<NativeWindowLocalGeometry>,
     event: &'a winit::event::WindowEvent,
     close_request: Option<NativeViewportCloseRequest>,
 }
@@ -875,6 +960,14 @@ impl NativeWindowEvent<'_> {
     /// Returns the eframe viewport receiving the callback, when it belongs to eframe.
     pub const fn viewport_id(&self) -> Option<ViewportId> {
         self.viewport_id
+    }
+
+    /// Returns window-local geometry sampled before this callback, when both
+    /// the exact live window and egui context are available.
+    ///
+    /// This does not describe the geometry which generated a queued event.
+    pub const fn local_geometry(&self) -> Option<NativeWindowLocalGeometry> {
+        self.local_geometry
     }
 
     /// Returns the immutable native event before egui-winit translation.
@@ -1629,6 +1722,7 @@ impl NativeHostState {
         ordinal: NativeEventOrdinal,
         window_id: WindowId,
         viewport_id: Option<ViewportId>,
+        local_geometry: Option<NativeWindowLocalGeometry>,
         event: &winit::event::WindowEvent,
     ) -> NativeWindowEventDisposition {
         let Some(inner) = &self.inner else {
@@ -1687,6 +1781,7 @@ impl NativeHostState {
             ordinal,
             window_id,
             viewport_id,
+            local_geometry,
             event,
             close_request,
         });
@@ -2049,6 +2144,7 @@ impl NativeHostState {
             window_id,
             None,
             NativeWindowSnapshot {
+                content_size: [0, 0],
                 inner_rect: None,
                 outer_rect: None,
                 native_scale_factor: 1.0,
@@ -2668,11 +2764,10 @@ impl NativeHostStateInner {
         window_id: WindowId,
         snapshot: NativeWindowSnapshot,
     ) -> PresentedNativeOutputFrame {
+        let [width, height] = snapshot.content_size();
         PresentedNativeOutputFrame {
             window_id,
-            inner_size: snapshot
-                .inner_rect()
-                .map(|rect| (rect.width(), rect.height())),
+            inner_size: Some((width, height)),
             generation: self.current_presentation_generation(viewport_id),
         }
     }
@@ -2980,6 +3075,7 @@ mod tests {
                 WindowId,
                 Option<ViewportId>,
                 winit::event::PointerEventFacts,
+                Option<NativeWindowLocalGeometry>,
             )>,
         >,
         device_removals: Mutex<Vec<u64>>,
@@ -3068,6 +3164,7 @@ mod tests {
                 event.window_id(),
                 event.viewport_id(),
                 facts,
+                event.local_geometry(),
             ));
             NativeWindowEventDisposition::Continue
         }
@@ -3141,6 +3238,103 @@ mod tests {
     }
 
     #[test]
+    fn local_geometry_preserves_native_precision_and_egui_scale_rounding() {
+        for (native_scale, zoom) in [(1.2, 1.1_f32), (1.000_000_000_1, 0.9), (2.0, 1.25)] {
+            let geometry =
+                NativeWindowLocalGeometry::from_window_facts([801, 603], native_scale, zoom);
+            assert_eq!(geometry.content_size(), [801, 603]);
+            assert_eq!(geometry.native_scale_factor(), native_scale);
+            assert_eq!(
+                geometry.presentation_scale_factor(),
+                f64::from(zoom * native_scale as f32)
+            );
+        }
+        let geometry = NativeWindowLocalGeometry::from_window_facts([800, 600], 1.2, 1.1);
+        assert_ne!(
+            geometry.presentation_scale_factor(),
+            f64::from(1.1_f32) * 1.2,
+            "presentation scale must round as f32 before widening"
+        );
+    }
+
+    #[test]
+    fn snapshot_keeps_content_size_without_inventing_desktop_position() {
+        let geometry = NativeWindowLocalGeometry::from_window_facts([801, 603], 1.2, 1.1);
+        let snapshot = NativeWindowSnapshot::from_captured_geometry(
+            geometry,
+            None,
+            None,
+            Some(true),
+            None,
+            NativeWindowInputState::ReceivesInput,
+        );
+        assert_eq!(snapshot.content_size(), [801, 603]);
+        assert_eq!(snapshot.inner_rect(), None);
+        assert_eq!(snapshot.outer_rect(), None);
+        assert_eq!(
+            snapshot.native_scale_factor(),
+            geometry.native_scale_factor()
+        );
+        assert_eq!(
+            snapshot.presentation_scale_factor(),
+            geometry.presentation_scale_factor()
+        );
+
+        let positioned = NativeWindowSnapshot::from_captured_geometry(
+            geometry,
+            Some(winit::dpi::PhysicalPosition::new(-120, 45)),
+            None,
+            Some(true),
+            None,
+            NativeWindowInputState::ReceivesInput,
+        );
+        assert_eq!(positioned.content_size(), [801, 603]);
+        assert_eq!(
+            positioned.inner_rect(),
+            Some(NativePhysicalRect::new(-120, 45, 801, 603))
+        );
+    }
+
+    #[test]
+    fn callback_preserves_optional_local_geometry_separately_from_event_facts() {
+        use winit::event::{DeviceId, ElementState, MouseButton, PointerEventFacts, WindowEvent};
+
+        let host = Arc::new(RecordingHost::default());
+        let handler: Arc<dyn NativeHostHandler> = host.clone();
+        let state = NativeHostState::new(Some(handler));
+        let mut sequence = NativeEventSequencer::default();
+        let window = WindowId::from(29);
+        let facts = PointerEventFacts {
+            surface_position: Some(winit::dpi::PhysicalPosition::new(11.0, 12.0)),
+            ..PointerEventFacts::default()
+        };
+        let event = WindowEvent::MouseInput {
+            device_id: DeviceId::dummy(),
+            state: ElementState::Released,
+            button: MouseButton::Left,
+            facts,
+        };
+        let geometry = NativeWindowLocalGeometry::from_window_facts([801, 603], 1.2, 1.1);
+        for local_geometry in [Some(geometry), None] {
+            state.observe_window_event(
+                None,
+                sequence.next(),
+                window,
+                Some(ViewportId::ROOT),
+                local_geometry,
+                &event,
+            );
+        }
+        assert_eq!(
+            *host.events.lock(),
+            vec![
+                (1, window, Some(ViewportId::ROOT), facts, Some(geometry)),
+                (2, window, Some(ViewportId::ROOT), facts, None),
+            ]
+        );
+    }
+
+    #[test]
     fn device_removal_callback_preserves_global_native_event_order() {
         use winit::event::{DeviceId, ElementState, MouseButton, PointerEventFacts};
 
@@ -3168,6 +3362,7 @@ mod tests {
             sequencer.next(),
             window,
             Some(ViewportId::ROOT),
+            None,
             &press,
         );
         state.observe_device_removal(None, sequencer.next());
@@ -3176,6 +3371,7 @@ mod tests {
             sequencer.next(),
             window,
             Some(ViewportId::ROOT),
+            None,
             &release,
         );
 
@@ -3240,6 +3436,7 @@ mod tests {
             sequencer.next(),
             root_window,
             Some(ViewportId::ROOT),
+            None,
             &WindowEvent::CloseRequested,
         );
         state.finish_viewport_close_request(&ctx, ViewportId::ROOT, root_window, false);
@@ -3250,6 +3447,7 @@ mod tests {
             sequencer.next(),
             child_window,
             Some(child_viewport),
+            None,
             &WindowEvent::CloseRequested,
         );
         state.finish_viewport_close_request(&ctx, child_viewport, child_window, true);
@@ -3532,7 +3730,7 @@ mod tests {
             button: MouseButton::Left,
             facts: first_facts,
         };
-        state.observe_window_event(None, sequencer.next(), first_window, None, &release);
+        state.observe_window_event(None, sequencer.next(), first_window, None, None, &release);
 
         let press = WindowEvent::MouseInput {
             device_id: DeviceId::dummy(),
@@ -3545,14 +3743,15 @@ mod tests {
             sequencer.next(),
             second_window,
             Some(second_viewport),
+            None,
             &press,
         );
 
         assert_eq!(
             *host.events.lock(),
             vec![
-                (1, first_window, None, first_facts),
-                (2, second_window, Some(second_viewport), second_facts),
+                (1, first_window, None, first_facts, None),
+                (2, second_window, Some(second_viewport), second_facts, None),
             ]
         );
     }
@@ -3589,13 +3788,14 @@ mod tests {
             sequencer.next(),
             child_window,
             Some(child_viewport),
+            None,
             &event,
         );
 
         assert_eq!(repaint_count.load(Ordering::Relaxed), 1);
         assert_eq!(
             *host.events.lock(),
-            vec![(1, child_window, Some(child_viewport), facts)]
+            vec![(1, child_window, Some(child_viewport), facts, None)]
         );
     }
 
@@ -3621,6 +3821,7 @@ mod tests {
             modifiers: Some(ModifiersState::CONTROL),
             hover: PointerWindowRoute::Window(second_window),
             capture: PointerWindowRoute::Window(first_window),
+            ..PointerEventFacts::default()
         };
         let second_facts = PointerEventFacts {
             surface_position: Some(PhysicalPosition::new(6.0, 7.0)),
@@ -3628,6 +3829,7 @@ mod tests {
             modifiers: None,
             hover: PointerWindowRoute::Foreign,
             capture: PointerWindowRoute::Unknown,
+            ..PointerEventFacts::default()
         };
 
         let first = WindowEvent::MouseWheel {
@@ -3636,7 +3838,7 @@ mod tests {
             phase: TouchPhase::Moved,
             facts: first_facts,
         };
-        state.observe_window_event(None, sequencer.next(), first_window, None, &first);
+        state.observe_window_event(None, sequencer.next(), first_window, None, None, &first);
 
         let second = WindowEvent::MouseWheel {
             device_id: DeviceId::dummy(),
@@ -3649,14 +3851,15 @@ mod tests {
             sequencer.next(),
             second_window,
             Some(second_viewport),
+            None,
             &second,
         );
 
         assert_eq!(
             *host.events.lock(),
             vec![
-                (1, first_window, None, first_facts),
-                (2, second_window, Some(second_viewport), second_facts),
+                (1, first_window, None, first_facts, None),
+                (2, second_window, Some(second_viewport), second_facts, None),
             ]
         );
     }
@@ -3881,6 +4084,7 @@ mod tests {
             WindowId::from(24),
             None,
             NativeWindowSnapshot {
+                content_size: [0, 0],
                 inner_rect: None,
                 outer_rect: None,
                 native_scale_factor: 1.0,
@@ -4016,6 +4220,7 @@ mod tests {
         let viewport_id = ViewportId::ROOT;
         let window_id = WindowId::from(77);
         let initial_snapshot = NativeWindowSnapshot {
+            content_size: [800, 600],
             inner_rect: Some(NativePhysicalRect::new(0, 0, 800, 600)),
             outer_rect: None,
             native_scale_factor: 1.0,
@@ -4025,6 +4230,7 @@ mod tests {
             input_state: NativeWindowInputState::ReceivesInput,
         };
         let resized_snapshot = NativeWindowSnapshot {
+            content_size: [801, 600],
             inner_rect: Some(NativePhysicalRect::new(0, 0, 801, 600)),
             ..initial_snapshot
         };
@@ -4061,6 +4267,49 @@ mod tests {
     }
 
     #[test]
+    fn retained_output_checks_content_size_without_desktop_position() {
+        let host = Arc::new(RecordingHost::default());
+        let handler: Arc<dyn NativeHostHandler> = host;
+        let state = NativeHostState::new(Some(handler));
+        let ctx = egui::Context::default();
+        let viewport_id = ViewportId::ROOT;
+        let window_id = WindowId::from(78);
+        let initial_snapshot = NativeWindowSnapshot::from_captured_geometry(
+            NativeWindowLocalGeometry::from_window_facts([800, 600], 1.0, 1.0),
+            None,
+            None,
+            Some(true),
+            None,
+            NativeWindowInputState::ReceivesInput,
+        );
+        state
+            .begin_output(&ctx, viewport_id, window_id, None, initial_snapshot, None)
+            .accepted()
+            .expect("the size-only initial output scope exists")
+            .finish()
+            .present();
+
+        let unchanged = state
+            .begin_output(&ctx, viewport_id, window_id, None, initial_snapshot, None)
+            .accepted()
+            .expect("the unchanged size-only output scope exists");
+        assert!(retain_current_native_output());
+        drop(unchanged);
+
+        let resized_snapshot = NativeWindowSnapshot {
+            content_size: [801, 600],
+            ..initial_snapshot
+        };
+        let resized = state
+            .begin_output(&ctx, viewport_id, window_id, None, resized_snapshot, None)
+            .accepted()
+            .expect("the resized size-only output scope exists");
+        assert!(!retain_current_native_output());
+        assert!(!retain_current_native_output_with_overlay());
+        drop(resized);
+    }
+
+    #[test]
     fn retained_overlay_requires_an_exact_renderer_presentation() {
         let host = Arc::new(RecordingHost::default());
         let handler: Arc<dyn NativeHostHandler> = Arc::<RecordingHost>::clone(&host);
@@ -4070,6 +4319,7 @@ mod tests {
         let window_id = WindowId::from(81);
         let replacement_window_id = WindowId::from(82);
         let initial_snapshot = NativeWindowSnapshot {
+            content_size: [800, 600],
             inner_rect: Some(NativePhysicalRect::new(0, 0, 800, 600)),
             outer_rect: None,
             native_scale_factor: 1.0,
@@ -4079,6 +4329,7 @@ mod tests {
             input_state: NativeWindowInputState::ReceivesInput,
         };
         let resized_snapshot = NativeWindowSnapshot {
+            content_size: [801, 600],
             inner_rect: Some(NativePhysicalRect::new(0, 0, 801, 600)),
             ..initial_snapshot
         };
@@ -4186,6 +4437,7 @@ mod tests {
         let viewport_id = ViewportId::ROOT;
         let window_id = WindowId::from(86);
         let initial_snapshot = NativeWindowSnapshot {
+            content_size: [800, 600],
             inner_rect: Some(NativePhysicalRect::new(0, 0, 800, 600)),
             outer_rect: None,
             native_scale_factor: 1.0,
@@ -4195,6 +4447,7 @@ mod tests {
             input_state: NativeWindowInputState::ReceivesInput,
         };
         let resized_snapshot = NativeWindowSnapshot {
+            content_size: [801, 600],
             inner_rect: Some(NativePhysicalRect::new(0, 0, 801, 600)),
             ..initial_snapshot
         };
@@ -4235,6 +4488,7 @@ mod tests {
         let viewport_id = ViewportId::ROOT;
         let window_id = WindowId::from(88);
         let initial_snapshot = NativeWindowSnapshot {
+            content_size: [800, 600],
             inner_rect: Some(NativePhysicalRect::new(0, 0, 800, 600)),
             outer_rect: None,
             native_scale_factor: 1.0,
@@ -4244,6 +4498,7 @@ mod tests {
             input_state: NativeWindowInputState::ReceivesInput,
         };
         let resized_snapshot = NativeWindowSnapshot {
+            content_size: [801, 600],
             inner_rect: Some(NativePhysicalRect::new(0, 0, 801, 600)),
             ..initial_snapshot
         };
@@ -4284,6 +4539,7 @@ mod tests {
         let viewport_id = ViewportId::ROOT;
         let window_id = WindowId::from(87);
         let initial_snapshot = NativeWindowSnapshot {
+            content_size: [800, 600],
             inner_rect: Some(NativePhysicalRect::new(0, 0, 800, 600)),
             outer_rect: None,
             native_scale_factor: 1.0,
@@ -4293,6 +4549,7 @@ mod tests {
             input_state: NativeWindowInputState::ReceivesInput,
         };
         let resized_snapshot = NativeWindowSnapshot {
+            content_size: [801, 600],
             inner_rect: Some(NativePhysicalRect::new(0, 0, 801, 600)),
             ..initial_snapshot
         };
@@ -4340,6 +4597,7 @@ mod tests {
         let viewport_id = ViewportId::ROOT;
         let window_id = WindowId::from(89);
         let initial_snapshot = NativeWindowSnapshot {
+            content_size: [800, 600],
             inner_rect: Some(NativePhysicalRect::new(0, 0, 800, 600)),
             outer_rect: None,
             native_scale_factor: 1.0,
@@ -4349,6 +4607,7 @@ mod tests {
             input_state: NativeWindowInputState::ReceivesInput,
         };
         let resized_snapshot = NativeWindowSnapshot {
+            content_size: [801, 600],
             inner_rect: Some(NativePhysicalRect::new(0, 0, 801, 600)),
             ..initial_snapshot
         };
@@ -4444,6 +4703,7 @@ mod tests {
         let child_window = WindowId::from(22);
         let child_viewport = ViewportId::from_hash_of("child-roster");
         let root_snapshot = NativeWindowSnapshot {
+            content_size: [800, 600],
             inner_rect: Some(NativePhysicalRect::new(10, 20, 800, 600)),
             outer_rect: Some(NativePhysicalRect::new(2, -10, 816, 638)),
             native_scale_factor: 2.0,
@@ -4453,6 +4713,7 @@ mod tests {
             input_state: NativeWindowInputState::ReceivesInput,
         };
         let child_snapshot = NativeWindowSnapshot {
+            content_size: [640, 480],
             inner_rect: Some(NativePhysicalRect::new(900, 20, 640, 480)),
             outer_rect: None,
             native_scale_factor: 1.5,
@@ -4814,6 +5075,7 @@ mod tests {
                 window_id,
                 Some(create_attempt),
                 NativeWindowSnapshot {
+                    content_size: [0, 0],
                     inner_rect: None,
                     outer_rect: None,
                     native_scale_factor: 1.0,

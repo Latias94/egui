@@ -11,7 +11,7 @@ use ahash::HashMap;
 
 use super::winit_integration::{UserEvent, WinitApp};
 #[cfg(feature = "native-host-seam")]
-use crate::native::host_seam::{NativeEventSequencer, NativeHostState};
+use crate::native::host_seam::{NativeEventSequencer, NativeHostState, NativeWindowLocalGeometry};
 use crate::{
     Result, epi,
     native::{
@@ -458,11 +458,18 @@ impl<T: WinitApp> ApplicationHandler<UserEvent> for WinitAppWrapper<T> {
                     let native_event = if self.native_host.is_enabled() {
                         let ordinal = self.native_event_sequence.next();
                         let viewport_id = self.winit_app.viewport_id_from_window_id(window_id);
+                        let ctx = self.winit_app.egui_ctx();
+                        let local_geometry = ctx.and_then(|ctx| {
+                            self.winit_app
+                                .window(window_id)
+                                .map(|window| NativeWindowLocalGeometry::capture(ctx, &window))
+                        });
                         let disposition = self.native_host.observe_window_event(
-                            self.winit_app.egui_ctx(),
+                            ctx,
                             ordinal,
                             window_id,
                             viewport_id,
+                            local_geometry,
                             &event,
                         );
                         Some((
