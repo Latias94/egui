@@ -1,6 +1,6 @@
 use super::*;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 enum Trace {
     Ordinary(egui::ViewportCommand),
     Applied(QueuedNativeViewportPropertyCommand),
@@ -44,6 +44,16 @@ impl NativeHostHandler for PropertyHost {
     ) -> NativeHostWake {
         self.trace.lock().push(Trace::Callback(
             NativeViewportPropertyResult::PointerPassthrough(result),
+        ));
+        NativeHostWake::Wait
+    }
+
+    fn on_viewport_pointer_observation(
+        &self,
+        result: NativeViewportPointerObservationResult,
+    ) -> NativeHostWake {
+        self.trace.lock().push(Trace::Callback(
+            NativeViewportPropertyResult::PointerObservation(result),
         ));
         NativeHostWake::Wait
     }
@@ -112,6 +122,20 @@ fn apply_stub(
                 },
             )
         }
+        QueuedNativeViewportPropertyCommand::PointerObservation {
+            token,
+            expected_window_id,
+            device_id,
+        } => NativeViewportPropertyResult::PointerObservation(
+            NativeViewportPointerObservationResult::observe_with(
+                token,
+                viewport_id,
+                expected_window_id,
+                device_id,
+                window_id,
+                |expected, device| observe_native_pointer(None, expected, device),
+            ),
+        ),
     }
 }
 

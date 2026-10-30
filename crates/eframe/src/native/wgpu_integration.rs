@@ -944,6 +944,8 @@ impl WgpuWinitRunning<'_> {
                             commands,
                             #[cfg(feature = "native-host-seam")]
                             native_host,
+                            #[cfg(feature = "native-host-seam")]
+                            Some(event_loop),
                         );
                     }
                 }
@@ -1172,6 +1174,8 @@ impl WgpuWinitRunning<'_> {
             viewport_from_window,
             #[cfg(feature = "native-host-seam")]
             native_host,
+            #[cfg(feature = "native-host-seam")]
+            Some(event_loop),
         );
 
         // Prune dead viewports:
@@ -1391,6 +1395,7 @@ impl Viewport {
         egui_ctx: &egui::Context,
         mut commands: Vec<egui::ViewportCommand>,
         #[cfg(feature = "native-host-seam")] native_host: &NativeHostState,
+        #[cfg(feature = "native-host-seam")] event_loop: Option<&ActiveEventLoop>,
     ) {
         self.deferred_commands.append(&mut commands);
 
@@ -1403,6 +1408,7 @@ impl Viewport {
                 std::mem::take(&mut self.deferred_commands),
                 window,
                 &mut self.actions_requested,
+                event_loop,
             );
             #[cfg(not(feature = "native-host-seam"))]
             egui_winit::process_viewport_commands(
@@ -1717,6 +1723,8 @@ fn render_immediate_viewport(
         viewport_from_window,
         #[cfg(feature = "native-host-seam")]
         native_host,
+        #[cfg(feature = "native-host-seam")]
+        None,
     );
 }
 
@@ -1753,6 +1761,7 @@ fn handle_viewport_output(
     painter: &mut egui_wgpu::winit::Painter,
     viewport_from_window: &mut HashMap<WindowId, ViewportId>,
     #[cfg(feature = "native-host-seam")] native_host: &NativeHostState,
+    #[cfg(feature = "native-host-seam")] event_loop: Option<&ActiveEventLoop>,
 ) {
     for (
         viewport_id,
@@ -1790,6 +1799,8 @@ fn handle_viewport_output(
             commands,
             #[cfg(feature = "native-host-seam")]
             native_host,
+            #[cfg(feature = "native-host-seam")]
+            event_loop,
         );
 
         // For Wayland : https://github.com/emilk/egui/issues/4196

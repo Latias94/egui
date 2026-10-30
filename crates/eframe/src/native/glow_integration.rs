@@ -203,6 +203,7 @@ impl Viewport {
         egui_ctx: &egui::Context,
         mut commands: Vec<egui::ViewportCommand>,
         #[cfg(feature = "native-host-seam")] native_host: &NativeHostState,
+        #[cfg(feature = "native-host-seam")] event_loop: Option<&ActiveEventLoop>,
     ) {
         self.deferred_commands.append(&mut commands);
 
@@ -215,6 +216,7 @@ impl Viewport {
                 std::mem::take(&mut self.deferred_commands),
                 window,
                 &mut self.actions_requested,
+                event_loop,
             );
             #[cfg(not(feature = "native-host-seam"))]
             egui_winit::process_viewport_commands(
@@ -957,6 +959,8 @@ impl GlowWinitRunning<'_> {
                             commands,
                             #[cfg(feature = "native-host-seam")]
                             &self.native_host,
+                            #[cfg(feature = "native-host-seam")]
+                            Some(event_loop),
                         );
                     }
                 }
@@ -2043,6 +2047,8 @@ impl GlutinWindowContext {
                 commands,
                 #[cfg(feature = "native-host-seam")]
                 &self.native_host,
+                #[cfg(feature = "native-host-seam")]
+                Some(event_loop),
             );
 
             // For Wayland : https://github.com/emilk/egui/issues/4196

@@ -13,9 +13,10 @@ use std::sync::{Arc, Mutex, PoisonError, Weak};
 use egui::{ViewportBuilder, ViewportId};
 #[cfg(target_os = "linux")]
 use raw_window_handle::{HasDisplayHandle as _, HasWindowHandle as _};
+use winit::event::{DeviceId, PointerEventFacts, PointerWindowRoute};
 use winit::event_loop::ActiveEventLoop;
 #[cfg(all(target_os = "linux", feature = "x11"))]
-use winit::platform::x11::WindowExtX11 as _;
+use winit::platform::x11::{ActiveEventLoopExtX11 as _, WindowExtX11 as _, X11PointerObservation};
 use winit::window::{Window, WindowAttributes, WindowId};
 
 #[cfg(test)]
@@ -31,6 +32,7 @@ static NEXT_CONTEXT_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_FOCUS_COMMAND: AtomicU64 = AtomicU64::new(1);
 static NEXT_VISIBILITY_COMMAND: AtomicU64 = AtomicU64::new(1);
 static NEXT_POINTER_PASSTHROUGH_COMMAND: AtomicU64 = AtomicU64::new(1);
+static NEXT_POINTER_OBSERVATION_COMMAND: AtomicU64 = AtomicU64::new(1);
 
 thread_local! {
     static ACTIVE_OUTPUTS: RefCell<Vec<ActiveNativeOutput>> = const { RefCell::new(Vec::new()) };
@@ -1119,6 +1121,102 @@ impl NativeViewportPointerPassthroughResult {
     }
 }
 
+/// A synchronous native pointer observation, without generating a window input event.
+///
+/// Observed facts belong to one backend observation. Eframe never fills missing facts from
+/// cached input or later window queries. `Observed` does not imply complete capture facts,
+/// continuity of an earlier press, or support for stationary pointer continuation. The current
+/// X11 backend reports capture and delivery as [`PointerWindowRoute::Unknown`], even when it can
+/// query the requested device's position and hover. Eframe forwards those unknown routes unchanged.
+/// This does not grant application pointer ownership or acknowledge a continuation token; the
+/// host must process the result through its ordered ingress.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum NativeViewportPointerObservation {
+    /// The backend returned facts and a delivery classification from the same observation.
+    ///
+    /// Individual facts can be missing and routes can remain unknown.
+    Observed {
+        /// The immutable facts returned by the backend.
+        facts: PointerEventFacts,
+        /// The delivery classification from that same observation, possibly unknown.
+        ///
+        /// This is independent of hover, capture and the requested window identity.
+        delivery: PointerWindowRoute,
+    },
+    /// No eligible observation was available at execution time.
+    ///
+    /// This includes a mismatched native window or an execution path without an active event loop.
+    Unavailable,
+    /// The active native backend does not support this observation.
+    Unsupported,
+}
+
+/// Opaque identity for one host-owned viewport pointer observation command.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct NativeViewportPointerObservationCommandToken(NonZeroU64);
+
+/// The correlated terminal result of one native pointer observation command.
+///
+/// The viewport, expected window and device identify the request, even when no observation was
+/// possible. They are not independently observed routing facts.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct NativeViewportPointerObservationResult {
+    token: NativeViewportPointerObservationCommandToken,
+    viewport_id: ViewportId,
+    expected_window_id: WindowId,
+    device_id: DeviceId,
+    observation: NativeViewportPointerObservation,
+}
+
+impl NativeViewportPointerObservationResult {
+    /// Returns the exact command which produced this result.
+    pub const fn token(self) -> NativeViewportPointerObservationCommandToken {
+        self.token
+    }
+
+    /// Returns the requested eframe viewport.
+    pub const fn viewport_id(self) -> ViewportId {
+        self.viewport_id
+    }
+
+    /// Returns the exact native window expected by the request.
+    pub const fn expected_window_id(self) -> WindowId {
+        self.expected_window_id
+    }
+
+    /// Returns the window-input device requested by the host.
+    pub const fn device_id(self) -> DeviceId {
+        self.device_id
+    }
+
+    /// Returns the unmodified backend observation or its explicit unavailable/unsupported result.
+    pub const fn observation(self) -> NativeViewportPointerObservation {
+        self.observation
+    }
+
+    fn observe_with(
+        token: NativeViewportPointerObservationCommandToken,
+        viewport_id: ViewportId,
+        expected_window_id: WindowId,
+        device_id: DeviceId,
+        actual_window_id: WindowId,
+        observe: impl FnOnce(WindowId, DeviceId) -> NativeViewportPointerObservation,
+    ) -> Self {
+        let observation = if actual_window_id == expected_window_id {
+            observe(expected_window_id, device_id)
+        } else {
+            NativeViewportPointerObservation::Unavailable
+        };
+        Self {
+            token,
+            viewport_id,
+            expected_window_id,
+            device_id,
+            observation,
+        }
+    }
+}
+
 /// Exact terminal identity of a pending property command retired before execution.
 ///
 /// The viewport or its window was forgotten while the command remained queued. This reports
@@ -1151,6 +1249,17 @@ pub enum NativeViewportPropertyCommandRetirement {
         /// Requested pass-through value of the retired command.
         enabled: bool,
     },
+    /// One queued pointer observation was retired without querying the backend.
+    PointerObservation {
+        /// Target viewport of the retired command.
+        viewport_id: ViewportId,
+        /// Exact token returned when the command was prepared or queued.
+        token: NativeViewportPointerObservationCommandToken,
+        /// Expected native window from the request, not an observed window identity.
+        expected_window_id: WindowId,
+        /// Window-input device from the request.
+        device_id: DeviceId,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1164,6 +1273,11 @@ enum QueuedNativeViewportPropertyCommand {
         token: NativeViewportPointerPassthroughCommandToken,
         enabled: bool,
     },
+    PointerObservation {
+        token: NativeViewportPointerObservationCommandToken,
+        expected_window_id: WindowId,
+        device_id: DeviceId,
+    },
 }
 
 #[derive(Default)]
@@ -1171,11 +1285,12 @@ struct QueuedNativeViewportPropertyCommands(
     BTreeMap<ViewportId, VecDeque<QueuedNativeViewportPropertyCommand>>,
 );
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 enum NativeViewportPropertyResult {
     Focus(NativeViewportFocusResult),
     Visibility(NativeViewportVisibilityResult),
     PointerPassthrough(NativeViewportPointerPassthroughResult),
+    PointerObservation(NativeViewportPointerObservationResult),
 }
 
 /// One prepared host command whose terminal owner can be reserved before enqueueing.
@@ -1253,6 +1368,54 @@ pub fn prepare_native_viewport_pointer_passthrough(
         viewport_id,
         command: QueuedNativeViewportPropertyCommand::PointerPassthrough { token, enabled },
     }
+}
+
+/// Prepares a pointer observation without querying the backend or scheduling a callback.
+///
+/// Reserve the token's terminal owner before enqueueing. The core continuation identity remains
+/// owned by the host and is not sent to the native backend.
+pub fn prepare_native_viewport_pointer_observation(
+    viewport_id: ViewportId,
+    expected_window_id: WindowId,
+    device_id: DeviceId,
+) -> PreparedNativeViewportCommand<NativeViewportPointerObservationCommandToken> {
+    let token = NativeViewportPointerObservationCommandToken(next_non_zero(
+        &NEXT_POINTER_OBSERVATION_COMMAND,
+        "native pointer observation command identity exhausted",
+    ));
+    PreparedNativeViewportCommand {
+        token,
+        viewport_id,
+        command: QueuedNativeViewportPropertyCommand::PointerObservation {
+            token,
+            expected_window_id,
+            device_id,
+        },
+    }
+}
+
+/// Queues one synchronous native pointer observation for an exact viewport, window and device.
+///
+/// The backend is queried only when native commands execute, after application UI returns. A
+/// replacement window is never queried on behalf of the expected window. The command consumes no
+/// native events and produces no synthetic input event. Results are reported through
+/// [`NativeHostHandler::on_viewport_pointer_observation`]; an unavailable result is terminal and
+/// is not retried by eframe. An observed result can have unknown capture and delivery and does not
+/// establish stationary continuation eligibility. The host must apply its own input ordering,
+/// budget and continuation checks before using an observation; neither the request identity nor
+/// hover may fill missing capture or delivery. Queue ordering, attachment and retirement rules
+/// match [`queue_native_viewport_focus`].
+pub fn queue_native_viewport_pointer_observation(
+    ctx: &egui::Context,
+    viewport_id: ViewportId,
+    expected_window_id: WindowId,
+    device_id: DeviceId,
+) -> NativeViewportPointerObservationCommandToken {
+    let command =
+        prepare_native_viewport_pointer_observation(viewport_id, expected_window_id, device_id);
+    let token = command.token();
+    command.enqueue(ctx);
+    token
 }
 
 /// Queues one host-owned focus command for an exact viewport.
@@ -1429,6 +1592,19 @@ pub trait NativeHostHandler: Send + Sync + 'static {
     fn on_viewport_pointer_passthrough(
         &self,
         _result: NativeViewportPointerPassthroughResult,
+    ) -> NativeHostWake {
+        NativeHostWake::Wait
+    }
+
+    /// Reports one exact pointer observation command's terminal result.
+    ///
+    /// Copy retained facts into host-owned ordered ingress and return a wake request. The result
+    /// cannot change an already completed output. This callback must not re-enter eframe or query
+    /// newer window state to complete the observation. An observed result does not establish
+    /// capture continuity or stationary continuation support; unknown routes remain unknown.
+    fn on_viewport_pointer_observation(
+        &self,
+        _result: NativeViewportPointerObservationResult,
     ) -> NativeHostWake {
         NativeHostWake::Wait
     }
@@ -2291,6 +2467,7 @@ impl NativeHostState {
         visibility_control_for_event_loop(event_loop)
     }
 
+    #[expect(clippy::too_many_arguments)]
     pub(crate) fn process_viewport_commands(
         &self,
         ctx: &egui::Context,
@@ -2299,6 +2476,7 @@ impl NativeHostState {
         commands: impl IntoIterator<Item = egui::ViewportCommand>,
         window: &Window,
         actions_requested: &mut Vec<egui_winit::ActionRequested>,
+        event_loop: Option<&ActiveEventLoop>,
     ) {
         self.process_viewport_commands_with(
             ctx,
@@ -2322,7 +2500,9 @@ impl NativeHostState {
                     );
                 }
             },
-            |command| self.apply_viewport_property_command(viewport_id, window, command),
+            |command| {
+                self.apply_viewport_property_command(viewport_id, window, command, event_loop)
+            },
         );
     }
 
@@ -2373,6 +2553,9 @@ impl NativeHostState {
                 NativeViewportPropertyResult::PointerPassthrough(result) => {
                     self.notify_viewport_pointer_passthrough(ctx, result);
                 }
+                NativeViewportPropertyResult::PointerObservation(result) => {
+                    self.notify_viewport_pointer_observation(ctx, result);
+                }
             }
         }
     }
@@ -2396,6 +2579,7 @@ impl NativeHostState {
         viewport_id: ViewportId,
         window: &Window,
         command: QueuedNativeViewportPropertyCommand,
+        event_loop: Option<&ActiveEventLoop>,
     ) -> NativeViewportPropertyResult {
         match command {
             QueuedNativeViewportPropertyCommand::Focus(token) => {
@@ -2442,7 +2626,38 @@ impl NativeHostState {
                     },
                 )
             }
+            QueuedNativeViewportPropertyCommand::PointerObservation {
+                token,
+                expected_window_id,
+                device_id,
+            } => NativeViewportPropertyResult::PointerObservation(
+                NativeViewportPointerObservationResult::observe_with(
+                    token,
+                    viewport_id,
+                    expected_window_id,
+                    device_id,
+                    window.id(),
+                    |expected_window_id, device_id| {
+                        observe_native_pointer(event_loop, expected_window_id, device_id)
+                    },
+                ),
+            ),
         }
+    }
+
+    fn notify_viewport_pointer_observation(
+        &self,
+        ctx: &egui::Context,
+        result: NativeViewportPointerObservationResult,
+    ) {
+        let Some(inner) = &self.inner else {
+            return;
+        };
+        apply_host_wake(
+            inner,
+            ctx,
+            inner.handler.on_viewport_pointer_observation(result),
+        );
     }
 
     fn notify_viewport_focus(&self, ctx: &egui::Context, result: NativeViewportFocusResult) {
@@ -2937,6 +3152,16 @@ impl NativeHostStateInner {
                         enabled,
                     }
                 }
+                QueuedNativeViewportPropertyCommand::PointerObservation {
+                    token,
+                    expected_window_id,
+                    device_id,
+                } => NativeViewportPropertyCommandRetirement::PointerObservation {
+                    viewport_id,
+                    token,
+                    expected_window_id,
+                    device_id,
+                },
             };
             if self
                 .handler
@@ -3030,6 +3255,31 @@ fn apply_host_wake(inner: &NativeHostStateInner, ctx: &egui::Context, wake: Nati
     }
 }
 
+fn observe_native_pointer(
+    event_loop: Option<&ActiveEventLoop>,
+    expected_window_id: WindowId,
+    device_id: DeviceId,
+) -> NativeViewportPointerObservation {
+    let Some(event_loop) = event_loop else {
+        return NativeViewportPointerObservation::Unavailable;
+    };
+    #[cfg(all(target_os = "linux", feature = "x11"))]
+    {
+        match event_loop.observe_pointer(expected_window_id, device_id) {
+            X11PointerObservation::Observed { facts, delivery } => {
+                NativeViewportPointerObservation::Observed { facts, delivery }
+            }
+            X11PointerObservation::Unavailable => NativeViewportPointerObservation::Unavailable,
+            X11PointerObservation::Unsupported => NativeViewportPointerObservation::Unsupported,
+        }
+    }
+    #[cfg(not(all(target_os = "linux", feature = "x11")))]
+    {
+        let _ = (event_loop, expected_window_id, device_id);
+        NativeViewportPointerObservation::Unsupported
+    }
+}
+
 fn next_non_zero(counter: &AtomicU64, exhausted: &str) -> NonZeroU64 {
     let value = counter
         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
@@ -3037,6 +3287,396 @@ fn next_non_zero(counter: &AtomicU64, exhausted: &str) -> NonZeroU64 {
         })
         .unwrap_or_else(|_| panic!("{exhausted}"));
     NonZeroU64::new(value).unwrap_or_else(|| panic!("{exhausted}"))
+}
+
+#[cfg(test)]
+mod pointer_observation_tests {
+    use super::*;
+
+    #[derive(Default)]
+    struct ObservationHost {
+        results: egui::mutex::Mutex<Vec<NativeViewportPointerObservationResult>>,
+        retirements: egui::mutex::Mutex<Vec<NativeViewportPropertyCommandRetirement>>,
+        requeue: egui::mutex::Mutex<Option<(egui::Context, ViewportId, WindowId, DeviceId)>>,
+        successor: egui::mutex::Mutex<Option<NativeViewportPointerObservationCommandToken>>,
+    }
+
+    impl NativeHostHandler for ObservationHost {
+        fn on_viewport_pointer_observation(
+            &self,
+            result: NativeViewportPointerObservationResult,
+        ) -> NativeHostWake {
+            self.results.lock().push(result);
+            NativeHostWake::RepaintRootAfterCurrent
+        }
+
+        fn on_viewport_property_command_retired(
+            &self,
+            retirement: NativeViewportPropertyCommandRetirement,
+        ) -> NativeHostWake {
+            self.retirements.lock().push(retirement);
+            if let Some((ctx, viewport, window, device)) = self.requeue.lock().take() {
+                *self.successor.lock() = Some(queue_native_viewport_pointer_observation(
+                    &ctx, viewport, window, device,
+                ));
+            }
+            NativeHostWake::RepaintRootAfterCurrent
+        }
+    }
+
+    fn fixture() -> (Arc<ObservationHost>, NativeHostState, egui::Context) {
+        let host = Arc::new(ObservationHost::default());
+        let handler: Arc<dyn NativeHostHandler> = Arc::<ObservationHost>::clone(&host);
+        let state = NativeHostState::new(Some(handler));
+        let ctx = egui::Context::default();
+        state.bind_close_context(&ctx);
+        (host, state, ctx)
+    }
+
+    // Only native sampling is stubbed. Queue consumption, exact-window gating, callbacks and
+    // retirement use the same production boundary as both renderers.
+    fn dispatch(
+        state: &NativeHostState,
+        ctx: &egui::Context,
+        viewport: ViewportId,
+        actual_window: WindowId,
+        mut observe: impl FnMut(WindowId, DeviceId) -> NativeViewportPointerObservation,
+    ) {
+        state.process_viewport_commands_with(
+            ctx,
+            viewport,
+            [],
+            |_| panic!("no ordinary command was queued"),
+            |command| {
+                let QueuedNativeViewportPropertyCommand::PointerObservation {
+                    token,
+                    expected_window_id,
+                    device_id,
+                } = command
+                else {
+                    panic!("only pointer observations may execute in this fixture");
+                };
+                NativeViewportPropertyResult::PointerObservation(
+                    NativeViewportPointerObservationResult::observe_with(
+                        token,
+                        viewport,
+                        expected_window_id,
+                        device_id,
+                        actual_window,
+                        &mut observe,
+                    ),
+                )
+            },
+        );
+    }
+
+    #[test]
+    fn pointer_observation_preparation_reserves_identity_before_enqueue() {
+        let (host, state, ctx) = fixture();
+        let viewport = ViewportId::ROOT;
+        let window = WindowId::from(141);
+        let device = DeviceId::dummy();
+        let unattached = queue_native_viewport_pointer_observation(
+            &egui::Context::default(),
+            viewport,
+            window,
+            device,
+        );
+        let prepared = prepare_native_viewport_pointer_observation(viewport, window, device);
+        let token = prepared.token();
+        let rejected = prepare_native_viewport_pointer_observation(viewport, window, device);
+        assert_ne!(token, unattached);
+        assert_ne!(rejected.token(), token);
+        drop(rejected);
+        assert!(state.take_viewport_property_commands(viewport).is_empty());
+        assert!(host.results.lock().is_empty());
+        assert!(host.retirements.lock().is_empty());
+
+        prepared.enqueue(&ctx);
+        dispatch(
+            &state,
+            &ctx,
+            viewport,
+            window,
+            |expected, requested_device| {
+                assert_eq!((expected, requested_device), (window, device));
+                assert!(host.results.lock().is_empty());
+                NativeViewportPointerObservation::Unsupported
+            },
+        );
+        assert_eq!(host.results.lock()[0].token(), token);
+        assert!(host.retirements.lock().is_empty());
+    }
+
+    #[test]
+    fn pointer_observation_queue_preserves_same_observation_and_viewport_order() {
+        let (host, state, ctx) = fixture();
+        let viewport = ViewportId::ROOT;
+        let other = ViewportId::from_hash_of("other-pointer-observation");
+        let window = WindowId::from(141);
+        let other_window = WindowId::from(142);
+        let device = DeviceId::dummy();
+        let observations = [
+            NativeViewportPointerObservation::Observed {
+                facts: PointerEventFacts {
+                    surface_position: Some(winit::dpi::PhysicalPosition::new(10.25, 20.5)),
+                    geometry: Some(winit::event::PointerEventGeometry {
+                        surface_size: winit::dpi::PhysicalSize::new(801, 603),
+                        scale_factor: 1.25,
+                    }),
+                    desktop_position: Some(winit::dpi::PhysicalPosition::new(-200.75, 300.5)),
+                    modifiers: Some(winit::keyboard::ModifiersState::SHIFT),
+                    hover: PointerWindowRoute::Window(other_window),
+                    capture: PointerWindowRoute::Window(window),
+                },
+                delivery: PointerWindowRoute::Window(window),
+            },
+            NativeViewportPointerObservation::Unavailable,
+            NativeViewportPointerObservation::Unsupported,
+            NativeViewportPointerObservation::Observed {
+                facts: PointerEventFacts::default(),
+                delivery: PointerWindowRoute::Foreign,
+            },
+        ];
+        let tokens = observations
+            .map(|_| queue_native_viewport_pointer_observation(&ctx, viewport, window, device));
+        let other_token =
+            queue_native_viewport_pointer_observation(&ctx, other, other_window, device);
+        let mut sampled = 0;
+        dispatch(
+            &state,
+            &ctx,
+            viewport,
+            window,
+            |expected, requested_device| {
+                assert_eq!((expected, requested_device), (window, device));
+                assert_eq!(host.results.lock().len(), sampled);
+                let observation = observations[sampled];
+                sampled += 1;
+                observation
+            },
+        );
+        assert_eq!(sampled, observations.len());
+        {
+            let results = host.results.lock();
+            assert_eq!(results.len(), observations.len());
+            for ((result, token), observation) in results.iter().zip(tokens).zip(observations) {
+                assert_eq!(result.token(), token);
+                assert_eq!(result.viewport_id(), viewport);
+                assert_eq!(result.expected_window_id(), window);
+                assert_eq!(result.device_id(), device);
+                assert_eq!(result.observation(), observation);
+            }
+        }
+        state.forget_presented_viewport(viewport);
+        assert!(host.retirements.lock().is_empty());
+        dispatch(
+            &state,
+            &ctx,
+            other,
+            other_window,
+            |expected, requested_device| {
+                assert_eq!((expected, requested_device), (other_window, device));
+                NativeViewportPointerObservation::Unavailable
+            },
+        );
+        assert_eq!(host.results.lock().last().unwrap().token(), other_token);
+    }
+
+    #[test]
+    fn pointer_observation_keeps_unknown_capture_and_delivery_with_known_hover() {
+        let (host, state, ctx) = fixture();
+        let viewport = ViewportId::ROOT;
+        let window = WindowId::from(141);
+        let device = DeviceId::dummy();
+        let facts = PointerEventFacts {
+            surface_position: Some(winit::dpi::PhysicalPosition::new(10.25, 20.5)),
+            desktop_position: Some(winit::dpi::PhysicalPosition::new(110.25, 220.5)),
+            hover: PointerWindowRoute::Window(window),
+            capture: PointerWindowRoute::Unknown,
+            ..Default::default()
+        };
+        let observation = NativeViewportPointerObservation::Observed {
+            facts,
+            delivery: PointerWindowRoute::Unknown,
+        };
+        let token = queue_native_viewport_pointer_observation(&ctx, viewport, window, device);
+
+        dispatch(
+            &state,
+            &ctx,
+            viewport,
+            window,
+            |expected, requested_device| {
+                assert_eq!((expected, requested_device), (window, device));
+                observation
+            },
+        );
+
+        let results = host.results.lock();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].token(), token);
+        assert_eq!(results[0].expected_window_id(), window);
+        assert_eq!(results[0].device_id(), device);
+        assert_eq!(results[0].observation(), observation);
+        let NativeViewportPointerObservation::Observed {
+            facts: observed,
+            delivery,
+        } = results[0].observation()
+        else {
+            panic!("partial pointer facts must remain an observed result");
+        };
+        assert_eq!(observed, facts);
+        assert_eq!(observed.capture, PointerWindowRoute::Unknown);
+        assert_eq!(delivery, PointerWindowRoute::Unknown);
+        assert_eq!(observed.geometry, None);
+    }
+
+    #[test]
+    fn pointer_observation_never_queries_a_replacement_window() {
+        let (host, state, ctx) = fixture();
+        let viewport = ViewportId::ROOT;
+        let original = WindowId::from(141);
+        let replacement = WindowId::from(142);
+        let device = DeviceId::dummy();
+        let inner = state.inner.as_ref().unwrap();
+        inner.capture_window_input_state(viewport, original);
+        inner.capture_window_input_state(viewport, replacement);
+        let token = queue_native_viewport_pointer_observation(&ctx, viewport, original, device);
+
+        state.forget_presented_window(viewport, original);
+        assert!(host.retirements.lock().is_empty());
+        dispatch(&state, &ctx, viewport, replacement, |_, _| {
+            panic!("the successor must not be queried for an older expected window")
+        });
+        let results = host.results.lock();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].token(), token);
+        assert_eq!(results[0].expected_window_id(), original);
+        assert_eq!(results[0].device_id(), device);
+        assert_eq!(
+            results[0].observation(),
+            NativeViewportPointerObservation::Unavailable
+        );
+    }
+
+    #[test]
+    fn pointer_observation_without_event_loop_finishes_unavailable_once() {
+        let (host, state, ctx) = fixture();
+        let viewport = ViewportId::ROOT;
+        let window = WindowId::from(141);
+        let token =
+            queue_native_viewport_pointer_observation(&ctx, viewport, window, DeviceId::dummy());
+        dispatch(&state, &ctx, viewport, window, |expected, device| {
+            observe_native_pointer(None, expected, device)
+        });
+        dispatch(&state, &ctx, viewport, window, |_, _| {
+            panic!("an unavailable observation must not retry itself")
+        });
+        state.forget_presented_viewport(viewport);
+        let results = host.results.lock();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].token(), token);
+        assert_eq!(
+            results[0].observation(),
+            NativeViewportPointerObservation::Unavailable
+        );
+        assert!(host.retirements.lock().is_empty());
+        assert!(state.take_root_wake_after_current());
+        assert!(!state.take_root_wake_after_current());
+    }
+
+    #[test]
+    fn pending_pointer_observations_retire_once_in_original_queue_order() {
+        for forget_window in [false, true] {
+            let (host, state, ctx) = fixture();
+            let viewport = ViewportId::ROOT;
+            let other = ViewportId::from_hash_of("surviving-pointer-observation");
+            let window = WindowId::from(141);
+            let device = DeviceId::dummy();
+            state
+                .inner
+                .as_ref()
+                .unwrap()
+                .capture_window_input_state(viewport, window);
+            let first = queue_native_viewport_pointer_observation(&ctx, viewport, window, device);
+            let focus = queue_native_viewport_focus(&ctx, viewport);
+            let second = queue_native_viewport_pointer_observation(&ctx, viewport, window, device);
+            let surviving = queue_native_viewport_pointer_observation(&ctx, other, window, device);
+            let pending = state.with_pending_viewport_property_targets(Default::default());
+            assert!(pending.contains_key(&viewport));
+            assert!(pending.contains_key(&other));
+            assert!(host.results.lock().is_empty());
+
+            if forget_window {
+                state.forget_presented_window(viewport, window);
+            } else {
+                state.forget_presented_viewport(viewport);
+            }
+            let expected = [
+                NativeViewportPropertyCommandRetirement::PointerObservation {
+                    viewport_id: viewport,
+                    token: first,
+                    expected_window_id: window,
+                    device_id: device,
+                },
+                NativeViewportPropertyCommandRetirement::Focus {
+                    viewport_id: viewport,
+                    token: focus,
+                },
+                NativeViewportPropertyCommandRetirement::PointerObservation {
+                    viewport_id: viewport,
+                    token: second,
+                    expected_window_id: window,
+                    device_id: device,
+                },
+            ];
+            assert_eq!(*host.retirements.lock(), expected);
+            state.forget_presented_window(viewport, window);
+            state.forget_presented_viewport(viewport);
+            dispatch(&state, &ctx, viewport, window, |_, _| {
+                panic!("a retired observation must not query the backend")
+            });
+            assert_eq!(*host.retirements.lock(), expected);
+            dispatch(&state, &ctx, other, window, |_, _| {
+                NativeViewportPointerObservation::Unsupported
+            });
+            let results = host.results.lock();
+            assert_eq!(results.len(), 1);
+            assert_eq!(results[0].token(), surviving);
+            assert_eq!(results[0].viewport_id(), other);
+        }
+    }
+
+    #[test]
+    fn pointer_observation_retirement_requeue_preserves_successor_and_root_wake() {
+        let (host, state, ctx) = fixture();
+        let viewport = ViewportId::ROOT;
+        let window = WindowId::from(141);
+        let device = DeviceId::dummy();
+        let retired = queue_native_viewport_pointer_observation(&ctx, viewport, window, device);
+        *host.requeue.lock() = Some((ctx.clone(), viewport, window, device));
+
+        state.forget_presented_viewport(viewport);
+        let successor = host.successor.lock().unwrap();
+        assert_ne!(successor, retired);
+        assert_eq!(host.retirements.lock().len(), 1);
+        assert!(
+            state
+                .with_pending_viewport_property_targets(Default::default())
+                .contains_key(&viewport)
+        );
+        assert!(state.take_root_wake_after_current());
+        assert!(!state.take_root_wake_after_current());
+        dispatch(&state, &ctx, viewport, window, |_, _| {
+            NativeViewportPointerObservation::Unsupported
+        });
+        state.forget_presented_viewport(viewport);
+        let results = host.results.lock();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].token(), successor);
+        assert_eq!(host.retirements.lock().len(), 1);
+    }
 }
 
 #[cfg(test)]
