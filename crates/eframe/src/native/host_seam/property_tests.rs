@@ -684,6 +684,7 @@ fn property_retirement_reentrant_queue_survives_and_preserves_root_wake() {
     for forget_window in [false, true] {
         for wake in [
             NativeHostWake::Wait,
+            NativeHostWake::ServiceAfterCurrent,
             NativeHostWake::RepaintRoot,
             NativeHostWake::RepaintRootAfterCurrent,
         ] {
@@ -738,9 +739,16 @@ fn property_retirement_reentrant_queue_survives_and_preserves_root_wake() {
             assert!(state.take_viewport_property_commands(viewport).is_empty());
             assert_eq!(
                 state.take_root_wake_after_current(),
-                wake != NativeHostWake::Wait
+                matches!(
+                    wake,
+                    NativeHostWake::RepaintRoot | NativeHostWake::RepaintRootAfterCurrent
+                )
             );
             assert!(!state.take_root_wake_after_current());
+            assert_eq!(
+                state.service_after_current_requested(),
+                wake == NativeHostWake::ServiceAfterCurrent
+            );
         }
     }
 }

@@ -290,6 +290,20 @@ pub enum NativeOutputAdmission {
     Defer,
 }
 
+/// Input admission for an already accepted native viewport output.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum NativeOutputInputAdmission {
+    /// Consume the buffered input and run the viewport UI normally.
+    #[default]
+    Proceed,
+    /// Leave input buffered and end this output without running application callbacks.
+    ///
+    /// The accepted token receives its ordinary
+    /// [`NativeOutputStatus::NotPresented`] terminal. Only the requested wake is
+    /// applied; [`NativeHostWake::Wait`] does not schedule a retry.
+    Defer(NativeHostWake),
+}
+
 /// Completion order assigned when one [`egui::FullOutput`] finishes generation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct NativeOutputOrdinal(NonZeroU64);
@@ -376,16 +390,43 @@ impl<'a> NativeOutputPassFinalization<'a> {
 
 /// Host-owned callback installed before eframe attaches a native context.
 pub trait NativeOutputPassFinalizer: Send + Sync + 'static {
+    /// Services retained host work without an output token, input extraction, or application pass.
+    ///
+    /// A host may forward [`NativeHostHandler::on_service`] here. Returning
+    /// [`NativeHostWake::ServiceAfterCurrent`] requests another native event.
+    fn on_service(&self, _context: &egui::Context) -> NativeHostWake {
+        NativeHostWake::Wait
+    }
+
+    /// Admits buffered input before any application input hook, logic, or UI runs.
+    ///
+    /// A host may forward [`NativeHostHandler::before_output_input`] here to
+    /// settle preceding work using the accepted output's exact token.
+    fn before_output_input(
+        &self,
+        _context: &egui::Context,
+        _token: NativeOutputToken,
+        _has_input: bool,
+    ) -> NativeOutputInputAdmission {
+        NativeOutputInputAdmission::Proceed
+    }
+
     /// Settles one exact pass output at eframe's final output boundary.
     fn finalize(&self, finalization: NativeOutputPassFinalization<'_>) -> NativeHostWake;
 }
 
-/// Optional wake requested after a terminal host callback.
+/// Optional wake requested by a native host callback.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum NativeHostWake {
     /// Do not schedule an additional frame.
     #[default]
     Wait,
+    /// Service retained host work in a native user event after the current event.
+    ///
+    /// Requests coalesce while a service event is queued. The callback runs
+    /// without extracting input, running application logic or UI, or opening an
+    /// output scope. Returning this wake from service schedules a later event.
+    ServiceAfterCurrent,
     /// Schedule the root viewport so queued host records can be reduced.
     RepaintRoot,
     /// Preserve one root repaint after a root pass which is already queued.
@@ -1511,6 +1552,16 @@ pub fn queue_native_viewport_pointer_passthrough(
 /// viewports so native side effects remain outside application UI recursion. Callbacks run on the
 /// native event-loop thread and must not re-enter eframe.
 pub trait NativeHostHandler: Send + Sync + 'static {
+    /// Services retained work in a dedicated native user event.
+    ///
+    /// Eframe does not extract input, run application logic or UI, or create an
+    /// output scope for this callback. Requests made before this event coalesce;
+    /// returning [`NativeHostWake::ServiceAfterCurrent`] schedules a later event
+    /// rather than re-entering this callback. The callback must not re-enter eframe.
+    fn on_service(&self, _context: &egui::Context) -> NativeHostWake {
+        NativeHostWake::Wait
+    }
+
     /// Installs the one finalizer which owns egui pass settlement for this host.
     ///
     /// The default rejects installation. Implementations which support this
@@ -1639,6 +1690,27 @@ pub trait NativeHostHandler: Send + Sync + 'static {
         _root_roster: Option<NativeViewportRoster<'_>>,
     ) -> NativeOutputAdmission {
         NativeOutputAdmission::Proceed
+    }
+
+    /// Admits input for the active output before eframe extracts it or runs application code.
+    ///
+    /// This runs after [`Self::on_output_begin`] accepted the token, with no
+    /// renderer resources borrowed. `has_input` reports buffered events,
+    /// dropped files, or hovered files, including input saved by a logic-only
+    /// update. It does not consume that input or prove any input authority.
+    ///
+    /// Returning [`NativeOutputInputAdmission::Defer`] leaves the input in its
+    /// existing buffers and skips application input hooks, logic, and UI. The
+    /// accepted scope still reports exactly one ordinary
+    /// [`NativeOutputStatus::NotPresented`] terminal through [`Self::on_output`].
+    /// The callback must not re-enter eframe.
+    fn before_output_input(
+        &self,
+        _context: &egui::Context,
+        _token: NativeOutputToken,
+        _has_input: bool,
+    ) -> NativeOutputInputAdmission {
+        NativeOutputInputAdmission::Proceed
     }
 
     /// Finalizes one egui pass while its exact native output token is active.
@@ -1817,6 +1889,7 @@ struct NativeHostStateInner {
     presentation_generations: Mutex<BTreeMap<ViewportId, u64>>,
     window_input: egui::mutex::Mutex<NativeWindowInputLedger>,
     root_wake_after_current: AtomicBool,
+    service_after_current: AtomicBool,
 }
 
 /// Single-threaded event ordinal source owned by the outer winit dispatcher.
@@ -1870,6 +1943,7 @@ impl NativeHostState {
                 presentation_generations: Mutex::new(BTreeMap::new()),
                 window_input: egui::mutex::Mutex::new(NativeWindowInputLedger::default()),
                 root_wake_after_current: AtomicBool::new(false),
+                service_after_current: AtomicBool::new(false),
             })),
         }
     }
@@ -1882,6 +1956,23 @@ impl NativeHostState {
         self.inner
             .as_ref()
             .is_some_and(|inner| inner.root_wake_after_current.swap(false, Ordering::AcqRel))
+    }
+
+    pub(crate) fn service_after_current_requested(&self) -> bool {
+        self.inner
+            .as_ref()
+            .is_some_and(|inner| inner.service_after_current.load(Ordering::Acquire))
+    }
+
+    pub(crate) fn service(&self, context: &egui::Context) {
+        let Some(inner) = &self.inner else {
+            return;
+        };
+        // Clear before the callback so a returned service wake belongs to the
+        // next native event. All requests preceding this callback coalesce.
+        if inner.service_after_current.swap(false, Ordering::AcqRel) {
+            apply_host_wake(inner, context, inner.handler.on_service(context));
+        }
     }
 
     #[track_caller]
@@ -2063,10 +2154,11 @@ impl NativeHostState {
                     root_allowed |= request.viewport_id == ViewportId::ROOT
                 }
                 NativeViewportCloseDecision::Veto => {
-                    if inner.handler.on_viewport_close_cancelled(request)
-                        == NativeHostWake::RepaintRoot
-                    {
+                    let wake = inner.handler.on_viewport_close_cancelled(request);
+                    if wake == NativeHostWake::RepaintRoot {
                         ctx.request_repaint_of(ViewportId::ROOT);
+                    } else {
+                        apply_host_wake(inner, ctx, wake);
                     }
                 }
             }
@@ -2105,13 +2197,15 @@ impl NativeHostState {
                 window_id,
             }
         });
-        if inner
+        let wake = inner
             .handler
-            .on_global_focus(NativeGlobalFocusObservation { event, focused })
-            == NativeHostWake::RepaintRoot
-            && let Some(ctx) = ctx
-        {
-            ctx.request_repaint_of(ViewportId::ROOT);
+            .on_global_focus(NativeGlobalFocusObservation { event, focused });
+        if wake == NativeHostWake::RepaintRoot {
+            if let Some(ctx) = ctx {
+                ctx.request_repaint_of(ViewportId::ROOT);
+            }
+        } else {
+            apply_deferred_host_wake(inner, wake);
         }
     }
 
@@ -2144,8 +2238,11 @@ impl NativeHostState {
         let Some(request) = request else {
             return;
         };
-        if inner.handler.on_viewport_close_cancelled(request) == NativeHostWake::RepaintRoot {
+        let wake = inner.handler.on_viewport_close_cancelled(request);
+        if wake == NativeHostWake::RepaintRoot {
             ctx.request_repaint_of(ViewportId::ROOT);
+        } else {
+            apply_host_wake(inner, ctx, wake);
         }
     }
 
@@ -2278,6 +2375,24 @@ impl NativeHostState {
             frame,
             active: true,
         })
+    }
+
+    pub(crate) fn before_output_input(&self, context: &egui::Context, has_input: bool) -> bool {
+        let Some(inner) = &self.inner else {
+            return true;
+        };
+        let Some(token) =
+            current_native_output_token().filter(|token| token.context == inner.attachment.context)
+        else {
+            return true;
+        };
+        match inner.handler.before_output_input(context, token, has_input) {
+            NativeOutputInputAdmission::Proceed => true,
+            NativeOutputInputAdmission::Defer(wake) => {
+                apply_host_wake(inner, context, wake);
+                false
+            }
+        }
     }
 
     pub(crate) fn finalize_output_pass(
@@ -2437,15 +2552,16 @@ impl NativeHostState {
         let Some(inner) = &self.inner else {
             return;
         };
-        if inner
+        let wake = inner
             .handler
             .on_viewport_create_failed(NativeViewportCreateFailure {
                 create_attempt,
                 kind,
-            })
-            == NativeHostWake::RepaintRoot
-        {
+            });
+        if wake == NativeHostWake::RepaintRoot {
             ctx.request_repaint_of(ViewportId::ROOT);
+        } else {
+            apply_host_wake(inner, ctx, wake);
         }
     }
 
@@ -3163,15 +3279,13 @@ impl NativeHostStateInner {
                     device_id,
                 },
             };
-            if self
-                .handler
-                .on_viewport_property_command_retired(retirement)
-                != NativeHostWake::Wait
-            {
-                // Forget callbacks have no Context. Both repaint variants preserve a root
-                // wake through the existing event-loop latch without retaining that Context.
-                self.root_wake_after_current.store(true, Ordering::Release);
-            }
+            // Forget callbacks have no Context. Preserve the requested wake in
+            // its event-loop latch without turning service into a UI repaint.
+            apply_deferred_host_wake(
+                self,
+                self.handler
+                    .on_viewport_property_command_retired(retirement),
+            );
         }
     }
 
@@ -3246,10 +3360,20 @@ fn notify_output(
 }
 
 fn apply_host_wake(inner: &NativeHostStateInner, ctx: &egui::Context, wake: NativeHostWake) {
+    if wake == NativeHostWake::RepaintRoot {
+        ctx.request_repaint_once_of(ViewportId::ROOT);
+    } else {
+        apply_deferred_host_wake(inner, wake);
+    }
+}
+
+fn apply_deferred_host_wake(inner: &NativeHostStateInner, wake: NativeHostWake) {
     match wake {
         NativeHostWake::Wait => {}
-        NativeHostWake::RepaintRoot => ctx.request_repaint_once_of(ViewportId::ROOT),
-        NativeHostWake::RepaintRootAfterCurrent => {
+        NativeHostWake::ServiceAfterCurrent => {
+            inner.service_after_current.store(true, Ordering::Release);
+        }
+        NativeHostWake::RepaintRoot | NativeHostWake::RepaintRootAfterCurrent => {
             inner.root_wake_after_current.store(true, Ordering::Release);
         }
     }
@@ -3745,6 +3869,31 @@ mod tests {
     struct ExclusiveAttachmentHost {
         attachment: Mutex<Option<NativeHostAttachment>>,
         detachments: AtomicUsize,
+    }
+
+    #[derive(Default)]
+    struct InputAdmissionHost {
+        admission: NativeOutputInputAdmission,
+        calls: Mutex<Vec<(NativeOutputToken, bool)>>,
+        outputs: Mutex<Vec<NativeOutputResult>>,
+    }
+
+    impl NativeHostHandler for InputAdmissionHost {
+        fn before_output_input(
+            &self,
+            _context: &egui::Context,
+            token: NativeOutputToken,
+            has_input: bool,
+        ) -> NativeOutputInputAdmission {
+            assert_eq!(current_native_output_token(), Some(token));
+            self.calls.lock().push((token, has_input));
+            self.admission
+        }
+
+        fn on_output(&self, result: NativeOutputResult) -> NativeHostWake {
+            self.outputs.lock().push(result);
+            NativeHostWake::Wait
+        }
     }
 
     impl NativeHostHandler for ExclusiveAttachmentHost {
@@ -4712,6 +4861,329 @@ mod tests {
         assert_eq!(outputs.len(), 2);
         assert_eq!(outputs[1].ordinal().get(), 2);
         assert_eq!(outputs[1].status(), NativeOutputStatus::NotPresented);
+    }
+
+    #[test]
+    fn presented_output_requests_service_without_an_extra_output_or_repaint() {
+        let host = Arc::new(RecordingHost {
+            wake: NativeHostWake::ServiceAfterCurrent,
+            ..Default::default()
+        });
+        let state = NativeHostState::new(Some(host.clone()));
+        let context = egui::Context::default();
+        let repaints = Arc::new(AtomicUsize::new(0));
+        context.set_request_repaint_callback({
+            let repaints = Arc::clone(&repaints);
+            move |_| {
+                repaints.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+        state
+            .begin_output_for_test(&context, ViewportId::ROOT, WindowId::from(29))
+            .unwrap()
+            .finish()
+            .present();
+        assert!(state.service_after_current_requested());
+        assert_eq!(
+            host.outputs.lock()[0].status(),
+            NativeOutputStatus::Presented
+        );
+        state.service(&context);
+        state.service(&context);
+
+        assert!(!state.service_after_current_requested());
+        assert!(!state.take_root_wake_after_current());
+        assert_eq!(repaints.load(Ordering::Relaxed), 0);
+        assert_eq!(context.cumulative_pass_nr(), 0);
+        assert_eq!(current_native_output_token(), None);
+        assert_eq!(host.output_begins.lock().len(), 1);
+        assert_eq!(host.outputs.lock().len(), 1);
+    }
+
+    #[test]
+    fn before_output_input_defers_without_ui_and_only_applies_the_requested_wake() {
+        for wake in [
+            NativeHostWake::Wait,
+            NativeHostWake::ServiceAfterCurrent,
+            NativeHostWake::RepaintRoot,
+            NativeHostWake::RepaintRootAfterCurrent,
+        ] {
+            let host = Arc::new(InputAdmissionHost {
+                admission: NativeOutputInputAdmission::Defer(wake),
+                ..Default::default()
+            });
+            let handler: Arc<dyn NativeHostHandler> = host.clone();
+            let state = NativeHostState::new(Some(handler));
+            let context = egui::Context::default();
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            context.set_request_repaint_callback({
+                let requests = Arc::clone(&requests);
+                move |info| requests.lock().push(info.viewport_id)
+            });
+            let scope = state
+                .begin_output_for_test(&context, ViewportId::ROOT, WindowId::from(25))
+                .expect("the output is accepted before input admission");
+            let token = current_native_output_token().unwrap();
+            let mut input = egui::RawInput {
+                events: vec![egui::Event::Text("buffered text".into())],
+                ..Default::default()
+            };
+            let mut ran_ui = false;
+            if state.before_output_input(&context, true) {
+                let mut output = context.run_ui(input.take(), |_| ran_ui = true);
+                output.textures_delta.clear();
+            }
+            assert!(!ran_ui);
+            assert_eq!(context.cumulative_pass_nr_for(ViewportId::ROOT), 0);
+            assert_eq!(input.events, [egui::Event::Text("buffered text".into())]);
+            assert_eq!(*host.calls.lock(), [(token, true)]);
+            assert!(host.outputs.lock().is_empty());
+            assert_eq!(current_native_output_token(), Some(token));
+
+            drop(scope);
+            assert_eq!(current_native_output_token(), None);
+            assert_eq!(
+                *host.outputs.lock(),
+                [NativeOutputResult {
+                    token,
+                    ordinal: NativeOutputOrdinal(NonZeroU64::MIN),
+                    status: NativeOutputStatus::NotPresented,
+                }]
+            );
+            assert_eq!(
+                *requests.lock(),
+                if wake == NativeHostWake::RepaintRoot {
+                    vec![ViewportId::ROOT]
+                } else {
+                    vec![]
+                }
+            );
+            assert_eq!(
+                state.take_root_wake_after_current(),
+                wake == NativeHostWake::RepaintRootAfterCurrent
+            );
+            assert!(!state.take_root_wake_after_current());
+            assert_eq!(
+                state.service_after_current_requested(),
+                wake == NativeHostWake::ServiceAfterCurrent
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "default_fonts")]
+    fn deferred_input_reaches_the_original_text_edit_once_on_a_later_output() {
+        struct Host(std::sync::atomic::AtomicBool);
+
+        impl NativeHostHandler for Host {
+            fn before_output_input(
+                &self,
+                _: &egui::Context,
+                _: NativeOutputToken,
+                _: bool,
+            ) -> NativeOutputInputAdmission {
+                if self.0.load(std::sync::atomic::Ordering::Relaxed) {
+                    NativeOutputInputAdmission::Defer(NativeHostWake::RepaintRootAfterCurrent)
+                } else {
+                    NativeOutputInputAdmission::Proceed
+                }
+            }
+        }
+
+        let host = Arc::new(Host(std::sync::atomic::AtomicBool::new(true)));
+        let handler: Arc<dyn NativeHostHandler> = host.clone();
+        let state = NativeHostState::new(Some(handler));
+        let context = egui::Context::default();
+        let raw_input = || egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(640.0, 480.0),
+            )),
+            ..Default::default()
+        };
+        let edit_id = egui::Id::unique("deferred-native-text-edit");
+        let mut text = String::new();
+        let mut edit_rect = egui::Rect::NOTHING;
+        let mut output = context.run_ui(raw_input(), |ui| {
+            edit_rect = ui
+                .add(egui::TextEdit::singleline(&mut text).id(edit_id))
+                .rect;
+        });
+        output.textures_delta.clear();
+        let mut input = raw_input();
+        input.events = vec![
+            egui::Event::PointerMoved(edit_rect.center()),
+            egui::Event::PointerButton {
+                pos: edit_rect.center(),
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            },
+            egui::Event::PointerButton {
+                pos: edit_rect.center(),
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ];
+        let pass_before = context.cumulative_pass_nr_for(ViewportId::ROOT);
+        let scope = state
+            .begin_output_for_test(&context, ViewportId::ROOT, WindowId::from(25))
+            .unwrap();
+        assert!(!state.before_output_input(&context, true));
+        drop(scope);
+        assert_eq!(input.events.len(), 3);
+        assert_eq!(
+            context.cumulative_pass_nr_for(ViewportId::ROOT),
+            pass_before
+        );
+
+        host.0.store(false, std::sync::atomic::Ordering::Relaxed);
+        let scope = state
+            .begin_output_for_test(&context, ViewportId::ROOT, WindowId::from(25))
+            .unwrap();
+        assert!(state.before_output_input(&context, true));
+        let mut focused = false;
+        let mut output = context.run_ui(input.take(), |ui| {
+            focused = ui
+                .add(egui::TextEdit::singleline(&mut text).id(edit_id))
+                .has_focus();
+        });
+        output.textures_delta.clear();
+        drop(scope);
+        assert!(focused);
+        assert!(input.events.is_empty());
+
+        input.events.push(egui::Event::Text("once".into()));
+        host.0.store(true, std::sync::atomic::Ordering::Relaxed);
+        let pass_before = context.cumulative_pass_nr_for(ViewportId::ROOT);
+        let scope = state
+            .begin_output_for_test(&context, ViewportId::ROOT, WindowId::from(25))
+            .unwrap();
+        assert!(!state.before_output_input(&context, true));
+        drop(scope);
+        assert_eq!(
+            context.cumulative_pass_nr_for(ViewportId::ROOT),
+            pass_before
+        );
+        assert_eq!(input.events, [egui::Event::Text("once".into())]);
+        assert!(text.is_empty());
+
+        host.0.store(false, std::sync::atomic::Ordering::Relaxed);
+        for _ in 0..2 {
+            let scope = state
+                .begin_output_for_test(&context, ViewportId::ROOT, WindowId::from(25))
+                .unwrap();
+            assert!(state.before_output_input(&context, !input.events.is_empty()));
+            let mut output = context.run_ui(input.take(), |ui| {
+                focused = ui
+                    .add(egui::TextEdit::singleline(&mut text).id(edit_id))
+                    .has_focus();
+            });
+            output.textures_delta.clear();
+            drop(scope);
+            assert!(focused);
+            assert_eq!(text, "once");
+        }
+    }
+
+    #[test]
+    fn before_output_input_only_invokes_the_handler_for_its_active_context_token() {
+        let host = Arc::new(InputAdmissionHost::default());
+        let handler: Arc<dyn NativeHostHandler> = host.clone();
+        let state = NativeHostState::new(Some(handler));
+        let context = egui::Context::default();
+        assert!(state.before_output_input(&context, true));
+        assert!(host.calls.lock().is_empty());
+
+        let outer = state
+            .begin_output_for_test(&context, ViewportId::ROOT, WindowId::from(26))
+            .unwrap();
+        let outer_token = current_native_output_token().unwrap();
+        assert!(state.before_output_input(&context, true));
+        assert_eq!(*host.calls.lock(), [(outer_token, true)]);
+
+        let foreign_host = Arc::new(InputAdmissionHost::default());
+        let foreign_handler: Arc<dyn NativeHostHandler> = foreign_host.clone();
+        let foreign_state = NativeHostState::new(Some(foreign_handler));
+        let foreign_context = egui::Context::default();
+        let foreign = foreign_state
+            .begin_output_for_test(&foreign_context, ViewportId::ROOT, WindowId::from(27))
+            .unwrap();
+        let foreign_token = current_native_output_token().unwrap();
+        assert!(!outer_token.same_context(foreign_token));
+        assert!(state.before_output_input(&context, false));
+        assert!(NativeHostState::default().before_output_input(&foreign_context, true));
+        assert_eq!(*host.calls.lock(), [(outer_token, true)]);
+        assert!(foreign_host.calls.lock().is_empty());
+        assert!(foreign_state.before_output_input(&foreign_context, false));
+        assert_eq!(*foreign_host.calls.lock(), [(foreign_token, false)]);
+        drop(foreign);
+
+        assert!(state.before_output_input(&context, false));
+        assert_eq!(
+            *host.calls.lock(),
+            [(outer_token, true), (outer_token, false)]
+        );
+        outer.finish().present();
+        assert!(state.before_output_input(&context, true));
+        assert_eq!(host.calls.lock().len(), 2);
+    }
+
+    #[test]
+    fn before_output_input_defaults_allow_unmanaged_ui_and_existing_host_finalizers() {
+        struct DefaultInputHost;
+        impl NativeHostHandler for DefaultInputHost {}
+        impl NativeOutputPassFinalizer for DefaultInputHost {
+            fn finalize(&self, _finalization: NativeOutputPassFinalization<'_>) -> NativeHostWake {
+                NativeHostWake::Wait
+            }
+        }
+
+        let context = egui::Context::default();
+        let disabled = NativeHostState::default();
+        disabled.service(&context);
+        assert!(!disabled.service_after_current_requested());
+        assert_eq!(
+            NativeHostHandler::on_service(&DefaultInputHost, &context),
+            NativeHostWake::Wait
+        );
+        assert_eq!(
+            NativeOutputPassFinalizer::on_service(&DefaultInputHost, &context),
+            NativeHostWake::Wait
+        );
+        assert!(disabled.before_output_input(&context, true));
+        let mut ui_calls = 0;
+        let mut output = context.run_ui(Default::default(), |_| ui_calls += 1);
+        output.textures_delta.clear();
+
+        let state = NativeHostState::new(Some(Arc::new(DefaultInputHost)));
+        apply_host_wake(
+            state.inner.as_ref().unwrap(),
+            &context,
+            NativeHostWake::ServiceAfterCurrent,
+        );
+        assert!(state.service_after_current_requested());
+        state.service(&context);
+        assert!(!state.service_after_current_requested());
+        let scope = state
+            .begin_output_for_test(&context, ViewportId::ROOT, WindowId::from(28))
+            .unwrap();
+        let token = current_native_output_token().unwrap();
+        assert!(state.before_output_input(&context, true));
+        assert_eq!(
+            NativeOutputPassFinalizer::before_output_input(
+                &DefaultInputHost,
+                &context,
+                token,
+                true
+            ),
+            NativeOutputInputAdmission::Proceed
+        );
+        let mut output = context.run_ui(Default::default(), |_| ui_calls += 1);
+        output.textures_delta.clear();
+        scope.finish().present();
+        assert_eq!(ui_calls, 2);
     }
 
     #[test]

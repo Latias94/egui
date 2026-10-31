@@ -75,6 +75,10 @@ pub fn create_egui_context(storage: Option<&dyn crate::Storage>) -> egui::Contex
 /// The custom even `eframe` uses with the [`winit`] event loop.
 #[derive(Debug)]
 pub enum UserEvent {
+    /// Service retained native host work without an application pass.
+    #[cfg(feature = "native-host-seam")]
+    NativeHostService,
+
     /// A repaint is requested.
     RequestRepaint {
         /// What to repaint.
@@ -104,6 +108,9 @@ pub trait WinitApp {
 
     #[cfg(feature = "native-host-seam")]
     fn native_host_state(&self) -> super::host_seam::NativeHostState;
+
+    #[cfg(feature = "native-host-seam")]
+    fn request_native_host_service(&self);
 
     fn window(&self, window_id: WindowId) -> Option<Arc<Window>>;
 

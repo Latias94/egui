@@ -568,6 +568,14 @@ impl WinitApp for GlowWinitApp<'_> {
         self.native_host.clone()
     }
 
+    #[cfg(feature = "native-host-seam")]
+    fn request_native_host_service(&self) {
+        let _ = self
+            .repaint_proxy
+            .lock()
+            .send_event(UserEvent::NativeHostService);
+    }
+
     fn window(&self, window_id: WindowId) -> Option<Arc<Window>> {
         let running = self.running.as_ref()?;
         let glutin = running.glutin.borrow();
@@ -874,6 +882,29 @@ impl GlowWinitRunning<'_> {
         } else {
             None
         };
+
+        #[cfg(feature = "native-host-seam")]
+        if output_scope.is_some() {
+            let has_input = self.integration.has_pending_ui_input()
+                || self
+                    .glutin
+                    .borrow()
+                    .viewports
+                    .get(&viewport_id)
+                    .and_then(|viewport| viewport.egui_winit.as_ref())
+                    .is_some_and(|egui_winit| {
+                        let input = egui_winit.egui_input();
+                        !input.events.is_empty()
+                            || !input.dropped_files.is_empty()
+                            || !input.hovered_files.is_empty()
+                    });
+            if !self
+                .native_host
+                .before_output_input(&self.integration.egui_ctx, has_input)
+            {
+                return Ok(EventResult::Wait);
+            }
+        }
 
         let raw_input = {
             let mut glutin = self.glutin.borrow_mut();

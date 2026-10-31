@@ -341,6 +341,14 @@ impl EpiIntegration {
         self.app_icon_setter.update();
     }
 
+    /// Reports UI input preserved by a logic-only update without consuming it.
+    #[cfg(feature = "native-host-seam")]
+    pub(crate) fn has_pending_ui_input(&self) -> bool {
+        !self.pending_raw_input.events.is_empty()
+            || !self.pending_raw_input.dropped_files.is_empty()
+            || !self.pending_raw_input.hovered_files.is_empty()
+    }
+
     /// Run user code - this can create immediate viewports, so hold no locks over this!
     ///
     /// If `viewport_ui_cb` is None, we are in the root viewport and will call

@@ -94,6 +94,8 @@ struct WinitAppWrapper<T: WinitApp> {
     native_host: NativeHostState,
     #[cfg(feature = "native-host-seam")]
     native_event_sequence: NativeEventSequencer,
+    #[cfg(feature = "native-host-seam")]
+    native_host_service_queued: bool,
 
     /// Windows we asked to redraw, and when to give up waiting for their `RedrawRequested`.
     windows_redraw_deadlines: HashMap<WindowId, Instant>,
@@ -113,6 +115,8 @@ impl<T: WinitApp> WinitAppWrapper<T> {
             native_host,
             #[cfg(feature = "native-host-seam")]
             native_event_sequence: NativeEventSequencer::default(),
+            #[cfg(feature = "native-host-seam")]
+            native_host_service_queued: false,
             windows_redraw_deadlines: HashMap::default(),
             winit_app,
             return_result: Ok(()),
@@ -193,16 +197,7 @@ impl<T: WinitApp> WinitAppWrapper<T> {
         }
 
         #[cfg(feature = "native-host-seam")]
-        if self.native_host.take_root_wake_after_current()
-            && let Some(ctx) = self.winit_app.egui_ctx()
-        {
-            log::trace!("native host durable root wake queued after the current event");
-            // Renderer terminal callbacks run after egui's pass-local repaint
-            // scheduling. Re-enter through egui's EventLoopProxy-backed
-            // repaint callback so X11 cannot coalesce the request with the
-            // RedrawRequested event which produced this terminal.
-            ctx.request_repaint_of(egui::ViewportId::ROOT);
-        }
+        self.apply_native_host_root_wake();
 
         if save {
             log::debug!("Received an EventResult::Save - saving app state");
@@ -224,6 +219,45 @@ impl<T: WinitApp> WinitAppWrapper<T> {
         }
 
         self.check_redraw_requests(event_loop);
+        #[cfg(feature = "native-host-seam")]
+        self.queue_native_host_service();
+    }
+
+    #[cfg(feature = "native-host-seam")]
+    fn apply_native_host_root_wake(&self) {
+        if self.native_host.take_root_wake_after_current()
+            && let Some(ctx) = self.winit_app.egui_ctx()
+        {
+            log::trace!("native host durable root wake queued after the current event");
+            // Renderer terminal callbacks run after egui's pass-local repaint
+            // scheduling. Re-enter through egui's EventLoopProxy-backed
+            // repaint callback so X11 cannot coalesce the request with the
+            // RedrawRequested event which produced this terminal.
+            ctx.request_repaint_of(egui::ViewportId::ROOT);
+        }
+    }
+
+    #[cfg(feature = "native-host-seam")]
+    fn queue_native_host_service(&mut self) {
+        if !self.native_host_service_queued
+            && self.native_host.service_after_current_requested()
+            && self.winit_app.egui_ctx().is_some()
+        {
+            // Keep this claim until the queued event starts. Other native
+            // events may request service before that event is dispatched.
+            self.native_host_service_queued = true;
+            self.winit_app.request_native_host_service();
+        }
+    }
+
+    #[cfg(feature = "native-host-seam")]
+    fn service_native_host(&mut self) {
+        self.native_host_service_queued = false;
+        if let Some(context) = self.winit_app.egui_ctx() {
+            self.native_host.service(context);
+        }
+        self.apply_native_host_root_wake();
+        self.queue_native_host_service();
     }
 
     fn check_redraw_requests(&mut self, event_loop: &ActiveEventLoop) {
@@ -378,6 +412,8 @@ impl<T: WinitApp> ApplicationHandler<UserEvent> for WinitAppWrapper<T> {
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
         profiling::function_scope!(match &event {
+            #[cfg(feature = "native-host-seam")]
+            UserEvent::NativeHostService => "UserEvent::NativeHostService",
             UserEvent::RequestRepaint { .. } => "UserEvent::RequestRepaint",
             #[cfg(feature = "accesskit")]
             UserEvent::AccessKitActionRequest(_) => "UserEvent::AccessKitActionRequest",
@@ -385,6 +421,14 @@ impl<T: WinitApp> ApplicationHandler<UserEvent> for WinitAppWrapper<T> {
 
         event_loop_context::with_event_loop_context(event_loop, move || {
             let event_result = match event {
+                #[cfg(feature = "native-host-seam")]
+                UserEvent::NativeHostService => {
+                    self.service_native_host();
+                    // Service never enters redraw checks, which may run UI
+                    // for invisible windows or overdue redraws. Repaint wakes
+                    // return through their own ordinary native events.
+                    return;
+                }
                 UserEvent::RequestRepaint {
                     when,
                     cumulative_pass_nr,
@@ -714,4 +758,251 @@ pub enum EframePumpStatus {
 
     /// The exit code for the application
     Exit(i32),
+}
+
+#[cfg(all(test, feature = "native-host-seam"))]
+mod native_host_service_tests {
+    use std::cell::RefCell;
+    use std::collections::VecDeque;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    use super::*;
+    use crate::native::host_seam::{
+        NativeGlobalFocusObservation, NativeHostHandler, NativeHostWake, NativeOutputAdmission,
+        NativeOutputToken, NativeViewportRoster, NativeWindowSnapshot, current_native_output_token,
+    };
+
+    #[derive(Default)]
+    struct ServiceHost {
+        calls: AtomicUsize,
+        retry: AtomicBool,
+    }
+
+    impl NativeHostHandler for ServiceHost {
+        fn on_global_focus(&self, _: NativeGlobalFocusObservation) -> NativeHostWake {
+            NativeHostWake::ServiceAfterCurrent
+        }
+
+        fn on_service(&self, _: &egui::Context) -> NativeHostWake {
+            assert_eq!(current_native_output_token(), None);
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            if self.retry.swap(false, Ordering::Relaxed) {
+                NativeHostWake::ServiceAfterCurrent
+            } else {
+                NativeHostWake::Wait
+            }
+        }
+
+        fn on_output_begin(
+            &self,
+            _: NativeOutputToken,
+            _: NativeWindowSnapshot,
+            _: Option<NativeViewportRoster<'_>>,
+        ) -> NativeOutputAdmission {
+            panic!("service must not open an output scope")
+        }
+    }
+
+    struct ServiceApp {
+        native_host: NativeHostState,
+        context: egui::Context,
+        events: RefCell<VecDeque<UserEvent>>,
+        input: egui::RawInput,
+    }
+
+    impl WinitApp for ServiceApp {
+        fn egui_ctx(&self) -> Option<&egui::Context> {
+            Some(&self.context)
+        }
+
+        fn native_host_state(&self) -> NativeHostState {
+            self.native_host.clone()
+        }
+
+        fn request_native_host_service(&self) {
+            self.events
+                .borrow_mut()
+                .push_back(UserEvent::NativeHostService);
+        }
+
+        fn window(&self, _: WindowId) -> Option<Arc<winit::window::Window>> {
+            panic!("service must not inspect redraw requests")
+        }
+
+        fn window_id_from_viewport_id(&self, _: egui::ViewportId) -> Option<WindowId> {
+            None
+        }
+
+        fn viewport_id_from_window_id(&self, _: WindowId) -> Option<egui::ViewportId> {
+            None
+        }
+
+        fn focused_native_viewport(&self) -> Option<(egui::ViewportId, WindowId)> {
+            None
+        }
+
+        fn save(&mut self) {
+            panic!("service must not save the application")
+        }
+
+        fn save_and_destroy(&mut self) {
+            panic!("service must not destroy the application")
+        }
+
+        fn run_ui_and_paint(
+            &mut self,
+            _: &ActiveEventLoop,
+            _: WindowId,
+            _: PassMode,
+        ) -> crate::Result<EventResult> {
+            panic!("service must not extract input or run application logic or UI")
+        }
+
+        fn suspended(&mut self, _: &ActiveEventLoop) -> crate::Result<EventResult> {
+            unreachable!()
+        }
+
+        fn resumed(&mut self, _: &ActiveEventLoop) -> crate::Result<EventResult> {
+            unreachable!()
+        }
+
+        fn device_event(
+            &mut self,
+            _: &ActiveEventLoop,
+            _: winit::event::DeviceId,
+            _: winit::event::DeviceEvent,
+        ) -> crate::Result<EventResult> {
+            unreachable!()
+        }
+
+        fn window_event(
+            &mut self,
+            _: &ActiveEventLoop,
+            _: WindowId,
+            _: winit::event::WindowEvent,
+        ) -> crate::Result<EventResult> {
+            unreachable!()
+        }
+
+        #[cfg(feature = "accesskit")]
+        fn on_accesskit_event(
+            &mut self,
+            _: egui_winit::accesskit_winit::Event,
+        ) -> crate::Result<EventResult> {
+            unreachable!()
+        }
+    }
+
+    fn fixture() -> (Arc<ServiceHost>, WinitAppWrapper<ServiceApp>) {
+        #[derive(Debug)]
+        struct BufferedFile;
+
+        impl egui::DroppedFile for BufferedFile {
+            fn path(&self) -> &std::path::Path {
+                std::path::Path::new("buffered-file.txt")
+            }
+
+            fn bytes(&self) -> Result<Vec<u8>, String> {
+                panic!("host service must not read a buffered dropped file")
+            }
+        }
+
+        let host = Arc::new(ServiceHost::default());
+        let native_host = NativeHostState::new(Some(host.clone()));
+        let context = egui::Context::default();
+        let mut output = context.run_ui(Default::default(), |_| {});
+        output.textures_delta.clear();
+        let app = ServiceApp {
+            native_host,
+            context,
+            events: RefCell::default(),
+            input: egui::RawInput {
+                events: vec![egui::Event::Text("buffered input".into())],
+                hovered_files: vec![egui::HoveredFile::default()],
+                dropped_files: vec![Arc::new(BufferedFile)],
+                ..Default::default()
+            },
+        };
+        (host, WinitAppWrapper::new(app, true))
+    }
+
+    fn request_service(wrapper: &mut WinitAppWrapper<ServiceApp>) {
+        let ordinal = wrapper.native_event_sequence.next();
+        wrapper
+            .native_host
+            .observe_global_focus(Some(&wrapper.winit_app.context), ordinal, None);
+        wrapper.queue_native_host_service();
+    }
+
+    fn dispatch_service(wrapper: &mut WinitAppWrapper<ServiceApp>) {
+        assert!(matches!(
+            wrapper.winit_app.events.borrow_mut().pop_front(),
+            Some(UserEvent::NativeHostService)
+        ));
+        wrapper.service_native_host();
+    }
+
+    #[test]
+    fn queued_service_coalesces_requests_and_preserves_ui_input_and_pass_number() {
+        let (host, mut wrapper) = fixture();
+        let pass = wrapper.winit_app.context.cumulative_pass_nr();
+        let window = WindowId::from(1);
+        let overdue = Instant::now() - Duration::from_secs(1);
+        wrapper.windows_next_repaint_times.insert(window, overdue);
+        wrapper.windows_redraw_deadlines.insert(window, overdue);
+
+        for _ in 0..3 {
+            request_service(&mut wrapper);
+            assert_eq!(wrapper.winit_app.events.borrow().len(), 1);
+            assert!(wrapper.native_host_service_queued);
+            assert!(wrapper.native_host.service_after_current_requested());
+            assert_eq!(host.calls.load(Ordering::Relaxed), 0);
+        }
+        dispatch_service(&mut wrapper);
+        wrapper.queue_native_host_service();
+        wrapper.service_native_host();
+
+        assert_eq!(host.calls.load(Ordering::Relaxed), 1);
+        assert!(!wrapper.native_host_service_queued);
+        assert!(!wrapper.native_host.service_after_current_requested());
+        assert!(wrapper.winit_app.events.borrow().is_empty());
+        assert_eq!(wrapper.winit_app.context.cumulative_pass_nr(), pass);
+        assert_eq!(
+            wrapper.winit_app.input.events,
+            [egui::Event::Text("buffered input".into())]
+        );
+        assert_eq!(wrapper.winit_app.input.hovered_files.len(), 1);
+        assert_eq!(wrapper.winit_app.input.dropped_files.len(), 1);
+        assert_eq!(
+            wrapper.windows_next_repaint_times.get(&window),
+            Some(&overdue)
+        );
+        assert_eq!(
+            wrapper.windows_redraw_deadlines.get(&window),
+            Some(&overdue)
+        );
+        assert_eq!(current_native_output_token(), None);
+    }
+
+    #[test]
+    fn service_retry_waits_for_a_later_event_and_keeps_one_queue_claim() {
+        let (host, mut wrapper) = fixture();
+        host.retry.store(true, Ordering::Relaxed);
+        request_service(&mut wrapper);
+        dispatch_service(&mut wrapper);
+
+        assert_eq!(host.calls.load(Ordering::Relaxed), 1);
+        assert!(wrapper.native_host_service_queued);
+        assert!(wrapper.native_host.service_after_current_requested());
+        assert_eq!(wrapper.winit_app.events.borrow().len(), 1);
+        request_service(&mut wrapper);
+        assert_eq!(wrapper.winit_app.events.borrow().len(), 1);
+
+        dispatch_service(&mut wrapper);
+        assert_eq!(host.calls.load(Ordering::Relaxed), 2);
+        assert!(!wrapper.native_host_service_queued);
+        assert!(!wrapper.native_host.service_after_current_requested());
+        assert!(wrapper.winit_app.events.borrow().is_empty());
+    }
 }
