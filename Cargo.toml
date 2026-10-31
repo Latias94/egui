@@ -170,10 +170,10 @@ webbrowser = "1.2.4" # 1.2.2 fixes RUSTSEC-2026-0257 (`BROWSER` argument injecti
 # `wgpu` is held at 30.0.0 in `Cargo.lock`: 30.0.1 needs wasm-bindgen-futures 0.4.77, which would force a wasm-bindgen bump
 wgpu = { version = "30.0", default-features = false, features = ["std"] }
 windows-sys = "0.61.2"
-winit = { git = "https://github.com/Latias94/winit.git", rev = "f378b50f29cafafec31cd8675c17646b4ef57d70", version = "0.30.13", default-features = false }
+winit = { git = "https://github.com/Latias94/winit.git", rev = "3084fc09a7dca269d41d7aaa955369e365db6a71", version = "0.30.13", default-features = false }
 
 [patch.crates-io]
-winit = { git = "https://github.com/Latias94/winit.git", rev = "f378b50f29cafafec31cd8675c17646b4ef57d70" }
+winit = { git = "https://github.com/Latias94/winit.git", rev = "3084fc09a7dca269d41d7aaa955369e365db6a71" }
 
 [workspace.lints.rust]
 unsafe_code = "deny"
