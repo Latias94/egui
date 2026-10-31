@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex, PoisonError, Weak};
 use egui::{ViewportBuilder, ViewportId};
 #[cfg(target_os = "linux")]
 use raw_window_handle::{HasDisplayHandle as _, HasWindowHandle as _};
-use winit::event::{DeviceId, PointerEventFacts, PointerWindowRoute};
+use winit::event::{DeviceId, PointerEventFacts, PointerPressToken, PointerWindowRoute};
 use winit::event_loop::ActiveEventLoop;
 #[cfg(all(target_os = "linux", feature = "x11"))]
 use winit::platform::x11::{ActiveEventLoopExtX11 as _, WindowExtX11 as _, X11PointerObservation};
@@ -1248,10 +1248,15 @@ impl NativeViewportPointerObservationResult {
         expected_window_id: WindowId,
         device_id: DeviceId,
         actual_window_id: WindowId,
-        observe: impl FnOnce(WindowId, DeviceId) -> NativeViewportPointerObservation,
+        expected_press: Option<&PointerPressToken>,
+        observe: impl FnOnce(
+            WindowId,
+            DeviceId,
+            Option<&PointerPressToken>,
+        ) -> NativeViewportPointerObservation,
     ) -> Self {
         let observation = if actual_window_id == expected_window_id {
-            observe(expected_window_id, device_id)
+            observe(expected_window_id, device_id, expected_press)
         } else {
             NativeViewportPointerObservation::Unavailable
         };
@@ -1310,7 +1315,7 @@ pub enum NativeViewportPropertyCommandRetirement {
     },
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum QueuedNativeViewportPropertyCommand {
     Focus(NativeViewportFocusCommandToken),
     Visibility {
@@ -1325,6 +1330,7 @@ enum QueuedNativeViewportPropertyCommand {
         token: NativeViewportPointerObservationCommandToken,
         expected_window_id: WindowId,
         device_id: DeviceId,
+        expected_press: Option<PointerPressToken>,
     },
 }
 
@@ -1422,10 +1428,14 @@ pub fn prepare_native_viewport_pointer_passthrough(
 ///
 /// Reserve the token's terminal owner before enqueueing. The core continuation identity remains
 /// owned by the host and is not sent to the native backend.
+/// `expected_press` freezes the original native Primary identity in this command. `None` requests
+/// ordinary position/hover observation. The result's command token identifies this immutable
+/// request; neither the result nor retirement repeats the press identity.
 pub fn prepare_native_viewport_pointer_observation(
     viewport_id: ViewportId,
     expected_window_id: WindowId,
     device_id: DeviceId,
+    expected_press: Option<PointerPressToken>,
 ) -> PreparedNativeViewportCommand<NativeViewportPointerObservationCommandToken> {
     let token = NativeViewportPointerObservationCommandToken(next_non_zero(
         &NEXT_POINTER_OBSERVATION_COMMAND,
@@ -1438,6 +1448,7 @@ pub fn prepare_native_viewport_pointer_observation(
             token,
             expected_window_id,
             device_id,
+            expected_press,
         },
     }
 }
@@ -1453,14 +1464,21 @@ pub fn prepare_native_viewport_pointer_observation(
 /// budget and continuation checks before using an observation; neither the request identity nor
 /// hover may fill missing capture or delivery. Queue ordering, attachment and retirement rules
 /// match [`queue_native_viewport_focus`].
+/// A supplied `expected_press` must still match the backend's original Primary identity when
+/// queried. Matching it does not promote unknown capture or delivery to an authoritative route.
 pub fn queue_native_viewport_pointer_observation(
     ctx: &egui::Context,
     viewport_id: ViewportId,
     expected_window_id: WindowId,
     device_id: DeviceId,
+    expected_press: Option<PointerPressToken>,
 ) -> NativeViewportPointerObservationCommandToken {
-    let command =
-        prepare_native_viewport_pointer_observation(viewport_id, expected_window_id, device_id);
+    let command = prepare_native_viewport_pointer_observation(
+        viewport_id,
+        expected_window_id,
+        device_id,
+        expected_press,
+    );
     let token = command.token();
     command.enqueue(ctx);
     token
@@ -2753,6 +2771,7 @@ impl NativeHostState {
                 token,
                 expected_window_id,
                 device_id,
+                expected_press,
             } => NativeViewportPropertyResult::PointerObservation(
                 NativeViewportPointerObservationResult::observe_with(
                     token,
@@ -2760,8 +2779,14 @@ impl NativeHostState {
                     expected_window_id,
                     device_id,
                     window.id(),
-                    |expected_window_id, device_id| {
-                        observe_native_pointer(event_loop, expected_window_id, device_id)
+                    expected_press.as_ref(),
+                    |expected_window_id, device_id, expected_press| {
+                        observe_native_pointer(
+                            event_loop,
+                            expected_window_id,
+                            device_id,
+                            expected_press,
+                        )
                     },
                 ),
             ),
@@ -3279,6 +3304,7 @@ impl NativeHostStateInner {
                     token,
                     expected_window_id,
                     device_id,
+                    ..
                 } => NativeViewportPropertyCommandRetirement::PointerObservation {
                     viewport_id,
                     token,
@@ -3390,13 +3416,14 @@ fn observe_native_pointer(
     event_loop: Option<&ActiveEventLoop>,
     expected_window_id: WindowId,
     device_id: DeviceId,
+    expected_press: Option<&PointerPressToken>,
 ) -> NativeViewportPointerObservation {
     let Some(event_loop) = event_loop else {
         return NativeViewportPointerObservation::Unavailable;
     };
     #[cfg(all(target_os = "linux", feature = "x11"))]
     {
-        match event_loop.observe_pointer(expected_window_id, device_id) {
+        match event_loop.observe_pointer(expected_window_id, device_id, expected_press) {
             X11PointerObservation::Observed { facts, delivery } => {
                 NativeViewportPointerObservation::Observed { facts, delivery }
             }
@@ -3406,7 +3433,7 @@ fn observe_native_pointer(
     }
     #[cfg(not(all(target_os = "linux", feature = "x11")))]
     {
-        let _ = (event_loop, expected_window_id, device_id);
+        let _ = (event_loop, expected_window_id, device_id, expected_press);
         NativeViewportPointerObservation::Unsupported
     }
 }
@@ -3448,7 +3475,7 @@ mod pointer_observation_tests {
             self.retirements.lock().push(retirement);
             if let Some((ctx, viewport, window, device)) = self.requeue.lock().take() {
                 *self.successor.lock() = Some(queue_native_viewport_pointer_observation(
-                    &ctx, viewport, window, device,
+                    &ctx, viewport, window, device, None,
                 ));
             }
             NativeHostWake::RepaintRootAfterCurrent
@@ -3483,6 +3510,7 @@ mod pointer_observation_tests {
                     token,
                     expected_window_id,
                     device_id,
+                    expected_press,
                 } = command
                 else {
                     panic!("only pointer observations may execute in this fixture");
@@ -3494,7 +3522,14 @@ mod pointer_observation_tests {
                         expected_window_id,
                         device_id,
                         actual_window,
-                        &mut observe,
+                        expected_press.as_ref(),
+                        |window, device, expected_press| {
+                            assert!(
+                                expected_press.is_none(),
+                                "this model requests ordinary observation"
+                            );
+                            observe(window, device)
+                        },
                     ),
                 )
             },
@@ -3512,10 +3547,11 @@ mod pointer_observation_tests {
             viewport,
             window,
             device,
+            None,
         );
-        let prepared = prepare_native_viewport_pointer_observation(viewport, window, device);
+        let prepared = prepare_native_viewport_pointer_observation(viewport, window, device, None);
         let token = prepared.token();
-        let rejected = prepare_native_viewport_pointer_observation(viewport, window, device);
+        let rejected = prepare_native_viewport_pointer_observation(viewport, window, device, None);
         assert_ne!(token, unattached);
         assert_ne!(rejected.token(), token);
         drop(rejected);
@@ -3569,10 +3605,11 @@ mod pointer_observation_tests {
                 delivery: PointerWindowRoute::Foreign,
             },
         ];
-        let tokens = observations
-            .map(|_| queue_native_viewport_pointer_observation(&ctx, viewport, window, device));
+        let tokens = observations.map(|_| {
+            queue_native_viewport_pointer_observation(&ctx, viewport, window, device, None)
+        });
         let other_token =
-            queue_native_viewport_pointer_observation(&ctx, other, other_window, device);
+            queue_native_viewport_pointer_observation(&ctx, other, other_window, device, None);
         let mut sampled = 0;
         dispatch(
             &state,
@@ -3631,7 +3668,7 @@ mod pointer_observation_tests {
             facts,
             delivery: PointerWindowRoute::Unknown,
         };
-        let token = queue_native_viewport_pointer_observation(&ctx, viewport, window, device);
+        let token = queue_native_viewport_pointer_observation(&ctx, viewport, window, device, None);
 
         dispatch(
             &state,
@@ -3673,7 +3710,8 @@ mod pointer_observation_tests {
         let inner = state.inner.as_ref().unwrap();
         inner.capture_window_input_state(viewport, original);
         inner.capture_window_input_state(viewport, replacement);
-        let token = queue_native_viewport_pointer_observation(&ctx, viewport, original, device);
+        let token =
+            queue_native_viewport_pointer_observation(&ctx, viewport, original, device, None);
 
         state.forget_presented_window(viewport, original);
         assert!(host.retirements.lock().is_empty());
@@ -3696,10 +3734,15 @@ mod pointer_observation_tests {
         let (host, state, ctx) = fixture();
         let viewport = ViewportId::ROOT;
         let window = WindowId::from(141);
-        let token =
-            queue_native_viewport_pointer_observation(&ctx, viewport, window, DeviceId::dummy());
+        let token = queue_native_viewport_pointer_observation(
+            &ctx,
+            viewport,
+            window,
+            DeviceId::dummy(),
+            None,
+        );
         dispatch(&state, &ctx, viewport, window, |expected, device| {
-            observe_native_pointer(None, expected, device)
+            observe_native_pointer(None, expected, device, None)
         });
         dispatch(&state, &ctx, viewport, window, |_, _| {
             panic!("an unavailable observation must not retry itself")
@@ -3730,10 +3773,13 @@ mod pointer_observation_tests {
                 .as_ref()
                 .unwrap()
                 .capture_window_input_state(viewport, window);
-            let first = queue_native_viewport_pointer_observation(&ctx, viewport, window, device);
+            let first =
+                queue_native_viewport_pointer_observation(&ctx, viewport, window, device, None);
             let focus = queue_native_viewport_focus(&ctx, viewport);
-            let second = queue_native_viewport_pointer_observation(&ctx, viewport, window, device);
-            let surviving = queue_native_viewport_pointer_observation(&ctx, other, window, device);
+            let second =
+                queue_native_viewport_pointer_observation(&ctx, viewport, window, device, None);
+            let surviving =
+                queue_native_viewport_pointer_observation(&ctx, other, window, device, None);
             let pending = state.with_pending_viewport_property_targets(Default::default());
             assert!(pending.contains_key(&viewport));
             assert!(pending.contains_key(&other));
@@ -3785,7 +3831,8 @@ mod pointer_observation_tests {
         let viewport = ViewportId::ROOT;
         let window = WindowId::from(141);
         let device = DeviceId::dummy();
-        let retired = queue_native_viewport_pointer_observation(&ctx, viewport, window, device);
+        let retired =
+            queue_native_viewport_pointer_observation(&ctx, viewport, window, device, None);
         *host.requeue.lock() = Some((ctx.clone(), viewport, window, device));
 
         state.forget_presented_viewport(viewport);

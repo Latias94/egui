@@ -92,7 +92,7 @@ fn apply_stub(
     command: QueuedNativeViewportPropertyCommand,
 ) -> NativeViewportPropertyResult {
     let window_id = WindowId::from(41);
-    host.trace.lock().push(Trace::Applied(command));
+    host.trace.lock().push(Trace::Applied(command.clone()));
     match command {
         QueuedNativeViewportPropertyCommand::Focus(token) => {
             NativeViewportPropertyResult::Focus(NativeViewportFocusResult {
@@ -126,6 +126,7 @@ fn apply_stub(
             token,
             expected_window_id,
             device_id,
+            expected_press,
         } => NativeViewportPropertyResult::PointerObservation(
             NativeViewportPointerObservationResult::observe_with(
                 token,
@@ -133,7 +134,10 @@ fn apply_stub(
                 expected_window_id,
                 device_id,
                 window_id,
-                |expected, device| observe_native_pointer(None, expected, device),
+                expected_press.as_ref(),
+                |expected, device, expected_press| {
+                    observe_native_pointer(None, expected, device, expected_press)
+                },
             ),
         ),
     }
@@ -268,7 +272,7 @@ fn typed_properties_execute_and_callback_in_one_per_viewport_order() {
     let trace = host.trace.lock();
     assert_eq!(trace.len(), expected.len() * 2);
     for (pair, expected) in trace.chunks_exact(2).zip(expected) {
-        assert_eq!(pair[0], Trace::Applied(expected));
+        assert_eq!(pair[0], Trace::Applied(expected.clone()));
         match (expected, &pair[1]) {
             (
                 QueuedNativeViewportPropertyCommand::Focus(token),
@@ -601,7 +605,7 @@ fn old_window_forget_preserves_replacement_property_commands() {
     let applied: Vec<_> = trace
         .iter()
         .filter_map(|entry| match entry {
-            Trace::Applied(command) => Some(*command),
+            Trace::Applied(command) => Some(command.clone()),
             _ => None,
         })
         .collect();
