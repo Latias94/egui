@@ -4105,6 +4105,7 @@ mod tests {
             ..PointerEventFacts::default()
         };
         let event = WindowEvent::MouseInput {
+            primary_press: None,
             device_id: DeviceId::dummy(),
             state: ElementState::Released,
             button: MouseButton::Left,
@@ -4141,12 +4142,14 @@ mod tests {
         let window = WindowId::from(31);
         let device = DeviceId::dummy();
         let press = winit::event::WindowEvent::MouseInput {
+            primary_press: None,
             device_id: device,
             state: ElementState::Pressed,
             button: MouseButton::Left,
             facts: PointerEventFacts::default(),
         };
         let release = winit::event::WindowEvent::MouseInput {
+            primary_press: None,
             device_id: device,
             state: ElementState::Released,
             button: MouseButton::Left,
@@ -4521,6 +4524,7 @@ mod tests {
         };
 
         let release = WindowEvent::MouseInput {
+            primary_press: None,
             device_id: DeviceId::dummy(),
             state: ElementState::Released,
             button: MouseButton::Left,
@@ -4529,6 +4533,7 @@ mod tests {
         state.observe_window_event(None, sequencer.next(), first_window, None, None, &release);
 
         let press = WindowEvent::MouseInput {
+            primary_press: None,
             device_id: DeviceId::dummy(),
             state: ElementState::Pressed,
             button: MouseButton::Left,
@@ -4573,6 +4578,7 @@ mod tests {
         let child_viewport = ViewportId::from_hash_of("secondary-wake");
         let facts = PointerEventFacts::default();
         let event = WindowEvent::MouseInput {
+            primary_press: None,
             device_id: DeviceId::dummy(),
             state: ElementState::Pressed,
             button: MouseButton::Left,
