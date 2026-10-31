@@ -368,6 +368,13 @@ pub struct NativeOutputPassFinalization<'a> {
 }
 
 impl<'a> NativeOutputPassFinalization<'a> {
+    /// Returns the frozen pass disposition without consuming the finalization.
+    ///
+    /// Wrapping hosts can inspect it before forwarding the same affine output.
+    pub const fn disposition(&self) -> egui::OutputPassDisposition {
+        self.disposition
+    }
+
     /// Decomposes the finalization into its exact host-owned facts.
     pub fn into_parts(
         self,
