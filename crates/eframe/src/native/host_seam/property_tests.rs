@@ -94,6 +94,9 @@ fn apply_stub(
     let window_id = WindowId::from(41);
     host.trace.lock().push(Trace::Applied(command.clone()));
     match command {
+        QueuedNativeViewportPropertyCommand::PointerCapture(_) => {
+            panic!("capture commands use pointer_capture_tests")
+        }
         QueuedNativeViewportPropertyCommand::Focus(token) => {
             NativeViewportPropertyResult::Focus(NativeViewportFocusResult {
                 token,

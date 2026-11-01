@@ -16,14 +16,24 @@ use raw_window_handle::{HasDisplayHandle as _, HasWindowHandle as _};
 use winit::event::{DeviceId, PointerEventFacts, PointerPressToken, PointerWindowRoute};
 use winit::event_loop::ActiveEventLoop;
 #[cfg(all(target_os = "linux", feature = "x11"))]
-use winit::platform::x11::{ActiveEventLoopExtX11 as _, WindowExtX11 as _, X11PointerObservation};
+use winit::platform::x11::{
+    ActiveEventLoopExtX11 as _, WindowExtX11 as _, X11PointerCaptureAcquisition,
+    X11PointerCaptureRelease, X11PointerObservation,
+};
 use winit::window::{Window, WindowAttributes, WindowId};
 
 #[cfg(test)]
 mod close_tests;
 #[cfg(test)]
+mod pointer_capture_tests;
+#[cfg(test)]
 mod property_tests;
 mod work_area;
+
+#[cfg(test)]
+use pointer_capture_tests::PressIdentity as NativePointerCapturePress;
+#[cfg(not(test))]
+type NativePointerCapturePress = PointerPressToken;
 
 use work_area::OwnedNativeWorkAreaRoster;
 pub use work_area::{NativeDisplayId, NativeWorkAreaRecord, NativeWorkAreaRoster};
@@ -33,6 +43,7 @@ static NEXT_FOCUS_COMMAND: AtomicU64 = AtomicU64::new(1);
 static NEXT_VISIBILITY_COMMAND: AtomicU64 = AtomicU64::new(1);
 static NEXT_POINTER_PASSTHROUGH_COMMAND: AtomicU64 = AtomicU64::new(1);
 static NEXT_POINTER_OBSERVATION_COMMAND: AtomicU64 = AtomicU64::new(1);
+static NEXT_POINTER_CAPTURE_COMMAND: AtomicU64 = AtomicU64::new(1);
 
 thread_local! {
     static ACTIVE_OUTPUTS: RefCell<Vec<ActiveNativeOutput>> = const { RefCell::new(Vec::new()) };
@@ -1173,9 +1184,10 @@ impl NativeViewportPointerPassthroughResult {
 ///
 /// Observed facts belong to one backend observation. Eframe never fills missing facts from
 /// cached input or later window queries. `Observed` does not imply complete capture facts,
-/// continuity of an earlier press, or support for stationary pointer continuation. The current
-/// X11 backend reports capture and delivery as [`PointerWindowRoute::Unknown`], even when it can
-/// query the requested device's position and hover. Eframe forwards those unknown routes unchanged.
+/// continuity of an earlier press, or support for stationary pointer continuation. The X11
+/// backend can report known capture/delivery only after independently refreshing an exact active
+/// explicit capture for the original press. Ordinary and implicit-only queries keep those routes
+/// [`PointerWindowRoute::Unknown`]. Eframe forwards every backend classification unchanged.
 /// This does not grant application pointer ownership or acknowledge a continuation token; the
 /// host must process the result through its ordered ingress.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -1270,6 +1282,140 @@ impl NativeViewportPointerObservationResult {
     }
 }
 
+/// One explicit native pointer capture operation for an original Primary press.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NativeViewportPointerCaptureAction {
+    /// Attempts to acquire source-directed native capture.
+    Acquire,
+    /// Releases only the capture tied to the exact original press.
+    Release,
+}
+
+/// The outcome of one bounded native pointer capture command.
+///
+/// Each command reports once. `Pending` leaves the request unsettled; acquisition may not yet
+/// have dispatched a native operation, while a pending release retains its exact cleanup duty.
+/// The host must drain normal events and prepare another command with the same original press
+/// token to poll it. Eframe never polls or retries internally.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NativeViewportPointerCaptureStatus {
+    /// Acquisition is not settled, or the exact release duty is still pending.
+    ///
+    /// Pending acquisition does not prove that a native operation ran or capture was acquired.
+    Pending,
+    /// The backend accepted acquisition and completed its normal FIFO fence.
+    ///
+    /// This does not prove fresh pointer routing or uninterrupted capture.
+    Acquired,
+    /// The exact native release completed.
+    Released,
+    /// The original press cannot acquire capture, or has no current release duty.
+    Unavailable,
+    /// The active backend does not support this operation.
+    Unsupported,
+    /// No backend operation ran because the window mismatched or no active event loop existed.
+    ///
+    /// This says nothing about an earlier native operation or its remaining cleanup duty.
+    NotExecuted,
+}
+
+/// Opaque identity for one host-owned native pointer capture command.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct NativeViewportPointerCaptureCommandToken(NonZeroU64);
+
+/// The correlated result of one bounded native pointer capture command.
+///
+/// The expected window and device identify the frozen request, not observed pointer routes.
+/// The command token correlates the original press without repeating its native identity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NativeViewportPointerCaptureResult {
+    token: NativeViewportPointerCaptureCommandToken,
+    viewport_id: ViewportId,
+    expected_window_id: WindowId,
+    device_id: DeviceId,
+    action: NativeViewportPointerCaptureAction,
+    status: NativeViewportPointerCaptureStatus,
+}
+
+impl NativeViewportPointerCaptureResult {
+    /// Returns the exact command which produced this result.
+    pub const fn token(self) -> NativeViewportPointerCaptureCommandToken {
+        self.token
+    }
+
+    /// Returns the requested eframe viewport.
+    pub const fn viewport_id(self) -> ViewportId {
+        self.viewport_id
+    }
+
+    /// Returns the native window expected by the frozen request.
+    pub const fn expected_window_id(self) -> WindowId {
+        self.expected_window_id
+    }
+
+    /// Returns the window-input device requested by the host.
+    pub const fn device_id(self) -> DeviceId {
+        self.device_id
+    }
+
+    /// Returns whether the command requested acquisition or release.
+    pub const fn action(self) -> NativeViewportPointerCaptureAction {
+        self.action
+    }
+
+    /// Returns this command's single backend outcome or explicit non-execution.
+    pub const fn status(self) -> NativeViewportPointerCaptureStatus {
+        self.status
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct NativeViewportPointerCaptureCommand<Press> {
+    token: NativeViewportPointerCaptureCommandToken,
+    expected_window_id: WindowId,
+    device_id: DeviceId,
+    expected_press: Press,
+    action: NativeViewportPointerCaptureAction,
+}
+
+impl<Press> NativeViewportPointerCaptureCommand<Press> {
+    fn execute_with<EventLoop>(
+        self,
+        viewport_id: ViewportId,
+        actual_window_id: WindowId,
+        event_loop: Option<&EventLoop>,
+        execute: impl FnOnce(
+            &EventLoop,
+            WindowId,
+            DeviceId,
+            &Press,
+            NativeViewportPointerCaptureAction,
+        ) -> NativeViewportPointerCaptureStatus,
+    ) -> NativeViewportPointerCaptureResult {
+        let status = if actual_window_id != self.expected_window_id {
+            NativeViewportPointerCaptureStatus::NotExecuted
+        } else if let Some(event_loop) = event_loop {
+            execute(
+                event_loop,
+                self.expected_window_id,
+                self.device_id,
+                &self.expected_press,
+                self.action,
+            )
+        } else {
+            NativeViewportPointerCaptureStatus::NotExecuted
+        };
+        NativeViewportPointerCaptureResult {
+            token: self.token,
+            viewport_id,
+            expected_window_id: self.expected_window_id,
+            device_id: self.device_id,
+            action: self.action,
+            status,
+        }
+    }
+}
+
 /// Exact terminal identity of a pending property command retired before execution.
 ///
 /// The viewport or its window was forgotten while the command remained queued. This reports
@@ -1313,6 +1459,19 @@ pub enum NativeViewportPropertyCommandRetirement {
         /// Window-input device from the request.
         device_id: DeviceId,
     },
+    /// One queued pointer capture command was retired without invoking the backend.
+    PointerCapture {
+        /// Target viewport of the retired command.
+        viewport_id: ViewportId,
+        /// Exact token returned when the command was prepared.
+        token: NativeViewportPointerCaptureCommandToken,
+        /// Expected native window from the frozen request.
+        expected_window_id: WindowId,
+        /// Window-input device from the request.
+        device_id: DeviceId,
+        /// The requested acquisition or release.
+        action: NativeViewportPointerCaptureAction,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1332,6 +1491,7 @@ enum QueuedNativeViewportPropertyCommand {
         device_id: DeviceId,
         expected_press: Option<PointerPressToken>,
     },
+    PointerCapture(NativeViewportPointerCaptureCommand<NativePointerCapturePress>),
 }
 
 #[derive(Default)]
@@ -1345,6 +1505,7 @@ enum NativeViewportPropertyResult {
     Visibility(NativeViewportVisibilityResult),
     PointerPassthrough(NativeViewportPointerPassthroughResult),
     PointerObservation(NativeViewportPointerObservationResult),
+    PointerCapture(NativeViewportPointerCaptureResult),
 }
 
 /// One prepared host command whose terminal owner can be reserved before enqueueing.
@@ -1450,6 +1611,63 @@ pub fn prepare_native_viewport_pointer_observation(
             device_id,
             expected_press,
         },
+    }
+}
+
+/// Prepares one bounded native pointer capture command without enqueueing it.
+///
+/// Reserve the token's terminal owner before enqueueing. The window, device, action and original
+/// `expected_press` are frozen in the command. Both acquisition and release require the current
+/// native window to equal `expected_window_id`; otherwise the result is `NotExecuted`. Execution
+/// without an active event loop is also `NotExecuted`, and non-X11 backends are `Unsupported`.
+///
+/// Results arrive through [`NativeHostHandler::on_viewport_pointer_capture`]. A `Pending` result
+/// consumes this command exactly once. The host owns any later poll: drain normal native events,
+/// then prepare a new command using the same original press token. No later press may replace it.
+/// Acquisition does not prove fresh capture/delivery facts or stationary continuation eligibility.
+/// Queue ordering, attachment, missing-window and retirement rules match
+/// [`queue_native_viewport_focus`].
+pub fn prepare_native_viewport_pointer_capture(
+    viewport_id: ViewportId,
+    expected_window_id: WindowId,
+    device_id: DeviceId,
+    expected_press: PointerPressToken,
+    action: NativeViewportPointerCaptureAction,
+) -> PreparedNativeViewportCommand<NativeViewportPointerCaptureCommandToken> {
+    #[cfg(test)]
+    let expected_press = expected_press.into();
+    prepare_native_viewport_pointer_capture_with(
+        viewport_id,
+        expected_window_id,
+        device_id,
+        expected_press,
+        action,
+    )
+}
+
+fn prepare_native_viewport_pointer_capture_with(
+    viewport_id: ViewportId,
+    expected_window_id: WindowId,
+    device_id: DeviceId,
+    expected_press: NativePointerCapturePress,
+    action: NativeViewportPointerCaptureAction,
+) -> PreparedNativeViewportCommand<NativeViewportPointerCaptureCommandToken> {
+    let token = NativeViewportPointerCaptureCommandToken(next_non_zero(
+        &NEXT_POINTER_CAPTURE_COMMAND,
+        "native pointer capture command identity exhausted",
+    ));
+    PreparedNativeViewportCommand {
+        token,
+        viewport_id,
+        command: QueuedNativeViewportPropertyCommand::PointerCapture(
+            NativeViewportPointerCaptureCommand {
+                token,
+                expected_window_id,
+                device_id,
+                expected_press,
+                action,
+            },
+        ),
     }
 }
 
@@ -1681,6 +1899,18 @@ pub trait NativeHostHandler: Send + Sync + 'static {
     fn on_viewport_pointer_observation(
         &self,
         _result: NativeViewportPointerObservationResult,
+    ) -> NativeHostWake {
+        NativeHostWake::Wait
+    }
+
+    /// Reports the single result of one exact native pointer capture command.
+    ///
+    /// `Pending` requires host-driven polling with the original press token and never causes
+    /// an internal retry. Acquisition may not yet have dispatched; release retains its exact
+    /// cleanup duty. Copy the result into host-owned ordered ingress.
+    fn on_viewport_pointer_capture(
+        &self,
+        _result: NativeViewportPointerCaptureResult,
     ) -> NativeHostWake {
         NativeHostWake::Wait
     }
@@ -2697,6 +2927,9 @@ impl NativeHostState {
                 NativeViewportPropertyResult::PointerObservation(result) => {
                     self.notify_viewport_pointer_observation(ctx, result);
                 }
+                NativeViewportPropertyResult::PointerCapture(result) => {
+                    self.notify_viewport_pointer_capture(ctx, result);
+                }
             }
         }
     }
@@ -2790,7 +3023,38 @@ impl NativeHostState {
                     },
                 ),
             ),
+            QueuedNativeViewportPropertyCommand::PointerCapture(command) => {
+                NativeViewportPropertyResult::PointerCapture(command.execute_with(
+                    viewport_id,
+                    window.id(),
+                    event_loop,
+                    |event_loop, expected_window_id, device_id, expected_press, action| {
+                        capture_native_pointer(
+                            event_loop,
+                            expected_window_id,
+                            device_id,
+                            expected_press,
+                            action,
+                        )
+                    },
+                ))
+            }
         }
+    }
+
+    fn notify_viewport_pointer_capture(
+        &self,
+        ctx: &egui::Context,
+        result: NativeViewportPointerCaptureResult,
+    ) {
+        let Some(inner) = &self.inner else {
+            return;
+        };
+        apply_host_wake(
+            inner,
+            ctx,
+            inner.handler.on_viewport_pointer_capture(result),
+        );
     }
 
     fn notify_viewport_pointer_observation(
@@ -3311,6 +3575,15 @@ impl NativeHostStateInner {
                     expected_window_id,
                     device_id,
                 },
+                QueuedNativeViewportPropertyCommand::PointerCapture(command) => {
+                    NativeViewportPropertyCommandRetirement::PointerCapture {
+                        viewport_id,
+                        token: command.token,
+                        expected_window_id: command.expected_window_id,
+                        device_id: command.device_id,
+                        action: command.action,
+                    }
+                }
             };
             // Forget callbacks have no Context. Preserve the requested wake in
             // its event-loop latch without turning service into a UI repaint.
@@ -3435,6 +3708,74 @@ fn observe_native_pointer(
     {
         let _ = (event_loop, expected_window_id, device_id, expected_press);
         NativeViewportPointerObservation::Unsupported
+    }
+}
+
+fn capture_native_pointer(
+    event_loop: &ActiveEventLoop,
+    expected_window_id: WindowId,
+    device_id: DeviceId,
+    expected_press: &PointerPressToken,
+    action: NativeViewportPointerCaptureAction,
+) -> NativeViewportPointerCaptureStatus {
+    #[cfg(all(target_os = "linux", feature = "x11"))]
+    {
+        if !event_loop.is_x11() {
+            return NativeViewportPointerCaptureStatus::Unsupported;
+        }
+        match action {
+            NativeViewportPointerCaptureAction::Acquire => {
+                match event_loop.acquire_pointer_capture(
+                    expected_window_id,
+                    device_id,
+                    expected_press,
+                ) {
+                    X11PointerCaptureAcquisition::Pending => {
+                        NativeViewportPointerCaptureStatus::Pending
+                    }
+                    X11PointerCaptureAcquisition::Acquired => {
+                        NativeViewportPointerCaptureStatus::Acquired
+                    }
+                    X11PointerCaptureAcquisition::Unavailable => {
+                        NativeViewportPointerCaptureStatus::Unavailable
+                    }
+                    X11PointerCaptureAcquisition::Unsupported => {
+                        NativeViewportPointerCaptureStatus::Unsupported
+                    }
+                }
+            }
+            NativeViewportPointerCaptureAction::Release => {
+                match event_loop.release_pointer_capture(
+                    expected_window_id,
+                    device_id,
+                    expected_press,
+                ) {
+                    X11PointerCaptureRelease::Pending => {
+                        NativeViewportPointerCaptureStatus::Pending
+                    }
+                    X11PointerCaptureRelease::Released => {
+                        NativeViewportPointerCaptureStatus::Released
+                    }
+                    X11PointerCaptureRelease::Unavailable => {
+                        NativeViewportPointerCaptureStatus::Unavailable
+                    }
+                    X11PointerCaptureRelease::Unsupported => {
+                        NativeViewportPointerCaptureStatus::Unsupported
+                    }
+                }
+            }
+        }
+    }
+    #[cfg(not(all(target_os = "linux", feature = "x11")))]
+    {
+        let _ = (
+            event_loop,
+            expected_window_id,
+            device_id,
+            expected_press,
+            action,
+        );
+        NativeViewportPointerCaptureStatus::Unsupported
     }
 }
 
