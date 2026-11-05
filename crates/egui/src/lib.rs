@@ -413,6 +413,7 @@ mod layout;
 pub mod load;
 mod memory;
 pub mod os;
+mod paint_audit;
 mod painter;
 mod pass_state;
 pub(crate) mod placer;

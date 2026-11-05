@@ -19,7 +19,7 @@ use crate::{
     Align2, CursorIcon, DeferredViewportUiCallback, FontDefinitions, FontProvider, GlyphRasterizer,
     Grid, Id, ImmediateViewport, ImmediateViewportRendererCallback, Key, KeyboardShortcut, Label,
     LayerId, Memory, MissingGlyphPolicy, ModifierNames, Modifiers, NumExt as _, Order, Painter,
-    RawInput, Response, RichText, SafeAreaInsets, ScrollArea, Sense, Style, TextStyle,
+    RawInput, Response, RichText, SafeAreaInsets, ScrollArea, Sense, Shape, Style, TextStyle,
     TextureHandle, TextureOptions, Ui, UiBuilder, ViewportBuilder, ViewportCommand, ViewportId,
     ViewportIdMap, ViewportIdPair, ViewportIdSet, ViewportOutput, Visuals, Widget as _, WidgetRect,
     WidgetText,
@@ -291,6 +291,7 @@ pub struct ViewportState {
     // The output of a pass:
     //
     pub graphics: GraphicLayers,
+    paint_audits: crate::paint_audit::Registry,
     // Most of the things in `PlatformOutput` are not actually viewport dependent.
     pub output: PlatformOutput,
     pub commands: Vec<ViewportCommand>,
@@ -1381,7 +1382,104 @@ impl Context {
     /// Read-write access to [`GraphicLayers`], where painted [`crate::Shape`]s are written to.
     #[inline]
     pub fn graphics_mut<R>(&self, writer: impl FnOnce(&mut GraphicLayers) -> R) -> R {
+        let mut releases = crate::paint_audit::Releases::default();
+        self.write(|ctx| {
+            let viewport = ctx.viewport();
+            viewport
+                .paint_audits
+                .before_opaque_write(&viewport.graphics, &mut releases);
+            writer(&mut viewport.graphics)
+        })
+    }
+
+    /// Checks synchronous painter callbacks without copying untouched prefixes.
+    ///
+    /// This internal integration helper owns one paint-local comparison session.
+    /// The callback runs exactly once, without a Context lock. The supplied
+    /// aggregate is updated before captured user payloads are released.
+    #[doc(hidden)]
+    #[expect(clippy::type_complexity)]
+    pub fn paint_append_auditor(
+        &self,
+    ) -> Option<Box<dyn FnMut(&Painter, &mut dyn FnMut(), &mut bool)>> {
+        let session = Arc::new(epaint::mutex::Mutex::new(
+            crate::paint_audit::Session::default(),
+        ));
+        let viewport_id = self.write(|ctx| {
+            let viewport_id = ctx.viewport_id();
+            ctx.viewport().paint_audits.register(&session);
+            viewport_id
+        });
+        let context = self.clone();
+        let mut comparison = crate::paint_audit::Comparison::default();
+        Some(Box::new(move |painter, paint, aggregate| {
+            let same_context = painter.ctx() == &context;
+            let layer = painter.layer_id();
+            let checkpoint = context.write(|ctx| {
+                let before = if same_context && ctx.viewport_id() == viewport_id {
+                    ctx.viewports.get_mut(&viewport_id).and_then(|viewport| {
+                        viewport.paint_audits.register(&session);
+                        crate::paint_audit::Before::capture(&ctx.memory, &viewport.graphics, layer)
+                    })
+                } else {
+                    None
+                };
+                crate::paint_audit::checkpoint(&session, before)
+            });
+            paint();
+            let mut released = None;
+            let preserved = context.write(|ctx| {
+                released = checkpoint.lock().take();
+                if !same_context || ctx.viewport_id() != viewport_id {
+                    return false;
+                }
+                let Some(before) = released.as_ref() else {
+                    return false;
+                };
+                ctx.viewports.get(&viewport_id).is_some_and(|viewport| {
+                    before.is_preserved(
+                        &ctx.memory,
+                        &viewport.graphics,
+                        layer,
+                        &mut session.lock(),
+                        &mut comparison,
+                    )
+                })
+            });
+            *aggregate &= preserved;
+            drop(released);
+        }))
+    }
+
+    /// Only internal append operations may use this path.
+    pub(crate) fn graphics_mut_append<R>(&self, writer: impl FnOnce(&mut GraphicLayers) -> R) -> R {
         self.write(move |ctx| writer(&mut ctx.viewport().graphics))
+    }
+
+    pub(crate) fn set_paint_shape(
+        &self,
+        layer: LayerId,
+        index: crate::layers::ShapeIdx,
+        clip_rect: Rect,
+        shape: Shape,
+    ) {
+        let mut releases = crate::paint_audit::Releases::default();
+        self.write(|ctx| {
+            let viewport = ctx.viewport();
+            if viewport
+                .graphics
+                .get(layer)
+                .is_some_and(|list| index.0 < list.next_idx().0)
+            {
+                viewport.paint_audits.before_index_write(
+                    &viewport.graphics,
+                    layer,
+                    index.0,
+                    &mut releases,
+                );
+            }
+            viewport.graphics.entry(layer).set(index, clip_rect, shape);
+        });
     }
 
     /// Read-only access to [`GraphicLayers`], where painted [`crate::Shape`]s are written to.
@@ -3189,7 +3287,9 @@ impl Context {
         self.debug_painting();
 
         let ended_viewport = self.viewport_id();
-        let mut output = self.write(|ctx| ctx.end_pass());
+        let mut releases = crate::paint_audit::Releases::default();
+        let mut output = self.write(|ctx| ctx.end_pass(&mut releases));
+        drop(releases);
 
         let plugins = self.read(|ctx| ctx.plugins.ordered_plugins());
         plugins.on_output(self, &mut output);
@@ -3392,7 +3492,13 @@ impl Context {
 }
 
 impl ContextImpl {
-    fn end_pass(&mut self) -> FullOutput {
+    fn end_pass(&mut self, releases: &mut crate::paint_audit::Releases) -> FullOutput {
+        // Draining graphics and removing viewports both bypass graphics_mut.
+        for viewport in self.viewports.values_mut() {
+            viewport
+                .paint_audits
+                .before_opaque_write(&viewport.graphics, releases);
+        }
         let ended_viewport_id = self.viewport_id();
         let viewport = self.viewports.entry(ended_viewport_id).or_default();
         let pixels_per_point = viewport.input.pixels_per_point;

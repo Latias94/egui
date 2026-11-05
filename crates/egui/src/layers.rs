@@ -216,6 +216,14 @@ impl PaintList {
 pub struct GraphicLayers([IdMap<PaintList>; Order::COUNT]);
 
 impl GraphicLayers {
+    pub(crate) fn has_unknown_shapes(&self, known: &[LayerId]) -> bool {
+        Order::ALL.iter().zip(&self.0).any(|(&order, layers)| {
+            layers
+                .iter()
+                .any(|(&id, list)| !list.is_empty() && !known.contains(&LayerId::new(order, id)))
+        })
+    }
+
     /// Get or insert the [`PaintList`] for the given [`LayerId`].
     pub fn entry(&mut self, layer_id: LayerId) -> &mut PaintList {
         self.0[layer_id.order as usize]

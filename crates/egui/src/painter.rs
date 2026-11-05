@@ -194,8 +194,9 @@ impl Painter {
 /// ## Low level
 impl Painter {
     #[inline]
-    fn paint_list<R>(&self, writer: impl FnOnce(&mut PaintList) -> R) -> R {
-        self.ctx.graphics_mut(|g| writer(g.entry(self.layer_id)))
+    fn paint_list_append<R>(&self, writer: impl FnOnce(&mut PaintList) -> R) -> R {
+        self.ctx
+            .graphics_mut_append(|g| writer(g.entry(self.layer_id)))
     }
 
     fn transform_shape(&self, shape: &mut Shape) {
@@ -212,11 +213,11 @@ impl Painter {
     /// NOTE: all coordinates are screen coordinates!
     pub fn add(&self, shape: impl Into<Shape>) -> ShapeIdx {
         if self.fade_to_color == Some(Color32::TRANSPARENT) || self.opacity_factor == 0.0 {
-            self.paint_list(|l| l.add(self.clip_rect, Shape::Noop))
+            self.paint_list_append(|l| l.add(self.clip_rect, Shape::Noop))
         } else {
             let mut shape = shape.into();
             self.transform_shape(&mut shape);
-            self.paint_list(|l| l.add(self.clip_rect, shape))
+            self.paint_list_append(|l| l.add(self.clip_rect, shape))
         }
     }
 
@@ -232,9 +233,9 @@ impl Painter {
                 self.transform_shape(&mut shape);
                 shape
             });
-            self.paint_list(|l| l.extend(self.clip_rect, shapes));
+            self.paint_list_append(|l| l.extend(self.clip_rect, shapes));
         } else {
-            self.paint_list(|l| l.extend(self.clip_rect, shapes));
+            self.paint_list_append(|l| l.extend(self.clip_rect, shapes));
         }
     }
 
@@ -245,7 +246,8 @@ impl Painter {
         }
         let mut shape = shape.into();
         self.transform_shape(&mut shape);
-        self.paint_list(|l| l.set(idx, self.clip_rect, shape));
+        self.ctx
+            .set_paint_shape(self.layer_id, idx, self.clip_rect, shape);
     }
 
     /// Access all shapes added this frame.
