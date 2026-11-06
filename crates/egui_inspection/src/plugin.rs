@@ -165,7 +165,16 @@ impl InspectionPlugin {
             .iter()
             .any(|item| !matches!(item.req, Request::Settle { .. }))
         {
-            request_frame(ctx);
+            request_frame(ctx, ViewportId::ROOT);
+        }
+        for item in &self.in_flight {
+            if let Phase::AwaitViewportTree { viewport } = &item.phase
+                && *viewport != ViewportId::ROOT
+            {
+                // Only the selected viewport's output can complete this request.
+                // Keep its paint obligation alive if an earlier wake ran no pass.
+                request_frame(ctx, *viewport);
+            }
         }
     }
 
@@ -215,16 +224,13 @@ impl InspectionPlugin {
     }
 }
 
-/// Ask for one run of the ui, painted, whether or not the root window is visible.
+/// Ask for one run of the selected viewport's ui, painted, visible or not.
 ///
 /// This both wakes an idle app and overrides the integration's skipping of hidden windows.
 /// Every request needs it: a screenshot needs the painted pixels, the widget tree is what the
 /// pass produces, and injected input is only applied by a pass.
-fn request_frame(ctx: &Context) {
-    ctx.send_viewport_cmd_to(
-        egui::ViewportId::ROOT,
-        egui::ViewportCommand::RequestPaintWhileHidden,
-    );
+fn request_frame(ctx: &Context, viewport: ViewportId) {
+    ctx.send_viewport_cmd_to(viewport, egui::ViewportCommand::RequestPaintWhileHidden);
 }
 
 impl egui::Plugin for InspectionPlugin {
@@ -321,7 +327,6 @@ impl egui::Plugin for InspectionPlugin {
                         }
                         return false;
                     }
-                    ctx.request_repaint_of(*viewport);
                     item.phase = Phase::AwaitViewportTree {
                         viewport: *viewport,
                     };
@@ -576,7 +581,7 @@ fn serve_connection(stream: std::net::TcpStream, ctx: &Context) -> std::io::Resu
             );
         }
         // Wake the (possibly idle) UI loop so it services the request, hidden window and all.
-        request_frame(ctx);
+        request_frame(ctx, ViewportId::ROOT);
         let resp = rx.recv_timeout(REQUEST_TIMEOUT).unwrap_or_else(|_| {
             // The app is running no passes at all — it may be blocked, or its integration may
             // not paint hidden windows. Surface it loudly.
@@ -741,6 +746,219 @@ mod tests {
         assert_eq!(step, 5);
         assert_eq!(pixels_per_point, 2.5);
         assert_eq!(accesskit.unwrap().focus, NodeId(21));
+    }
+
+    #[test]
+    fn pending_child_tree_rearms_consumed_wake_until_fresh_output() {
+        let ctx = egui::Context::default();
+        ctx.set_embed_viewports(false);
+        ctx.add_plugin(InspectionPlugin::new(None));
+        let active = [
+            root(),
+            child(),
+            TestViewport {
+                id: ViewportId::from_hash_of("unrelated-inspection-child"),
+                parent: ViewportId::ROOT,
+                class: ViewportClass::Deferred,
+                title: "Unrelated child",
+            },
+        ];
+        let child_id = active[1].id;
+        let unrelated_id = active[2].id;
+        let pass = |current, label: &str| {
+            ctx.acknowledge_repaint_request(current);
+            ctx.run_ui(input(current, &active), |ui| {
+                ui.allocate_response(egui::vec2(16.0, 16.0), egui::Sense::hover())
+                    .widget_info(|| {
+                        egui::WidgetInfo::labeled(egui::accesskit::Role::Label, true, label)
+                    });
+                if current == ViewportId::ROOT {
+                    for viewport in &active[1..] {
+                        ui.ctx().show_viewport_deferred(
+                            viewport.id,
+                            ViewportBuilder::default().with_title(viewport.title),
+                            |_, _| {},
+                        );
+                    }
+                }
+            })
+        };
+        pass(ViewportId::ROOT, "Root tree").drop_without_applying_deltas();
+        pass(child_id, "Previous child tree").drop_without_applying_deltas();
+        ctx.acknowledge_repaint_request(child_id);
+
+        let wakes = std::sync::Arc::new(egui::mutex::Mutex::new(Vec::new()));
+        ctx.set_request_repaint_callback({
+            let wakes = std::sync::Arc::clone(&wakes);
+            move |info| wakes.lock().push(info.viewport_id)
+        });
+        let (sender, receiver) = mpsc::channel();
+        ctx.with_plugin::<InspectionPlugin, _>(|plugin| {
+            plugin.submit(
+                Request::GetViewportTree { viewport: child_id },
+                move |response| {
+                    sender.send(response).expect("test receiver remains live");
+                },
+            );
+        })
+        .expect("inspection plugin is registered");
+        pass(ViewportId::ROOT, "Root tree").drop_without_applying_deltas();
+        assert!(wakes.lock().contains(&child_id));
+        assert!(matches!(receiver.try_recv(), Err(TryRecvError::Empty)));
+
+        // The integration consumed the child wake but ran no child pass.
+        // A later root pass must preserve the outstanding target obligation.
+        let child_pass = ctx.cumulative_pass_nr_for(child_id);
+        ctx.acknowledge_repaint_request(child_id);
+        wakes.lock().clear();
+        let root_output = pass(ViewportId::ROOT, "Root tree");
+        assert_eq!(ctx.cumulative_pass_nr_for(child_id), child_pass);
+        let observed_wakes = std::mem::take(&mut *wakes.lock());
+        assert!(observed_wakes.contains(&child_id));
+        assert!(observed_wakes.contains(&ViewportId::ROOT));
+        assert!(!observed_wakes.contains(&unrelated_id));
+        for viewport in [ViewportId::ROOT, child_id] {
+            assert!(
+                root_output.viewport_output[&viewport]
+                    .commands
+                    .contains(&egui::ViewportCommand::RequestPaintWhileHidden)
+            );
+        }
+        assert!(
+            !root_output.viewport_output[&unrelated_id]
+                .commands
+                .contains(&egui::ViewportCommand::RequestPaintWhileHidden)
+        );
+        root_output.drop_without_applying_deltas();
+        assert!(matches!(receiver.try_recv(), Err(TryRecvError::Empty)));
+        let last_root_step = ctx
+            .with_plugin::<InspectionPlugin, _>(|plugin| plugin.step)
+            .unwrap();
+
+        pass(child_id, "Fresh child tree").drop_without_applying_deltas();
+        let Response::ViewportTree {
+            viewport,
+            step,
+            accesskit: Some(tree),
+            ..
+        } = receiver.try_recv().expect("the fresh child output replies")
+        else {
+            panic!("expected the selected child's fresh tree");
+        };
+        assert_eq!(viewport, child_id);
+        assert!(step > last_root_step);
+        assert!(
+            tree.nodes
+                .iter()
+                .any(|(_, node)| node.value() == Some("Fresh child tree"))
+        );
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(TryRecvError::Disconnected)
+        ));
+
+        ctx.acknowledge_repaint_request(child_id);
+        wakes.lock().clear();
+        pass(ViewportId::ROOT, "Root tree").drop_without_applying_deltas();
+        assert!(!wakes.lock().contains(&child_id));
+        assert!(!wakes.lock().contains(&unrelated_id));
+    }
+
+    #[test]
+    fn pending_child_tree_removal_uses_real_context_and_does_not_resurrect() {
+        let ctx = egui::Context::default();
+        ctx.set_embed_viewports(false);
+        ctx.add_plugin(InspectionPlugin::new(None));
+        let active = [
+            root(),
+            child(),
+            TestViewport {
+                id: ViewportId::from_hash_of("unrelated-removal-child"),
+                parent: ViewportId::ROOT,
+                class: ViewportClass::Deferred,
+                title: "Unrelated child",
+            },
+        ];
+        let child_id = active[1].id;
+        let unrelated_id = active[2].id;
+        let pass = |current, show_child: bool| {
+            ctx.acknowledge_repaint_request(current);
+            let mut raw = input(current, &active);
+            if !show_child {
+                raw.viewports.remove(&child_id);
+            }
+            ctx.run_ui(raw, |ui| {
+                if current == ViewportId::ROOT {
+                    for viewport in &active[1..] {
+                        if viewport.id != child_id || show_child {
+                            ui.ctx().show_viewport_deferred(
+                                viewport.id,
+                                ViewportBuilder::default().with_title(viewport.title),
+                                |_, _| {},
+                            );
+                        }
+                    }
+                }
+            })
+        };
+        pass(ViewportId::ROOT, true).drop_without_applying_deltas();
+        pass(child_id, true).drop_without_applying_deltas();
+        ctx.acknowledge_repaint_request(child_id);
+
+        let wakes = std::sync::Arc::new(egui::mutex::Mutex::new(Vec::new()));
+        ctx.set_request_repaint_callback({
+            let wakes = std::sync::Arc::clone(&wakes);
+            move |info| wakes.lock().push(info.viewport_id)
+        });
+        let request = Request::GetViewportTree { viewport: child_id };
+        let reply = ctx
+            .with_plugin::<InspectionPlugin, _>(|plugin| submit(plugin, request.clone()))
+            .expect("inspection plugin is registered");
+        pass(ViewportId::ROOT, true).drop_without_applying_deltas();
+        assert!(wakes.lock().contains(&child_id));
+        assert!(matches!(reply.try_recv(), Err(TryRecvError::Empty)));
+
+        // The integration consumes the child's wake without a pass; ROOT drops its declaration.
+        ctx.acknowledge_repaint_request(child_id);
+        let removed = pass(ViewportId::ROOT, false);
+        assert!(!removed.viewport_output.contains_key(&child_id));
+        assert!(removed.viewport_output.contains_key(&unrelated_id));
+        removed.drop_without_applying_deltas();
+        assert!(matches!(
+            reply.try_recv().expect("the actual removal completes the request"),
+            Response::ViewportError {
+                viewport,
+                reason: ViewportErrorReason::Removed,
+            } if viewport == child_id
+        ));
+        assert!(matches!(reply.try_recv(), Err(TryRecvError::Disconnected)));
+
+        // A command queued by an output hook must not recreate the retired child.
+        wakes.lock().clear();
+        let subsequent = pass(ViewportId::ROOT, false);
+        assert!(!subsequent.viewport_output.contains_key(&child_id));
+        assert!(subsequent.viewport_output.contains_key(&unrelated_id));
+        subsequent.drop_without_applying_deltas();
+        assert!(!wakes.lock().contains(&child_id));
+
+        let unknown = ctx
+            .with_plugin::<InspectionPlugin, _>(|plugin| submit(plugin, request))
+            .expect("inspection plugin remains registered");
+        let output = pass(ViewportId::ROOT, false);
+        assert!(!output.viewport_output.contains_key(&child_id));
+        output.drop_without_applying_deltas();
+        assert!(matches!(
+            unknown.try_recv().expect("a retired ID is now unknown"),
+            Response::ViewportError {
+                viewport,
+                reason: ViewportErrorReason::Unknown,
+            } if viewport == child_id
+        ));
+        assert!(matches!(
+            unknown.try_recv(),
+            Err(TryRecvError::Disconnected)
+        ));
+        assert!(!wakes.lock().contains(&child_id));
     }
 
     #[test]
