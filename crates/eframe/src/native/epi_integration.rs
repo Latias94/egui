@@ -364,7 +364,7 @@ impl EpiIntegration {
         #[cfg(feature = "native-host-seam")] native_host: &super::host_seam::NativeHostState,
     ) -> egui::FullOutput {
         #[cfg(feature = "native-host-seam")]
-        native_host.bind_close_context(&self.egui_ctx);
+        native_host.bind_context(&self.egui_ctx);
         let raw_input = self.prepare_raw_input(app, raw_input);
         #[cfg(feature = "native-host-seam")]
         let mut raw_input = raw_input;
@@ -454,7 +454,7 @@ impl EpiIntegration {
         #[cfg(feature = "native-host-seam")] native_host: &super::host_seam::NativeHostState,
     ) -> egui::LogicOutput {
         #[cfg(feature = "native-host-seam")]
-        native_host.bind_close_context(&self.egui_ctx);
+        native_host.bind_context(&self.egui_ctx);
         let raw_input = self.prepare_raw_input(app, raw_input);
         #[cfg(feature = "native-host-seam")]
         let mut raw_input = raw_input;

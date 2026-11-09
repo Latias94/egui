@@ -31,6 +31,7 @@ use winit_integration::UserEvent;
 use crate::native::host_seam::{
     NativeDeferredWindowPreparation, NativeHostState, NativeOutputRenderMode, NativeOutputStart,
     NativeViewportCreateAttempt, NativeViewportCreateFailureKind, NativeViewportRosterCapture,
+    unique_focused_native_viewport,
 };
 use crate::{
     App, AppCreator, CreationContext, NativeOptions, Result, Storage,
@@ -526,9 +527,10 @@ impl WinitApp for WgpuWinitApp<'_> {
     #[cfg(feature = "native-host-seam")]
     fn focused_native_viewport(&self) -> Option<(ViewportId, WindowId)> {
         let shared = self.running.as_ref()?.shared.borrow();
-        let viewport_id = shared.focused_viewport?;
-        let window_id = shared.viewports.get(&viewport_id)?.window.as_ref()?.id();
-        Some((viewport_id, window_id))
+        unique_focused_native_viewport(shared.viewports.iter().filter_map(|(&id, viewport)| {
+            let window = viewport.window.as_ref()?;
+            Some((id, window.id(), window.has_focus()))
+        }))
     }
 
     fn save(&mut self) {

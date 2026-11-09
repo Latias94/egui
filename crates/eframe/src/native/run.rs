@@ -255,6 +255,14 @@ impl<T: WinitApp> WinitAppWrapper<T> {
         self.native_host_service_queued = false;
         if let Some(context) = self.winit_app.egui_ctx() {
             self.native_host.service(context);
+            if self.native_host.take_global_focus_request() {
+                let ordinal = self.native_event_sequence.next();
+                self.native_host.observe_global_focus(
+                    Some(context),
+                    ordinal,
+                    self.winit_app.focused_native_viewport(),
+                );
+            }
         }
         self.apply_native_host_root_wake();
         self.queue_native_host_service();
@@ -762,31 +770,45 @@ pub enum EframePumpStatus {
 
 #[cfg(all(test, feature = "native-host-seam"))]
 mod native_host_service_tests {
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
     use std::collections::VecDeque;
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
 
     use super::*;
     use crate::native::host_seam::{
-        NativeGlobalFocusObservation, NativeHostHandler, NativeHostWake, NativeOutputAdmission,
-        NativeOutputToken, NativeViewportRoster, NativeWindowSnapshot, current_native_output_token,
+        NativeGlobalFocus, NativeGlobalFocusObservation, NativeHostHandler, NativeHostWake,
+        NativeOutputAdmission, NativeOutputToken, NativeViewportRoster, NativeWindowSnapshot,
+        current_native_output_token, request_native_global_focus,
     };
 
     #[derive(Default)]
     struct ServiceHost {
         calls: AtomicUsize,
         retry: AtomicBool,
+        focus_wait: AtomicBool,
+        request_focus: AtomicBool,
+        focus: Mutex<Vec<NativeGlobalFocusObservation>>,
     }
 
     impl NativeHostHandler for ServiceHost {
-        fn on_global_focus(&self, _: NativeGlobalFocusObservation) -> NativeHostWake {
-            NativeHostWake::ServiceAfterCurrent
+        fn on_global_focus(&self, observation: NativeGlobalFocusObservation) -> NativeHostWake {
+            self.focus.try_lock().unwrap().push(observation);
+            if self.focus_wait.load(Ordering::Relaxed) {
+                NativeHostWake::Wait
+            } else {
+                NativeHostWake::ServiceAfterCurrent
+            }
         }
 
-        fn on_service(&self, _: &egui::Context) -> NativeHostWake {
+        fn on_service(&self, context: &egui::Context) -> NativeHostWake {
             assert_eq!(current_native_output_token(), None);
             self.calls.fetch_add(1, Ordering::Relaxed);
+            if self.request_focus.swap(false, Ordering::Relaxed) {
+                // Hold the callback's lock to catch synchronous focus reentry.
+                let _focus = self.focus.lock().unwrap();
+                assert!(request_native_global_focus(context));
+            }
             if self.retry.swap(false, Ordering::Relaxed) {
                 NativeHostWake::ServiceAfterCurrent
             } else {
@@ -809,6 +831,8 @@ mod native_host_service_tests {
         context: egui::Context,
         events: RefCell<VecDeque<UserEvent>>,
         input: egui::RawInput,
+        focused: Cell<Option<(egui::ViewportId, WindowId)>>,
+        focus_queries: Cell<usize>,
     }
 
     impl WinitApp for ServiceApp {
@@ -839,7 +863,8 @@ mod native_host_service_tests {
         }
 
         fn focused_native_viewport(&self) -> Option<(egui::ViewportId, WindowId)> {
-            None
+            self.focus_queries.set(self.focus_queries.get() + 1);
+            self.focused.get()
         }
 
         fn save(&mut self) {
@@ -913,6 +938,7 @@ mod native_host_service_tests {
         let context = egui::Context::default();
         let mut output = context.run_ui(Default::default(), |_| {});
         output.textures_delta.clear();
+        native_host.bind_context(&context);
         let app = ServiceApp {
             native_host,
             context,
@@ -923,6 +949,8 @@ mod native_host_service_tests {
                 dropped_files: vec![Arc::new(BufferedFile)],
                 ..Default::default()
             },
+            focused: Cell::new(None),
+            focus_queries: Cell::new(0),
         };
         (host, WinitAppWrapper::new(app, true))
     }
@@ -1004,5 +1032,88 @@ mod native_host_service_tests {
         assert!(!wrapper.native_host_service_queued);
         assert!(!wrapper.native_host.service_after_current_requested());
         assert!(wrapper.winit_app.events.borrow().is_empty());
+    }
+
+    #[test]
+    fn focus_refresh_coalesces_and_queries_current_provider_focus_without_ui() {
+        let (host, mut wrapper) = fixture();
+        host.focus_wait.store(true, Ordering::Relaxed);
+        let pass = wrapper.winit_app.context.cumulative_pass_nr();
+        let earlier = wrapper.native_event_sequence.next();
+        let first = (egui::ViewportId::ROOT, WindowId::from(1));
+        let successor = (
+            egui::ViewportId::from_hash_of("focus-successor"),
+            WindowId::from(2),
+        );
+        wrapper.winit_app.focused.set(Some(first));
+
+        for _ in 0..3 {
+            assert!(request_native_global_focus(&wrapper.winit_app.context));
+            wrapper.queue_native_host_service();
+        }
+        assert_eq!(wrapper.winit_app.events.borrow().len(), 1);
+        assert_eq!(wrapper.winit_app.focus_queries.get(), 0);
+        wrapper.winit_app.focused.set(Some(successor));
+        dispatch_service(&mut wrapper);
+
+        let observations = host.focus.lock().unwrap();
+        assert_eq!(observations.len(), 1);
+        assert!(observations[0].event() > earlier);
+        assert_eq!(
+            observations[0].focused(),
+            NativeGlobalFocus::Viewport {
+                viewport_id: successor.0,
+                window_id: successor.1,
+            }
+        );
+        drop(observations);
+        assert_eq!(wrapper.winit_app.focus_queries.get(), 1);
+        assert_eq!(host.calls.load(Ordering::Relaxed), 0);
+        assert_eq!(wrapper.winit_app.context.cumulative_pass_nr(), pass);
+        assert_eq!(
+            wrapper.winit_app.input.events,
+            [egui::Event::Text("buffered input".into())]
+        );
+        assert_eq!(wrapper.winit_app.input.hovered_files.len(), 1);
+        assert_eq!(wrapper.winit_app.input.dropped_files.len(), 1);
+
+        wrapper.queue_native_host_service();
+        wrapper.service_native_host();
+        assert_eq!(wrapper.winit_app.focus_queries.get(), 1);
+        assert!(wrapper.winit_app.events.borrow().is_empty());
+        assert!(!wrapper.native_host.service_after_current_requested());
+
+        assert!(request_native_global_focus(&wrapper.winit_app.context));
+        wrapper.queue_native_host_service();
+        wrapper.winit_app.focused.set(None);
+        dispatch_service(&mut wrapper);
+        let observations = host.focus.lock().unwrap();
+        assert_eq!(observations.len(), 2);
+        assert!(observations[1].event() > observations[0].event());
+        assert_eq!(observations[1].focused(), NativeGlobalFocus::Unknown);
+        assert!(wrapper.native_event_sequence.next() > observations[1].event());
+    }
+
+    #[test]
+    fn service_can_request_focus_without_reentering_the_host() {
+        let (host, mut wrapper) = fixture();
+        request_service(&mut wrapper);
+        host.focus_wait.store(true, Ordering::Relaxed);
+        host.request_focus.store(true, Ordering::Relaxed);
+        dispatch_service(&mut wrapper);
+        assert_eq!(host.calls.load(Ordering::Relaxed), 1);
+        assert_eq!(host.focus.lock().unwrap().len(), 2);
+        assert_eq!(wrapper.winit_app.focus_queries.get(), 1);
+        assert!(wrapper.winit_app.events.borrow().is_empty());
+        assert!(!wrapper.native_host.service_after_current_requested());
+    }
+
+    #[test]
+    fn focus_refresh_rejects_missing_or_retired_attachments() {
+        assert!(!request_native_global_focus(&egui::Context::default()));
+        let (_, wrapper) = fixture();
+        let context = wrapper.winit_app.context.clone();
+        drop(wrapper);
+        assert!(!request_native_global_focus(&context));
     }
 }

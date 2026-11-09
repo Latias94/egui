@@ -80,7 +80,7 @@ fn fixture() -> (Arc<CaptureHost>, NativeHostState, egui::Context) {
     let handler: Arc<dyn NativeHostHandler> = host.clone();
     let state = NativeHostState::new(Some(handler));
     let ctx = egui::Context::default();
-    state.bind_close_context(&ctx);
+    state.bind_context(&ctx);
     (host, state, ctx)
 }
 

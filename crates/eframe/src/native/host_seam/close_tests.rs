@@ -313,7 +313,7 @@ fn held_raw_input_is_filtered_and_logic_only_context_can_schedule_a_decision() {
         .unwrap()
         .events
         .push(egui::ViewportEvent::Close);
-    state.bind_close_context(&ctx);
+    state.bind_context(&ctx);
     state.prepare_close_input(&mut raw);
     assert!(!raw.viewport().close_requested());
     assert!(resolve_native_viewport_close(

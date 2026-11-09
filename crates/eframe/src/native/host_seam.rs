@@ -100,7 +100,7 @@ pub(crate) enum NativeOutputRenderMode {
     Overlay,
 }
 
-/// Monotonic order assigned to one native window event before egui translates it.
+/// Monotonic order assigned to a native event or a requested provider observation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct NativeEventOrdinal(NonZeroU64);
 
@@ -162,10 +162,30 @@ struct PendingNativeViewportClose {
 }
 
 #[derive(Clone)]
-struct NativeCloseResolutionHandle(Weak<NativeHostStateInner>);
+struct NativeHostContextHandle(Weak<NativeHostStateInner>);
 
-fn close_resolution_handle_id() -> egui::Id {
-    egui::Id::unique("eframe::native_host::close_resolution_handle")
+fn native_host_context_handle_id() -> egui::Id {
+    egui::Id::unique("eframe::native_host::context_handle")
+}
+
+/// Requests a fresh global focus observation from the attached native provider.
+///
+/// Requests coalesce until a native service event queries the provider and calls
+/// [`NativeHostHandler::on_global_focus`] with a new [`NativeEventOrdinal`]. This
+/// does not activate a window. The observation callback runs without extracting
+/// input or running application UI. Returns `false` when the context has no live
+/// native host attachment.
+pub fn request_native_global_focus(ctx: &egui::Context) -> bool {
+    let handle =
+        ctx.data(|data| data.get_temp::<NativeHostContextHandle>(native_host_context_handle_id()));
+    let Some(inner) = handle.and_then(|handle| handle.0.upgrade()) else {
+        return false;
+    };
+    if !inner.global_focus_requested.swap(true, Ordering::AcqRel) {
+        // Wake the outer event loop even when requested outside an output.
+        ctx.request_repaint_of(ViewportId::ROOT);
+    }
+    true
 }
 
 /// Schedules a final decision for a held request on its attached egui context.
@@ -181,7 +201,7 @@ pub fn resolve_native_viewport_close(
     decision: NativeViewportCloseDecision,
 ) -> bool {
     let handle =
-        ctx.data(|data| data.get_temp::<NativeCloseResolutionHandle>(close_resolution_handle_id()));
+        ctx.data(|data| data.get_temp::<NativeHostContextHandle>(native_host_context_handle_id()));
     let Some(inner) = handle.and_then(|handle| handle.0.upgrade()) else {
         return false;
     };
@@ -1749,7 +1769,7 @@ fn queue_native_viewport_property(
     command: QueuedNativeViewportPropertyCommand,
 ) {
     let handle =
-        ctx.data(|data| data.get_temp::<NativeCloseResolutionHandle>(close_resolution_handle_id()));
+        ctx.data(|data| data.get_temp::<NativeHostContextHandle>(native_host_context_handle_id()));
     let Some(inner) = handle.and_then(|handle| handle.0.upgrade()) else {
         return;
     };
@@ -1870,7 +1890,8 @@ pub trait NativeHostHandler: Send + Sync + 'static {
     /// Observes one physical-device removal before eframe handles it.
     fn on_device_removed(&self, _removal: NativeDeviceRemoval) {}
 
-    /// Observes globally consistent focus after eframe applies one focus event.
+    /// Observes globally consistent focus after a native focus event or a
+    /// [`request_native_global_focus`] query.
     fn on_global_focus(&self, _observation: NativeGlobalFocusObservation) -> NativeHostWake {
         NativeHostWake::Wait
     }
@@ -2145,6 +2166,7 @@ struct NativeHostStateInner {
     window_input: egui::mutex::Mutex<NativeWindowInputLedger>,
     root_wake_after_current: AtomicBool,
     service_after_current: AtomicBool,
+    global_focus_requested: AtomicBool,
 }
 
 /// Single-threaded event ordinal source owned by the outer winit dispatcher.
@@ -2164,6 +2186,17 @@ impl NativeEventSequencer {
         self.next = ordinal.get();
         NativeEventOrdinal(ordinal)
     }
+}
+
+/// Samples exact live windows without inheriting eframe's default root focus.
+pub(crate) fn unique_focused_native_viewport(
+    windows: impl IntoIterator<Item = (ViewportId, WindowId, bool)>,
+) -> Option<(ViewportId, WindowId)> {
+    let mut focused = windows
+        .into_iter()
+        .filter_map(|(viewport, window, focused)| focused.then_some((viewport, window)));
+    let current = focused.next()?;
+    focused.next().is_none().then_some(current)
 }
 
 impl NativeHostState {
@@ -2199,6 +2232,7 @@ impl NativeHostState {
                 window_input: egui::mutex::Mutex::new(NativeWindowInputLedger::default()),
                 root_wake_after_current: AtomicBool::new(false),
                 service_after_current: AtomicBool::new(false),
+                global_focus_requested: AtomicBool::new(false),
             })),
         }
     }
@@ -2214,9 +2248,16 @@ impl NativeHostState {
     }
 
     pub(crate) fn service_after_current_requested(&self) -> bool {
+        self.inner.as_ref().is_some_and(|inner| {
+            inner.service_after_current.load(Ordering::Acquire)
+                || inner.global_focus_requested.load(Ordering::Acquire)
+        })
+    }
+
+    pub(crate) fn take_global_focus_request(&self) -> bool {
         self.inner
             .as_ref()
-            .is_some_and(|inner| inner.service_after_current.load(Ordering::Acquire))
+            .is_some_and(|inner| inner.global_focus_requested.swap(false, Ordering::AcqRel))
     }
 
     pub(crate) fn service(&self, context: &egui::Context) {
@@ -2253,7 +2294,7 @@ impl NativeHostState {
         if matches!(event, winit::event::WindowEvent::CloseRequested)
             && let Some(ctx) = ctx
         {
-            self.bind_close_context(ctx);
+            self.bind_context(ctx);
         }
         let close_request = if let Some(viewport_id) = viewport_id
             && matches!(
@@ -2331,12 +2372,12 @@ impl NativeHostState {
         NativeWindowEventDisposition::Continue
     }
 
-    pub(crate) fn bind_close_context(&self, ctx: &egui::Context) {
+    pub(crate) fn bind_context(&self, ctx: &egui::Context) {
         if let Some(inner) = &self.inner {
             ctx.data_mut(|data| {
                 data.insert_temp(
-                    close_resolution_handle_id(),
-                    NativeCloseResolutionHandle(Arc::downgrade(inner)),
+                    native_host_context_handle_id(),
+                    NativeHostContextHandle(Arc::downgrade(inner)),
                 )
             });
         }
@@ -2379,7 +2420,7 @@ impl NativeHostState {
     /// Consumes only final decisions from the existing close ledger. Child
     /// Allow releases the host's gate; the host still owns child retirement.
     pub(crate) fn settle_close_resolutions(&self, ctx: &egui::Context) -> bool {
-        self.bind_close_context(ctx);
+        self.bind_context(ctx);
         let Some(inner) = &self.inner else {
             return false;
         };
@@ -2586,7 +2627,7 @@ impl NativeHostState {
         snapshot: NativeWindowSnapshot,
         root_roster: Option<NativeViewportRoster<'_>>,
     ) -> NativeOutputStart {
-        self.bind_close_context(ctx);
+        self.bind_context(ctx);
         let Some(inner) = &self.inner else {
             return NativeOutputStart::Disabled;
         };
@@ -3828,7 +3869,7 @@ mod pointer_observation_tests {
         let handler: Arc<dyn NativeHostHandler> = Arc::<ObservationHost>::clone(&host);
         let state = NativeHostState::new(Some(handler));
         let ctx = egui::Context::default();
-        state.bind_close_context(&ctx);
+        state.bind_context(&ctx);
         (host, state, ctx)
     }
 
@@ -4442,6 +4483,32 @@ mod tests {
     }
 
     #[test]
+    fn global_focus_samples_exact_live_windows_without_default_or_successor_focus() {
+        let root = ViewportId::ROOT;
+        let child = ViewportId::from_hash_of("focus-sample-child");
+        let first = WindowId::from(71);
+        let successor = WindowId::from(72);
+        assert_eq!(unique_focused_native_viewport([]), None);
+        assert_eq!(unique_focused_native_viewport([(root, first, false)]), None);
+        assert_eq!(
+            unique_focused_native_viewport([(root, first, true)]),
+            Some((root, first))
+        );
+        assert_eq!(
+            unique_focused_native_viewport([(root, successor, false)]),
+            None
+        );
+        assert_eq!(
+            unique_focused_native_viewport([(root, first, false), (child, successor, true)]),
+            Some((child, successor))
+        );
+        assert_eq!(
+            unique_focused_native_viewport([(root, first, true), (child, successor, true)]),
+            None
+        );
+    }
+
+    #[test]
     fn snapshot_keeps_content_size_without_inventing_desktop_position() {
         let geometry = NativeWindowLocalGeometry::from_window_facts([801, 603], 1.2, 1.1);
         let snapshot = NativeWindowSnapshot::from_captured_geometry(
@@ -4688,7 +4755,7 @@ mod tests {
         let child_viewport = ViewportId::from_hash_of("focus-command-child");
         let child_window = WindowId::from(19);
         let context = egui::Context::default();
-        state.bind_close_context(&context);
+        state.bind_context(&context);
         let token = queue_native_viewport_focus(&context, child_viewport);
 
         state.notify_viewport_focus(
@@ -4718,7 +4785,7 @@ mod tests {
         let handler: Arc<dyn NativeHostHandler> = Arc::<RecordingHost>::clone(&host);
         let state = NativeHostState::new(Some(handler));
         let context = egui::Context::default();
-        state.bind_close_context(&context);
+        state.bind_context(&context);
         let child_viewport = ViewportId::from_hash_of("pointer-passthrough-child");
         let child_window = WindowId::from(23);
         let token = queue_native_viewport_pointer_passthrough(&context, child_viewport, true);
@@ -4750,7 +4817,7 @@ mod tests {
     fn pointer_passthrough_host_commands_keep_exact_tokens_and_viewport_order() {
         let context = egui::Context::default();
         let state = NativeHostState::new(Some(Arc::new(RecordingHost::default())));
-        state.bind_close_context(&context);
+        state.bind_context(&context);
         let first_viewport = ViewportId::from_hash_of("pointer-passthrough-first");
         let second_viewport = ViewportId::from_hash_of("pointer-passthrough-second");
         let first = queue_native_viewport_pointer_passthrough(&context, first_viewport, true);
@@ -6701,7 +6768,7 @@ mod tests {
         let handler: Arc<dyn NativeHostHandler> = Arc::<RecordingHost>::clone(&host);
         let state = NativeHostState::new(Some(handler));
         let context = egui::Context::default();
-        state.bind_close_context(&context);
+        state.bind_context(&context);
         let viewport = ViewportId::from_hash_of("prepared-property-owner");
         let focus = prepare_native_viewport_focus(viewport);
         let visibility = prepare_native_viewport_visibility(viewport, true);
@@ -6757,7 +6824,7 @@ mod tests {
                 repaint_count.fetch_add(1, Ordering::Relaxed);
             }
         });
-        state.bind_close_context(&ctx);
+        state.bind_context(&ctx);
         let viewport_id = ViewportId::from_hash_of("shown-child");
         let token = queue_native_viewport_visibility(&ctx, viewport_id, true);
         let result = NativeViewportVisibilityResult {

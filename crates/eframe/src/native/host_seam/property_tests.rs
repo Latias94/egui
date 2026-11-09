@@ -64,7 +64,7 @@ fn fixture() -> (Arc<PropertyHost>, NativeHostState, egui::Context) {
     let handler: Arc<dyn NativeHostHandler> = host.clone();
     let state = NativeHostState::new(Some(handler));
     let ctx = egui::Context::default();
-    state.bind_close_context(&ctx);
+    state.bind_context(&ctx);
     (host, state, ctx)
 }
 
@@ -392,7 +392,7 @@ fn property_commands_do_not_cross_attachment_or_viewport_retirement() {
     queue_native_viewport_focus(&ctx, viewport);
     queue_native_viewport_visibility(&ctx, viewport, true);
     let replacement = NativeHostState::new(Some(host.clone()));
-    replacement.bind_close_context(&ctx);
+    replacement.bind_context(&ctx);
     assert!(
         replacement
             .take_viewport_property_commands(viewport)
@@ -703,7 +703,7 @@ fn property_retirement_reentrant_queue_survives_and_preserves_root_wake() {
             });
             let state = NativeHostState::new(Some(host.clone()));
             let ctx = egui::Context::default();
-            state.bind_close_context(&ctx);
+            state.bind_context(&ctx);
             let viewport = ViewportId::ROOT;
             let window = WindowId::from(41);
             let inner = state.inner.as_ref().unwrap();

@@ -226,7 +226,7 @@ pub use native::host_seam::{
     prepare_native_viewport_pointer_passthrough, prepare_native_viewport_visibility,
     queue_native_viewport_focus, queue_native_viewport_pointer_observation,
     queue_native_viewport_pointer_passthrough, queue_native_viewport_visibility,
-    resolve_native_viewport_close, retain_current_native_output,
+    request_native_global_focus, resolve_native_viewport_close, retain_current_native_output,
     retain_current_native_output_with_overlay,
 };
 

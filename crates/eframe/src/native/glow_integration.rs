@@ -46,7 +46,7 @@ use crate::epaint::textures::TexturesDelta;
 use crate::native::host_seam::{
     NativeDeferredWindowOverride, NativeDeferredWindowPreparation, NativeHostState,
     NativeOutputRenderMode, NativeOutputStart, NativeViewportCreateAttempt,
-    NativeViewportCreateFailureKind, NativeViewportRosterCapture,
+    NativeViewportCreateFailureKind, NativeViewportRosterCapture, unique_focused_native_viewport,
 };
 use crate::{
     App, AppCreator, CreationContext, NativeOptions, Result, Storage,
@@ -611,9 +611,10 @@ impl WinitApp for GlowWinitApp<'_> {
     #[cfg(feature = "native-host-seam")]
     fn focused_native_viewport(&self) -> Option<(ViewportId, WindowId)> {
         let glutin = self.running.as_ref()?.glutin.borrow();
-        let viewport_id = glutin.focused_viewport?;
-        let window_id = glutin.window_from_viewport.get(&viewport_id).copied()?;
-        Some((viewport_id, window_id))
+        unique_focused_native_viewport(glutin.viewports.iter().filter_map(|(&id, viewport)| {
+            let window = viewport.window.as_ref()?;
+            Some((id, window.id(), window.has_focus()))
+        }))
     }
 
     fn save(&mut self) {
