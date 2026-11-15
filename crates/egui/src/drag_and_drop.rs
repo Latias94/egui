@@ -1,12 +1,13 @@
 use alloc::sync::Arc;
 use core::any::Any;
 
-use crate::{Context, CursorIcon, Plugin, Ui};
+use crate::{Context, CursorIcon, Plugin, Ui, ViewportId};
 
 /// Plugin for tracking drag-and-drop payload.
 ///
 /// This plugin stores the current drag-and-drop payload internally and handles
-/// automatic cleanup when the drag operation ends (via Escape key or mouse release).
+/// automatic cleanup when the drag operation ends (via Escape, mouse release,
+/// or cancellation of its source viewport).
 ///
 /// This is a low-level API. For a higher-level API, see:
 /// - [`crate::Ui::dnd_drag_source`]
@@ -22,7 +23,13 @@ use crate::{Context, CursorIcon, Plugin, Ui};
 #[derive(Clone, Default)]
 pub struct DragAndDrop {
     /// The current drag-and-drop payload, if any. Automatically cleared when drag ends.
-    payload: Option<Arc<dyn Any + Send + Sync>>,
+    payload: Option<DragPayload>,
+}
+
+#[derive(Clone)]
+struct DragPayload {
+    source: ViewportId,
+    value: Arc<dyn Any + Send + Sync>,
 }
 
 impl Plugin for DragAndDrop {
@@ -30,13 +37,22 @@ impl Plugin for DragAndDrop {
         "DragAndDrop"
     }
 
-    /// Interrupt drag-and-drop if the user presses the escape key.
+    /// Interrupt on Escape or cancellation of the payload's source viewport.
     ///
     /// This needs to happen at frame start so we can properly capture the escape key.
     fn on_begin_pass(&mut self, ui: &mut Ui) {
         let has_any_payload = self.payload.is_some();
 
         if has_any_payload {
+            if self
+                .payload
+                .as_ref()
+                .is_some_and(|payload| payload.source == ui.ctx().viewport_id())
+                && ui.input(|input| input.events.contains(&crate::Event::PointerCancelled))
+            {
+                self.payload = None;
+                return;
+            }
             let abort_dnd_due_to_escape_key =
                 ui.input_mut(|i| i.consume_key(crate::Modifiers::NONE, crate::Key::Escape));
 
@@ -80,7 +96,10 @@ impl DragAndDrop {
     where
         Payload: Any + Send + Sync,
     {
-        ctx.plugin::<Self>().lock().payload = Some(Arc::new(payload));
+        ctx.plugin::<Self>().lock().payload = Some(DragPayload {
+            source: ctx.viewport_id(),
+            value: Arc::new(payload),
+        });
     }
 
     /// Clears the payload, setting it to `None`.
@@ -98,7 +117,7 @@ impl DragAndDrop {
     where
         Payload: Any + Send + Sync,
     {
-        Arc::clone(ctx.plugin::<Self>().lock().payload.as_ref()?)
+        Arc::clone(&ctx.plugin::<Self>().lock().payload.as_ref()?.value)
             .downcast()
             .ok()
     }
@@ -113,7 +132,13 @@ impl DragAndDrop {
     where
         Payload: Any + Send + Sync,
     {
-        ctx.plugin::<Self>().lock().payload.take()?.downcast().ok()
+        ctx.plugin::<Self>()
+            .lock()
+            .payload
+            .take()?
+            .value
+            .downcast()
+            .ok()
     }
 
     /// Are we carrying a payload of the given type?

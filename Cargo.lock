@@ -1250,7 +1250,7 @@ checksum = "75b325c5dbd37f80359721ad39aca5a29fb04c89279657cffdda8736d0c0b9d2"
 [[package]]
 name = "dpi"
 version = "0.1.1"
-source = "git+https://github.com/Latias94/winit.git?rev=9bee63c4988553041034f18fa70e984feb82eebc#9bee63c4988553041034f18fa70e984feb82eebc"
+source = "git+https://github.com/Latias94/winit.git?rev=c274e09d73f422edae72d6d75a2cb931e90eb961#c274e09d73f422edae72d6d75a2cb931e90eb961"
 
 [[package]]
 name = "ecolor"
@@ -4773,7 +4773,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix 1.1.4",
  "windows-sys 0.61.2",
@@ -6006,7 +6006,7 @@ checksum = "589f6da84c646204747d1270a2a5661ea66ed1cced2631d546fdfb155959f9ec"
 [[package]]
 name = "winit"
 version = "0.30.13"
-source = "git+https://github.com/Latias94/winit.git?rev=9bee63c4988553041034f18fa70e984feb82eebc#9bee63c4988553041034f18fa70e984feb82eebc"
+source = "git+https://github.com/Latias94/winit.git?rev=c274e09d73f422edae72d6d75a2cb931e90eb961#c274e09d73f422edae72d6d75a2cb931e90eb961"
 dependencies = [
  "ahash",
  "android-activity",

@@ -30,6 +30,9 @@ mod dropped_file;
 mod safe_area;
 mod window_settings;
 
+#[cfg(test)]
+mod mouse_button_tests;
+
 pub use window_settings::{WindowGeometry, WindowSettings};
 
 use raw_window_handle::HasDisplayHandle;
@@ -120,6 +123,9 @@ pub struct State {
     /// Creates duplicate touches, if real touch inputs are coming.
     simulate_touch_screen: bool,
 
+    /// Last position of the active simulated contact, independent of cursor hover.
+    simulated_touch_pos_in_points: Option<egui::Pos2>,
+
     /// Is Some(…) when a touch is being translated to a pointer.
     ///
     /// Only one touch will be interpreted as pointer at any time.
@@ -188,6 +194,7 @@ impl State {
             clipboard,
 
             simulate_touch_screen: false,
+            simulated_touch_pos_in_points: None,
             pointer_touch_id: None,
 
             #[cfg(feature = "accesskit")]
@@ -391,8 +398,18 @@ impl State {
                     consumed: false,
                 }
             }
-            WindowEvent::MouseInput { state, button, .. } => {
-                self.on_mouse_button_input(*state, *button);
+            WindowEvent::MouseInput {
+                state,
+                button,
+                facts,
+                ..
+            } => {
+                self.on_mouse_button_input(
+                    *state,
+                    *button,
+                    facts.surface_position,
+                    pixels_per_point(&self.egui_ctx, window),
+                );
                 EventResponse {
                     repaint: true,
                     consumed: self.egui_ctx.egui_wants_pointer_input(),
@@ -403,6 +420,16 @@ impl State {
                 EventResponse {
                     repaint: true,
                     consumed: self.egui_ctx.egui_wants_pointer_input(),
+                }
+            }
+            WindowEvent::PointerCaptureChanged { capture, .. } => {
+                if !matches!(capture, winit::event::PointerWindowRoute::Window(owner) if *owner == window.id())
+                {
+                    self.cancel_pointer_input();
+                }
+                EventResponse {
+                    repaint: true,
+                    consumed: false,
                 }
             }
             WindowEvent::CursorMoved { position, .. } => {
@@ -581,7 +608,6 @@ impl State {
             | WindowEvent::Resized(_)
             | WindowEvent::Moved(_)
             | WindowEvent::TouchpadPressure { .. }
-            | WindowEvent::PointerCaptureChanged { .. }
             | WindowEvent::CloseRequested => EventResponse {
                 repaint: true,
                 consumed: false,
@@ -868,12 +894,40 @@ impl State {
             .push(egui::Event::AccessKitActionRequest(request));
     }
 
+    fn cancel_pointer_input(&mut self) {
+        // End only this viewport's UI stream. Physical buttons may remain held,
+        // and core native input independently consumes the original callback.
+        self.any_pointer_button_down = false;
+        self.egui_input.events.push(egui::Event::PointerCancelled);
+        if let Some(pos) = self.simulated_touch_pos_in_points.take() {
+            self.egui_input.events.push(egui::Event::Touch {
+                device_id: egui::TouchDeviceId(0),
+                id: egui::TouchId(0),
+                phase: egui::TouchPhase::Cancel,
+                pos,
+                force: None,
+            });
+        }
+    }
+
     fn on_mouse_button_input(
         &mut self,
         state: winit::event::ElementState,
         button: winit::event::MouseButton,
+        surface_position: Option<PhysicalPosition<f64>>,
+        pixels_per_point: f32,
     ) {
-        if let Some(pos) = self.pointer_pos_in_points
+        // Button callbacks may precede their position callback or arrive after CursorLeft.
+        // Keep this position on the button edge: an extra move could advance an old drag.
+        let position = surface_position
+            .map(|position| {
+                egui::pos2(
+                    position.x as f32 / pixels_per_point,
+                    position.y as f32 / pixels_per_point,
+                )
+            })
+            .or(self.pointer_pos_in_points);
+        if let Some(pos) = position
             && let Some(button) = translate_mouse_button(button)
         {
             let pressed = state == winit::event::ElementState::Pressed;
@@ -899,6 +953,7 @@ impl State {
             if self.simulate_touch_screen {
                 if pressed {
                     self.any_pointer_button_down = true;
+                    self.simulated_touch_pos_in_points = Some(pos);
 
                     self.egui_input.events.push(egui::Event::Touch {
                         device_id: egui::TouchDeviceId(0),
@@ -909,6 +964,7 @@ impl State {
                     });
                 } else {
                     self.any_pointer_button_down = false;
+                    self.simulated_touch_pos_in_points = None;
 
                     self.egui_input.events.push(egui::Event::PointerGone);
 
@@ -939,6 +995,7 @@ impl State {
 
         if self.simulate_touch_screen {
             if self.any_pointer_button_down {
+                self.simulated_touch_pos_in_points = Some(pos_in_points);
                 self.egui_input
                     .events
                     .push(egui::Event::PointerMoved(pos_in_points));
@@ -993,6 +1050,8 @@ impl State {
                     self.on_mouse_button_input(
                         winit::event::ElementState::Pressed,
                         winit::event::MouseButton::Left,
+                        None,
+                        pixels_per_point,
                     );
                 }
                 winit::event::TouchPhase::Moved => {
@@ -1003,6 +1062,8 @@ impl State {
                     self.on_mouse_button_input(
                         winit::event::ElementState::Released,
                         winit::event::MouseButton::Left,
+                        None,
+                        pixels_per_point,
                     );
                     // The pointer should vanish completely to not get any
                     // hover effects

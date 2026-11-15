@@ -2092,9 +2092,11 @@ impl Context {
             let clicked = Some(id) == viewport.interact_widgets.clicked;
             let mut any_press = false;
 
+            // Held/dragged flags above describe the final ordered interaction.
+            // Replaying an earlier release or cancellation must not clear a new press.
             for pointer_event in &input.pointer.pointer_events {
                 match pointer_event {
-                    PointerEvent::Moved(_) => {}
+                    PointerEvent::Moved(_) | PointerEvent::Cancelled => {}
                     PointerEvent::Pressed { .. } => {
                         any_press = true;
                     }
@@ -2102,9 +2104,6 @@ impl Context {
                         if enabled && sense.senses_click() && clicked && click.is_some() {
                             res.flags.set(Flags::CLICKED, true);
                         }
-
-                        res.flags.set(Flags::IS_POINTER_BUTTON_DOWN_ON, false);
-                        res.flags.set(Flags::DRAGGED, false);
                     }
                 }
             }

@@ -977,6 +977,7 @@ pub(crate) enum PointerEvent {
         click: Option<Click>,
         button: PointerButton,
     },
+    Cancelled,
 }
 
 impl PointerEvent {
@@ -1045,6 +1046,10 @@ pub struct PointerState {
     /// Buttons currently down, excluding those released this frame.
     down: [bool; NUM_POINTER_BUTTONS],
 
+    /// Cancelled buttons whose old release must not end a newer interaction.
+    #[cfg_attr(feature = "serde", serde(default))]
+    cancelled_buttons: [bool; NUM_POINTER_BUTTONS],
+
     /// Where did the current click/drag originate?
     /// `None` if no mouse button is down.
     press_origin: Option<Pos2>,
@@ -1107,6 +1112,7 @@ impl Default for PointerState {
             direction: Vec2::ZERO,
             pos_history: History::new(2..1000, 0.1),
             down: Default::default(),
+            cancelled_buttons: Default::default(),
             press_origin: None,
             press_start_time: None,
             has_moved_too_much_for_a_click: false,
@@ -1165,6 +1171,14 @@ impl PointerState {
                     let button = *button;
                     let pressed = *pressed;
                     let modifiers = *modifiers;
+
+                    if pressed {
+                        self.cancelled_buttons[button as usize] = false;
+                    } else if core::mem::take(&mut self.cancelled_buttons[button as usize]) {
+                        // This edge belongs to a cancelled stream. Releases without
+                        // a local press otherwise remain available for cross-viewport DnD.
+                        continue;
+                    }
 
                     self.latest_pos = Some(pos);
                     self.interact_pos = Some(pos);
@@ -1225,6 +1239,17 @@ impl PointerState {
                     // Delay the clearing until after the final velocity calculation, so we can
                     // get the final velocity when `drag_stopped` is true.
                     clear_history_after_velocity_calculation = true;
+                }
+                Event::PointerCancelled => {
+                    for (cancelled, down) in self.cancelled_buttons.iter_mut().zip(self.down) {
+                        *cancelled |= down;
+                    }
+                    self.down.fill(false);
+                    self.press_origin = None;
+                    self.press_start_time = None;
+                    self.has_moved_too_much_for_a_click = true;
+                    self.pos_history.clear();
+                    self.pointer_events.push(PointerEvent::Cancelled);
                 }
                 Event::MouseMoved(delta) => *self.motion.get_or_insert(Vec2::ZERO) += *delta,
                 _ => {}
@@ -1714,6 +1739,7 @@ impl PointerState {
             direction,
             pos_history: _,
             down,
+            cancelled_buttons,
             press_origin,
             press_start_time,
             has_moved_too_much_for_a_click,
@@ -1737,6 +1763,7 @@ impl PointerState {
         ));
         ui.label(format!("direction: {direction:?}"));
         ui.label(format!("down: {down:#?}"));
+        ui.label(format!("cancelled_buttons: {cancelled_buttons:#?}"));
         ui.label(format!("press_origin: {press_origin:?}"));
         ui.label(format!("press_start_time: {press_start_time:?} s"));
         ui.label(format!(

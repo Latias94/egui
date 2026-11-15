@@ -185,6 +185,12 @@ pub(crate) fn interact(
                 interaction.potential_click_id = None;
                 dragged = None;
             }
+            PointerEvent::Cancelled => {
+                interaction.potential_drag_id = None;
+                interaction.potential_click_id = None;
+                dragged = None;
+                clicked = None;
+            }
         }
     }
 

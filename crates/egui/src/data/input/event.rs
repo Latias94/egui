@@ -124,6 +124,14 @@ pub enum Event {
     /// On touch-up first send `PointerButton{pressed: false, …}` followed by `PointerLeft`.
     PointerGone,
 
+    /// The integration cancelled this viewport's pointer interaction.
+    ///
+    /// Clears held UI buttons, pending clicks and this viewport's drag payload without
+    /// producing a click or release. This does not claim that physical buttons
+    /// are up. Ordinary cursor exit or a focus transfer between app windows is
+    /// not sufficient; use this when the native input stream loses capture.
+    PointerCancelled,
+
     /// Zoom scale factor this frame (e.g. from a pinch gesture).
     ///
     /// * `zoom = 1`: no change.
