@@ -581,8 +581,11 @@ impl NativeViewportCreateAttempt {
 pub enum NativeViewportCreateAdmission {
     /// Proceed with native creation and optionally request exact physical placement.
     Proceed {
-        /// Undecorated physical outer rectangle requested before window creation.
-        undecorated_outer_rect: Option<NativePhysicalRect>,
+        /// Physical outer rectangle requested before window creation.
+        ///
+        /// Application decorations are preserved. Actual native geometry remains
+        /// authoritative if window constraints or the window manager adjust this request.
+        requested_outer_rect: Option<NativePhysicalRect>,
     },
     /// Keep the deferred viewport logical-only until a later host cycle.
     Defer,
@@ -1864,7 +1867,7 @@ pub trait NativeHostHandler: Send + Sync + 'static {
         _attempt: NativeViewportCreateAttempt,
     ) -> NativeViewportCreateAdmission {
         NativeViewportCreateAdmission::Proceed {
-            undecorated_outer_rect: None,
+            requested_outer_rect: None,
         }
     }
 
@@ -2791,7 +2794,7 @@ impl NativeHostState {
             viewport_id,
         };
         let NativeViewportCreateAdmission::Proceed {
-            undecorated_outer_rect,
+            requested_outer_rect,
         } = inner.handler.begin_deferred_viewport_create(create_attempt)
         else {
             return NativeDeferredWindowPreparation::Defer;
@@ -2808,7 +2811,7 @@ impl NativeHostState {
             return NativeDeferredWindowPreparation::Failed;
         }
 
-        let window_override = undecorated_outer_rect.and_then(|rect| {
+        let window_override = requested_outer_rect.and_then(|rect| {
             if builder.fullscreen == Some(true)
                 || builder.maximized == Some(true)
                 || builder.monitor.is_some()
@@ -3238,16 +3241,31 @@ impl NativeDeferredWindowOverride {
     pub(crate) fn apply_to_attributes(self, attributes: WindowAttributes) -> WindowAttributes {
         let rect = self.rect;
         attributes
-            .with_decorations(false)
             .with_position(winit::dpi::PhysicalPosition::new(rect.x, rect.y))
             .with_inner_size(winit::dpi::PhysicalSize::new(rect.width, rect.height))
     }
 
     pub(crate) fn reapply_to_window(self, window: &Window) {
         let rect = self.rect;
-        window.set_decorations(false);
         window.set_outer_position(winit::dpi::PhysicalPosition::new(rect.x, rect.y));
-        let _ = window.request_inner_size(winit::dpi::PhysicalSize::new(rect.width, rect.height));
+        let inner = self.requested_inner_size(window.outer_size(), window.inner_size());
+        let _ = window.request_inner_size(inner);
+        // Resizing or crossing displays can adjust the origin. This is a bounded
+        // placement request; later snapshots report what the platform accepted.
+        window.set_outer_position(winit::dpi::PhysicalPosition::new(rect.x, rect.y));
+    }
+
+    fn requested_inner_size(
+        self,
+        observed_outer: winit::dpi::PhysicalSize<u32>,
+        observed_inner: winit::dpi::PhysicalSize<u32>,
+    ) -> winit::dpi::PhysicalSize<u32> {
+        let width_inset = observed_outer.width.saturating_sub(observed_inner.width);
+        let height_inset = observed_outer.height.saturating_sub(observed_inner.height);
+        winit::dpi::PhysicalSize::new(
+            self.rect.width.saturating_sub(width_inset).max(1),
+            self.rect.height.saturating_sub(height_inset).max(1),
+        )
     }
 }
 
@@ -4375,7 +4393,7 @@ mod tests {
                 return NativeViewportCreateAdmission::Defer;
             }
             NativeViewportCreateAdmission::Proceed {
-                undecorated_outer_rect: self
+                requested_outer_rect: self
                     .deferred_rect
                     .lock()
                     .filter(|(requested_viewport, _)| *requested_viewport == attempt.viewport_id())
@@ -6893,7 +6911,7 @@ mod tests {
             .expect("the child geometry is available")
             .apply_to_attributes(WindowAttributes::default());
 
-        assert!(!attributes.decorations);
+        assert!(attributes.decorations);
         assert_eq!(
             attributes.position,
             Some(Position::Physical(PhysicalPosition::new(120, 240)))
@@ -6922,6 +6940,38 @@ mod tests {
         };
         assert_ne!(second_attempt, attempt);
         assert!(incompatible_override.is_none());
+    }
+
+    #[test]
+    fn deferred_geometry_preserves_application_window_decorations() {
+        let geometry = NativeDeferredWindowOverride {
+            rect: NativePhysicalRect::new(120, 240, 800, 600),
+        };
+        for decorations in [true, false] {
+            let attributes = geometry
+                .apply_to_attributes(WindowAttributes::default().with_decorations(decorations));
+            assert_eq!(attributes.decorations, decorations);
+        }
+    }
+
+    #[test]
+    fn deferred_outer_size_uses_observed_frame_insets_without_underflow() {
+        use winit::dpi::PhysicalSize;
+
+        for (target, observed_outer, observed_inner, expected_inner) in [
+            ((656, 518), (656, 518), (640, 480), (640, 480)),
+            ((656, 518), (640, 480), (640, 480), (656, 518)),
+            ((8, 20), (656, 518), (640, 480), (1, 1)),
+            ((656, 518), (600, 450), (640, 480), (656, 518)),
+        ] {
+            let geometry = NativeDeferredWindowOverride {
+                rect: NativePhysicalRect::new(0, 0, target.0, target.1),
+            };
+            assert_eq!(
+                geometry.requested_inner_size(observed_outer.into(), observed_inner.into()),
+                PhysicalSize::from(expected_inner),
+            );
+        }
     }
 
     #[test]
