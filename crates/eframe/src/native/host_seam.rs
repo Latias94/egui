@@ -15,6 +15,8 @@ use egui::{ViewportBuilder, ViewportId};
 use raw_window_handle::{HasDisplayHandle as _, HasWindowHandle as _};
 use winit::event::{DeviceId, PointerEventFacts, PointerPressToken, PointerWindowRoute};
 use winit::event_loop::ActiveEventLoop;
+#[cfg(target_os = "macos")]
+use winit::platform::macos::{ActiveEventLoopExtMacOS as _, MacOSPointerObservation};
 #[cfg(all(target_os = "linux", feature = "x11"))]
 use winit::platform::x11::{
     ActiveEventLoopExtX11 as _, WindowExtX11 as _, X11PointerCaptureAcquisition,
@@ -3745,7 +3747,17 @@ fn observe_native_pointer(
             X11PointerObservation::Unsupported => NativeViewportPointerObservation::Unsupported,
         }
     }
-    #[cfg(not(all(target_os = "linux", feature = "x11")))]
+    #[cfg(target_os = "macos")]
+    {
+        match event_loop.observe_pointer(expected_window_id, device_id, expected_press) {
+            MacOSPointerObservation::Observed { facts, delivery } => {
+                NativeViewportPointerObservation::Observed { facts, delivery }
+            }
+            MacOSPointerObservation::Unavailable => NativeViewportPointerObservation::Unavailable,
+            MacOSPointerObservation::Unsupported => NativeViewportPointerObservation::Unsupported,
+        }
+    }
+    #[cfg(not(any(target_os = "macos", all(target_os = "linux", feature = "x11"))))]
     {
         let _ = (event_loop, expected_window_id, device_id, expected_press);
         NativeViewportPointerObservation::Unsupported
