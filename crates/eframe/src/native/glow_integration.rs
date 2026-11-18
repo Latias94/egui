@@ -886,7 +886,7 @@ impl GlowWinitRunning<'_> {
 
         #[cfg(feature = "native-host-seam")]
         if output_scope.is_some() {
-            let has_input = self.integration.has_pending_ui_input()
+            let has_input = self.integration.has_pending_ui_input(viewport_id)
                 || self
                     .glutin
                     .borrow()
@@ -996,6 +996,8 @@ impl GlowWinitRunning<'_> {
                         );
                     }
                 }
+            } else {
+                self.integration.retain_raw_input(raw_input);
             }
 
             sleep_if_invisible_or_minimized(

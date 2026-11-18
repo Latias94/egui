@@ -869,7 +869,7 @@ impl WgpuWinitRunning<'_> {
 
         #[cfg(feature = "native-host-seam")]
         if output_scope.is_some() {
-            let has_input = integration.has_pending_ui_input()
+            let has_input = integration.has_pending_ui_input(viewport_id)
                 || shared
                     .borrow()
                     .viewports
@@ -978,6 +978,8 @@ impl WgpuWinitRunning<'_> {
                         );
                     }
                 }
+            } else {
+                integration.retain_raw_input(raw_input);
             }
 
             sleep_if_invisible_or_minimized(

@@ -537,6 +537,7 @@ impl<T: WinitApp> ApplicationHandler<UserEvent> for WinitAppWrapper<T> {
                         matches!(
                             disposition,
                             super::host_seam::NativeWindowEventDisposition::HoldClose(_)
+                                | super::host_seam::NativeWindowEventDisposition::VetoClose(_)
                         )
                     });
                     #[cfg(not(feature = "native-host-seam"))]

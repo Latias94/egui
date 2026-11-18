@@ -1187,7 +1187,7 @@ impl State {
         // emit events as if the corresponding keys from the Latin layout were pressed. In this case, clipboard shortcuts
         // are mapped to the physical keys that normally contain C, X, V, etc.
         // See also: https://github.com/emilk/egui/issues/3653
-        if let Some(active_key) = logical_key.or(physical_key) {
+        if let Some(active_key) = key_from_winit_key_event(event) {
             if pressed && self.clipboard_shortcuts {
                 if is_cut_command(self.modifiers, active_key) {
                     self.egui_input.events.push(egui::Event::Cut);
@@ -1641,6 +1641,17 @@ fn translate_mouse_button(button: winit::event::MouseButton) -> Option<egui::Poi
         winit::event::MouseButton::Forward => Some(egui::PointerButton::Extra2),
         winit::event::MouseButton::Other(_) => None,
     }
+}
+
+/// Maps a native key using the same logical-key and physical-key fallback as egui input.
+///
+/// Native hosts can use this before a UI pass to order control shortcuts with
+/// pointer input. This does not interpret text, modifiers, IME or pressed state.
+pub fn key_from_winit_key_event(event: &winit::event::KeyEvent) -> Option<egui::Key> {
+    key_from_winit_key(&event.logical_key).or_else(|| match event.physical_key {
+        winit::keyboard::PhysicalKey::Code(code) => key_from_key_code(code),
+        winit::keyboard::PhysicalKey::Unidentified(_) => None,
+    })
 }
 
 fn key_from_winit_key(key: &winit::keyboard::Key) -> Option<egui::Key> {

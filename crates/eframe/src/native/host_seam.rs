@@ -136,6 +136,12 @@ pub enum NativeWindowEventDisposition {
     /// Only the request carried by this callback is accepted. A held request
     /// stays held until an exact decision or physical-window retirement.
     HoldClose(NativeViewportCloseRequest),
+    /// Reject this exact close synchronously without retaining a close owner.
+    ///
+    /// Use when the host cannot admit a new request. No cancellation callback
+    /// is owed for an unaccepted request. A request already held by the host
+    /// keeps its existing owner and must be resolved through the held protocol.
+    VetoClose(NativeViewportCloseRequest),
 }
 
 /// Final host decision for an exact held native close request.
@@ -2371,6 +2377,10 @@ impl NativeHostState {
                 }
                 if matches!(close.ownership, NativeCloseOwnership::Held { .. }) {
                     return NativeWindowEventDisposition::HoldClose(request);
+                }
+                if disposition == NativeWindowEventDisposition::VetoClose(request) {
+                    pending.remove(&request.viewport_id);
+                    return NativeWindowEventDisposition::VetoClose(request);
                 }
             }
         }

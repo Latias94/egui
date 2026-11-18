@@ -6,6 +6,7 @@ struct CloseHost {
     requests: Mutex<Vec<NativeViewportCloseRequest>>,
     cancellations: Mutex<Vec<NativeViewportCloseRequest>>,
     continue_events: AtomicBool,
+    veto_events: AtomicBool,
     foreign_hold: Mutex<Option<NativeViewportCloseRequest>>,
 }
 
@@ -16,7 +17,13 @@ impl NativeHostHandler for CloseHost {
         };
         self.requests.lock().unwrap().push(request);
         if let Some(foreign) = *self.foreign_hold.lock().unwrap() {
-            NativeWindowEventDisposition::HoldClose(foreign)
+            if self.veto_events.load(Ordering::Relaxed) {
+                NativeWindowEventDisposition::VetoClose(foreign)
+            } else {
+                NativeWindowEventDisposition::HoldClose(foreign)
+            }
+        } else if self.veto_events.load(Ordering::Relaxed) {
+            NativeWindowEventDisposition::VetoClose(request)
         } else if self.continue_events.load(Ordering::Relaxed) {
             NativeWindowEventDisposition::Continue
         } else {
@@ -65,6 +72,73 @@ fn held_close(
         panic!("the exact native close must be held before backend translation");
     };
     request
+}
+
+#[test]
+fn synchronous_veto_keeps_no_close_owner_and_allows_a_fresh_request() {
+    let (host, state, ctx, mut sequence) = fixture();
+    host.veto_events.store(true, Ordering::Relaxed);
+    let window = WindowId::from(10);
+    let disposition = state.observe_window_event(
+        Some(&ctx),
+        sequence.next(),
+        window,
+        Some(ViewportId::ROOT),
+        None,
+        &WindowEvent::CloseRequested,
+    );
+    let request = host.requests.lock().unwrap()[0];
+    assert_eq!(
+        disposition,
+        NativeWindowEventDisposition::VetoClose(request)
+    );
+    assert!(!state.is_close_held(ViewportId::ROOT));
+    assert!(
+        state
+            .inner
+            .as_ref()
+            .unwrap()
+            .pending_viewport_closes
+            .lock()
+            .unwrap()
+            .is_empty()
+    );
+    assert!(!state.settle_close_resolutions(&ctx));
+    assert!(host.cancellations.lock().unwrap().is_empty());
+    assert!(!resolve_native_viewport_close(
+        &ctx,
+        request,
+        NativeViewportCloseDecision::Allow
+    ));
+
+    host.veto_events.store(false, Ordering::Relaxed);
+    let successor = held_close(&state, &ctx, &mut sequence, ViewportId::ROOT, window);
+    assert_ne!(successor, request);
+    assert!(resolve_native_viewport_close(
+        &ctx,
+        successor,
+        NativeViewportCloseDecision::Allow
+    ));
+    assert!(state.settle_close_resolutions(&ctx));
+}
+
+#[test]
+fn synchronous_veto_cannot_revoke_an_existing_held_request() {
+    let (host, state, ctx, mut sequence) = fixture();
+    let window = WindowId::from(10);
+    let request = held_close(&state, &ctx, &mut sequence, ViewportId::ROOT, window);
+    host.veto_events.store(true, Ordering::Relaxed);
+    assert_eq!(
+        held_close(&state, &ctx, &mut sequence, ViewportId::ROOT, window),
+        request
+    );
+    assert!(host.cancellations.lock().unwrap().is_empty());
+    assert!(resolve_native_viewport_close(
+        &ctx,
+        request,
+        NativeViewportCloseDecision::Allow
+    ));
+    assert!(state.settle_close_resolutions(&ctx));
 }
 
 #[test]

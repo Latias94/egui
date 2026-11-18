@@ -14,6 +14,8 @@ use crate::epi;
 
 #[cfg(all(test, feature = "native-host-seam"))]
 mod close_tests;
+#[cfg(all(test, feature = "native-host-seam"))]
+mod input_tests;
 
 #[cfg_attr(target_os = "ios", allow(dead_code, unused_variables, unused_mut))]
 pub fn viewport_builder(
@@ -188,7 +190,7 @@ pub struct EpiIntegration {
 
     /// Input that we have received, but not yet given to egui,
     /// because we haven't run any pass since (see [`Self::update_logic_only`]).
-    pending_raw_input: egui::RawInput,
+    pending_raw_input: egui::ViewportIdMap<egui::RawInput>,
 
     pending_full_output: egui::FullOutput,
 
@@ -343,10 +345,12 @@ impl EpiIntegration {
 
     /// Reports UI input preserved by a logic-only update without consuming it.
     #[cfg(feature = "native-host-seam")]
-    pub(crate) fn has_pending_ui_input(&self) -> bool {
-        !self.pending_raw_input.events.is_empty()
-            || !self.pending_raw_input.dropped_files.is_empty()
-            || !self.pending_raw_input.hovered_files.is_empty()
+    pub(crate) fn has_pending_ui_input(&self, viewport: ViewportId) -> bool {
+        self.pending_raw_input.get(&viewport).is_some_and(|input| {
+            !input.events.is_empty()
+                || !input.dropped_files.is_empty()
+                || !input.hovered_files.is_empty()
+        })
     }
 
     /// Run user code - this can create immediate viewports, so hold no locks over this!
@@ -436,6 +440,10 @@ impl EpiIntegration {
             self.handle_close_request(false);
         }
 
+        if is_root_viewport {
+            self.pending_raw_input
+                .retain(|id, _| full_output.viewport_output.contains_key(id));
+        }
         self.pending_full_output.append(full_output);
         core::mem::take(&mut self.pending_full_output)
     }
@@ -484,7 +492,7 @@ impl EpiIntegration {
         }
 
         // No pass consumed the input, so save it for the next one:
-        self.pending_raw_input = raw_input;
+        self.retain_raw_input(raw_input);
 
         if close_requested {
             let canceled = logic_output
@@ -506,13 +514,24 @@ impl EpiIntegration {
         logic_output
     }
 
-    /// Prepend any input we couldn't give to egui earlier, set the time, and run the app hook.
+    /// Preserve unconsumed input from a logic-only viewport without changing its owner.
+    pub(crate) fn retain_raw_input(&mut self, raw_input: egui::RawInput) {
+        self.pending_raw_input
+            .entry(raw_input.viewport_id)
+            .or_default()
+            .append(raw_input);
+    }
+
+    /// Prepend this viewport's unconsumed input, set the time, and run the app hook.
     fn prepare_raw_input(
         &mut self,
         app: &mut dyn epi::App,
         new_input: egui::RawInput,
     ) -> egui::RawInput {
-        let mut raw_input = core::mem::take(&mut self.pending_raw_input);
+        let mut raw_input = self
+            .pending_raw_input
+            .remove(&new_input.viewport_id)
+            .unwrap_or_default();
         raw_input.append(new_input); // The new input wins where they overlap
 
         raw_input.time = Some(self.beginning.elapsed().as_secs_f64());

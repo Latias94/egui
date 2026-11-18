@@ -116,7 +116,7 @@ impl crate::App for CloseApp {
     }
 }
 
-fn integration() -> EpiIntegration {
+pub(super) fn integration() -> EpiIntegration {
     let egui_ctx = egui::Context::default();
     egui_ctx.set_embed_viewports(false);
     EpiIntegration {
